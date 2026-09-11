@@ -1,0 +1,269 @@
+# ============================================================================
+# Benchmark Dashboard -- Performance Tracking CI
+# ============================================================================
+# Runs benchmarks on every push to dev/main and stores results.
+# Uses github-action-benchmark to track performance regressions.
+#
+# Results published to GitHub Pages (gh-pages branch).
+# Alert threshold: 150% (warns if >50% slower than baseline).
+#
+# Flow:
+#   benchmark        — Linux x86-64, full suite with libsecp comparison
+#   benchmark-windows — Windows MSVC, quick suite only (no comparison clone)
+#
+# Concurrency: cancel older runs on same branch so queue doesn't pile up.
+# ============================================================================
+
+name: Benchmark Dashboard
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'CMakeLists.txt'
+  workflow_dispatch:
+
+# Cancel older benchmark runs on the same branch — prevents queue pileup
+# when many commits arrive in a short window (e.g. during a CI fix sprint).
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      deployments: write
+
+    steps:
+    - name: Harden the runner (Audit all outbound calls)
+      uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+      with:
+        egress-policy: audit
+
+    - name: Checkout
+      uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      with:
+        persist-credentials: false
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ninja-build cmake ccache
+
+    - name: Cache ccache
+      uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+      with:
+        path: ~/.cache/ccache
+        key: ccache-bench-${{ hashFiles('src/cpu/src/**', 'src/cpu/include/**', 'include/**') }}
+        restore-keys: |
+          ccache-bench-
+
+    - name: Configure ccache
+      run: |
+        ccache --set-config=max_size=200M
+        ccache --set-config=compression=true
+        ccache -z
+
+    - name: Clone libsecp256k1 (apple-to-apple comparison)
+      run: |
+        # Pin to a release tag: an unpinned master baseline is not apple-to-apple and
+        # post-release master drifted the internal ecmult_gen API, breaking the comparison
+        # provider link (undefined reference to secp256k1_ecmult_gen).
+        git clone --depth 1 --branch v0.7.0 https://github.com/bitcoin-core/secp256k1.git \
+          "$GITHUB_WORKSPACE/_libsecp256k1"
+
+    - name: Configure (Release)
+      run: |
+        cmake -S . -B out/bench \
+          -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          -DSECP256K1_MARCH=x86-64-v2 \
+          -DSECP256K1_BUILD_TESTS=OFF \
+          -DSECP256K1_BUILD_EXAMPLES=OFF \
+          -DSECP256K1_BUILD_JAVA=OFF \
+          -DSECP256K1_USE_ASM=ON \
+          -DLIBSECP_SRC_DIR="$GITHUB_WORKSPACE/_libsecp256k1/src"
+
+    - name: Build
+      run: cmake --build out/bench -j$(nproc)
+
+    - name: Run benchmark suite
+      run: |
+        mkdir -p /tmp/benchmark_results
+        bench_bin="$(find out/bench -type f -name bench_unified | head -n1)"
+        if [ -z "$bench_bin" ]; then
+          echo "bench_unified binary not found under out/bench" >&2
+          exit 1
+        fi
+        "$bench_bin" 2>&1 | tee /tmp/benchmark_results/raw_output.txt
+        python3 .github/scripts/parse_benchmark.py \
+          /tmp/benchmark_results/raw_output.txt \
+          /tmp/benchmark_results/benchmark.json
+
+    - name: Validate benchmark artifact (CI-006 — reject zero-timing artifacts)
+      if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+      run: |
+        python3 - <<'EOF'
+        import json, sys
+        try:
+            data = json.load(open("/tmp/benchmark_results/benchmark.json"))
+        except Exception as e:
+            print(f"::error::Failed to parse benchmark.json: {e}")
+            sys.exit(1)
+        if not data:
+            print("::error::benchmark.json is empty — bench_unified may not have run")
+            sys.exit(1)
+        zeros = [e["name"] for e in data if float(e.get("value", 1)) == 0.0]
+        if zeros:
+            print(f"::error::Zero-timing entries found (bench may have crashed): {zeros}")
+            sys.exit(1)
+        print(f"Benchmark artifact OK: {len(data)} entries, no zero timings")
+        EOF
+
+    - name: Add diagnostic disclaimer to summary
+      if: always()
+      run: |
+        echo "## ⚠️ DIAGNOSTIC ONLY" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "These benchmark results are from an **uncontrolled GitHub runner** (no CPU pinning, no turbo lock, no governor fix)." >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Do NOT cite these numbers as release-grade evidence.** For canonical release-grade benchmarks, see \`docs/bench_unified_*_gcc14_x86-64.json\` (produced locally with turbo lock + CPU pinning)." >> $GITHUB_STEP_SUMMARY
+
+    - name: Upload benchmark artifact
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: benchmark-json-linux-${{ github.sha }}
+        path: /tmp/benchmark_results/benchmark.json
+        retention-days: 90
+
+    - name: Store benchmark result
+      if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+      uses: benchmark-action/github-action-benchmark@a7bc2366eda11037936ea57d811a43b3418d3073 # v1
+      with:
+        name: 'UltrafastSecp256k1 Performance'
+        tool: 'customSmallerIsBetter'
+        output-file-path: /tmp/benchmark_results/benchmark.json
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        auto-push: false
+        alert-threshold: '200%'
+        comment-on-alert: true
+        fail-on-alert: true
+        # Store data on gh-pages branch, NOT dev — keeping it on dev created an
+        # auto-commit that triggered cancel-in-progress on the Pipeline workflow,
+        # cancelling Preflight and other fast gates on every benchmark run.
+        gh-pages-branch: gh-pages
+        benchmark-data-dir-path: 'bench-v2'
+
+    - name: Summary
+      if: always()
+      run: |
+        echo "## Benchmark Results (Linux)" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        head -60 /tmp/benchmark_results/raw_output.txt >> $GITHUB_STEP_SUMMARY || true
+        echo '```' >> $GITHUB_STEP_SUMMARY
+
+  benchmark-windows:
+    runs-on: windows-latest
+    # Increased from 30m: Windows MSVC build + benchmark takes 35-40 min.
+    # With ccache the steady-state is ~20min; 60m gives 50% headroom.
+    timeout-minutes: 60
+
+    steps:
+    - name: Harden the runner (Audit all outbound calls)
+      uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+      with:
+        egress-policy: audit
+
+    - name: Checkout
+      uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      with:
+        persist-credentials: false
+
+    # Windows ccache — significantly reduces rebuild time on repeated pushes
+    - name: Cache ccache (Windows)
+      uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+      with:
+        path: C:\Users\runneradmin\AppData\Local\ccache
+        key: ccache-bench-win-${{ hashFiles('src/cpu/src/**', 'src/cpu/include/**', 'include/**') }}
+        restore-keys: |
+          ccache-bench-win-
+
+    - name: Install ccache (Windows)
+      run: choco install ccache --no-progress -y
+
+    # bench_unified requires libsecp256k1 source for apple-to-apple comparison.
+    # Clone it here so the CMake configure does not skip the benchmark target.
+    - name: Clone libsecp256k1 (apple-to-apple comparison)
+      run: |
+        # Pin to a release tag (see Linux job): unpinned master drifted the ecmult_gen API.
+        git clone --depth 1 --branch v0.7.0 https://github.com/bitcoin-core/secp256k1.git "$env:GITHUB_WORKSPACE\_libsecp256k1"
+
+    - name: Configure (Release, MSVC)
+      run: |
+        cmake -S . -B out/bench `
+          -DCMAKE_BUILD_TYPE=Release `
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache `
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
+          -DSECP256K1_BUILD_TESTS=OFF `
+          -DSECP256K1_BUILD_EXAMPLES=OFF `
+          -DSECP256K1_BUILD_JAVA=OFF `
+          -DUFSECP_REFRESH_SOURCE_GRAPH=OFF `
+          -DLIBSECP_SRC_DIR="$env:GITHUB_WORKSPACE\_libsecp256k1\src"
+
+    - name: Build
+      run: cmake --build out/bench --config Release -j $env:NUMBER_OF_PROCESSORS
+
+    - name: Run benchmark suite
+      run: |
+        New-Item -Path benchmark_results -ItemType Directory -Force
+        $benchBin = Get-ChildItem -Path .\out\bench -Recurse -Filter bench_unified.exe |
+                    Select-Object -First 1
+        if (-not $benchBin) {
+          Write-Error "bench_unified.exe not found under build/bench"
+          exit 1
+        }
+        # Tolerate late-stage crashes in bench_unified.exe (Windows-only issue):
+        # treat the run as successful if the THROUGHPUT SUMMARY was produced.
+        # Linux benchmark is the authoritative source — Windows is cross-platform
+        # sanity only.
+        $ErrorActionPreference = 'Continue'
+        & $benchBin.FullName --suite core --quick 2>&1 |
+          Tee-Object -FilePath benchmark_results\raw_output.txt
+        $benchExit = $LASTEXITCODE
+        $output = Get-Content benchmark_results\raw_output.txt -Raw
+        if ($output -match 'THROUGHPUT SUMMARY') {
+          if ($benchExit -ne 0) {
+            Write-Host "::warning::bench_unified.exe exited with $benchExit but produced THROUGHPUT SUMMARY — accepting partial run"
+          }
+          exit 0
+        }
+        Write-Error "bench_unified.exe did not produce THROUGHPUT SUMMARY (exit $benchExit)"
+        exit 1
+
+    - name: Upload benchmark artifact (Windows)
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: benchmark-raw-windows-${{ github.sha }}
+        path: benchmark_results\raw_output.txt
+        retention-days: 90
+
+    - name: Summary
+      if: always()
+      run: |
+        echo "## Benchmark Results (Windows MSVC)" >> $env:GITHUB_STEP_SUMMARY
+        echo '```' >> $env:GITHUB_STEP_SUMMARY
+        Get-Content benchmark_results\raw_output.txt |
+          Select-Object -First 60 >> $env:GITHUB_STEP_SUMMARY
+        echo '```' >> $env:GITHUB_STEP_SUMMARY

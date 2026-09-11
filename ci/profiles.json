@@ -1,0 +1,113 @@
+{
+  "_schema": "https://shrec.github.io/UltrafastSecp256k1/schema/profiles.v1.json",
+  "_version": "1.0.0",
+  "_purpose": "Single source of truth mapping deployment profile -> (CMake preset, CAAS profile, scoped capability set). Consumed by ci/profile_manifest.py (Python loader), ci/check_profile_smoke.sh (build smoke), ci/check_profile_consistency.py (cross-references CMakePresets.json and ci/caas_runner.py PROFILES), and the integration docs.",
+  "_invariants": [
+    "Every profile MUST have a `cmake_preset` that exists in CMakePresets.json `configurePresets[*].name`.",
+    "If `caas_profile` is set it MUST exist in ci/caas_runner.py PROFILES.",
+    "`enabled_modules` and `disabled_modules` MUST be disjoint.",
+    "Module names match the SECP256K1_BUILD_* CMake option naming (without the prefix). Example: 'MUSIG2' maps to SECP256K1_BUILD_MUSIG2."
+  ],
+
+  "profiles": {
+    "bitcoin-core": {
+      "title": "Bitcoin Core Backend",
+      "description": "Minimal footprint for Bitcoin Core fork integration. Drops everything Core does not need.",
+      "cmake_preset": "bitcoin-core",
+      "caas_profile": "bitcoin-core-backend",
+      "enabled_modules": ["CPU", "SHIM", "MUSIG2", "BIP324", "PIPPENGER"],
+      "disabled_modules": [
+        "CUDA", "OPENCL", "TESTS", "BENCH", "EXAMPLES",
+        "FROST", "ZK", "ECIES", "BIP352", "LTC_SP",
+        "ADAPTOR", "WALLET", "ETHEREUM", "BCH"
+      ],
+      "expected_artifact_kb_max": 2500,
+      "notes": "Built without LTO so size is dominated by .text. Pippenger is kept because Core's batch verify uses it. BIP-324 is on because Core v25+ uses it for P2P transport."
+    },
+
+    "litecoin": {
+      "title": "Litecoin Core Backend",
+      "description": "Minimal footprint for Litecoin Core fork. Taproot enabled (activated May 2023). No BIP-324 (LTC P2P is v1 only).",
+      "cmake_preset": "litecoin",
+      "caas_profile": "bitcoin-core-backend",
+      "enabled_modules": ["CPU", "SHIM", "MUSIG2", "PIPPENGER"],
+      "disabled_modules": [
+        "CUDA", "OPENCL", "TESTS", "BENCH", "EXAMPLES",
+        "FROST", "ZK", "ECIES", "BIP352", "LTC_SP",
+        "ADAPTOR", "WALLET", "ETHEREUM", "BCH", "BIP324"
+      ],
+      "expected_artifact_kb_max": 2500,
+      "notes": "Borrows the Bitcoin Core CAAS profile because the shim surface and signing paths are identical. LTC_SP is its own module (chain-specific Silent Payments) and stays OFF in the Core-backend variant."
+    },
+
+    "dogecoin": {
+      "title": "Dogecoin Core Backend",
+      "description": "Minimal footprint for Dogecoin Core. ECDSA only (DOGE has no Taproot, no MuSig2, no BIP-324).",
+      "cmake_preset": "dogecoin",
+      "caas_profile": "bitcoin-core-backend",
+      "enabled_modules": ["CPU", "SHIM", "PIPPENGER"],
+      "disabled_modules": [
+        "CUDA", "OPENCL", "TESTS", "BENCH", "EXAMPLES",
+        "FROST", "ZK", "ECIES", "BIP352", "LTC_SP",
+        "ADAPTOR", "WALLET", "ETHEREUM", "BCH",
+        "BIP324", "MUSIG2"
+      ],
+      "expected_artifact_kb_max": 2200,
+      "notes": "Smallest x86-64 footprint among the chain-specific profiles."
+    },
+
+    "bch-wallet": {
+      "title": "BCH Wallet (RPA + HD)",
+      "description": "BCH with RPA scanning, HD wallet (BIP-32/39), ECIES. No FROST/ZK. Pippenger ON for batch ops.",
+      "cmake_preset": "bch-wallet",
+      "caas_profile": "bchn-compat",
+      "enabled_modules": ["CPU", "BCH", "WALLET", "ECIES", "PIPPENGER", "MUSIG2", "TESTS", "BENCH"],
+      "disabled_modules": [
+        "CUDA", "OPENCL", "EXAMPLES",
+        "FROST", "ZK", "BIP352", "LTC_SP",
+        "ADAPTOR", "ETHEREUM", "BIP324"
+      ],
+      "expected_artifact_kb_max": 4500,
+      "notes": "Inherits from base-coin so BIP-352 / LTC-SP stay off (BCH has its own RPA scheme via SECP256K1_BUILD_BCH). The bchn-compat CAAS profile covers BCHN legacy Schnorr shim."
+    },
+
+    "wallet": {
+      "title": "Wallet Build (BIP-352 + adaptor + HD)",
+      "description": "Full wallet: BIP-32/39, BIP-352 Silent Payments, adaptor sigs, ECIES, MuSig2.",
+      "cmake_preset": "wallet",
+      "caas_profile": "default",
+      "enabled_modules": [
+        "CPU", "MUSIG2", "ECIES", "BIP352", "ADAPTOR",
+        "WALLET", "PIPPENGER", "TESTS", "BENCH"
+      ],
+      "disabled_modules": [
+        "CUDA", "OPENCL",
+        "FROST", "ZK",
+        "BIP324", "ETHEREUM", "BCH"
+      ],
+      "expected_artifact_kb_max": 6000,
+      "notes": "LTC_SP defaults to ON in this preset because BIP352 is ON; the chain-coin profiles explicitly turn LTC_SP off via base-coin."
+    },
+
+    "audit": {
+      "title": "Full Audit Build",
+      "description": "All optional modules enabled — matches ci_local.sh --full and the canonical CAAS pipeline.",
+      "cmake_preset": "audit",
+      "caas_profile": "default",
+      "enabled_modules": [
+        "CPU", "MUSIG2", "FROST", "ZK", "ECIES",
+        "BIP352", "LTC_SP", "ADAPTOR", "WALLET",
+        "PIPPENGER", "BIP324", "ETHEREUM", "TESTS", "BENCH"
+      ],
+      "disabled_modules": ["CUDA", "OPENCL", "BCH"],
+      "expected_artifact_kb_max": 9000,
+      "notes": "Reference build used by every audit gate in CI; deliberately broad."
+    }
+  },
+
+  "_consistency_notes": [
+    "Profiles 'bitcoin-core', 'litecoin', and 'dogecoin' all map to the SAME CAAS profile (bitcoin-core-backend). That is correct: the audit scope (shim parity + CPU signing) is identical across them; only the build-flag set differs.",
+    "Profile 'bch-wallet' is the only profile that exercises SECP256K1_BUILD_BCH=ON; the bchn-compat CAAS profile covers the BCHN legacy-Schnorr shim that ships with that build.",
+    "The 'wallet' profile is the only deployment profile with LTC_SP=ON; the chain-coin profiles inherit base-coin which forces LTC_SP=OFF (LTC_SP requires BIP352)."
+  ]
+}

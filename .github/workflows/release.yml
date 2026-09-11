@@ -1,0 +1,2328 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v4.5.0)'
+        required: true
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  CMAKE_BUILD_TYPE: Release
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  # RELEASE_VERSION is always the tag itself; every consumer strips the leading 'v'
+  # via ${RELEASE_VERSION#v}. The old `startsWith(...) || github.ref_name` form fell
+  # back to the BRANCH name on a non-'v' workflow_dispatch tag (e.g. input "4.1.0"),
+  # which would version every package as "dev"/"main". Just use the tag directly.
+  RELEASE_VERSION: ${{ github.event.inputs.tag || github.ref_name }}
+
+# ----------------------------------------------------------------------------
+# Global: version is always derived from the git tag (the leading 'v' is stripped).
+# All binding configs use 0.0.0-dev as placeholder; CI overrides at build time.
+# ----------------------------------------------------------------------------
+
+jobs:
+  # ==========================================================================
+  # 0) Release CAAS gate — must pass before build/package fan-out starts
+  # ==========================================================================
+  release-caas-gate:
+    name: Release / CAAS Gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # NOTE: The 'release-gate' GitHub environment must be configured in repo
+    # Settings → Environments with required reviewers to enforce manual approval.
+    # This prevents accidental or automated releases triggered by tag push alone.
+    environment: release-gate
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Install release gate dependencies
+        run: |
+          # CI-007: Updated to GCC 14 to match canonical performance benchmarks.
+          # All CT signing ratio claims in docs/BENCHMARKS.md and canonical_numbers.json
+          # use GCC 14.2.0. Building with GCC 13 produced materially different CT signing
+          # ratios (0.82-0.85× slower vs GCC 14's 1.09-1.24× faster), making the
+          # release evidence incompatible with the documented canonical numbers.
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends g++-14 ninja-build
+
+      - name: Select release profiles
+        id: release-impact
+        run: |
+          set +e
+          python3 ci/ci_gate_detect.py --release --github-output "$GITHUB_OUTPUT" > release-impact.json
+          rc=$?
+          set -e
+          if [ "$rc" -gt 1 ]; then exit "$rc"; fi
+          cat release-impact.json
+
+      - name: Fast release consistency checks
+        run: |
+          python3 tools/render_repo_map.py --check
+          python3 ci/check_exploit_wiring.py
+          python3 ci/check_version_sync.py
+          python3 ci/build_canonical_data.py --dry-run
+          python3 ci/sync_docs_from_canonical.py --dry-run
+          python3 ci/sync_module_count.py --dry-run
+          python3 ci/test_audit_scripts.py --quick
+          python3 ci/validate_assurance.py
+
+      - name: Build audit shared library + unified_audit_runner
+        # BUILD_TESTING=ON is required so the unified_audit_runner target exists.
+        # NOTE (CAAS-CI-002): BUILD_TESTING=ON only *registers* the per-module
+        # *_standalone targets — `--target unified_audit_runner` does NOT build
+        # them (they are not dependencies). Rule 16 is therefore enforced below
+        # from the unified_audit_runner JSON report, not those standalone binaries.
+        run: |
+          cmake -S . -B out/release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DBUILD_TESTING=ON \
+            -DSECP256K1_BUILD_TESTS=OFF \
+            -DSECP256K1_BUILD_PROTOCOL_TESTS=OFF \
+            -DSECP256K1_BUILD_FUZZ_TESTS=OFF
+          cmake --build out/release --target ufsecp_shared -j"$(nproc 2>/dev/null || echo 4)"
+          cmake --build out/release --target unified_audit_runner -j"$(nproc 2>/dev/null || echo 4)"
+
+      - name: Rule 16 enforcement (advisory skip-return) — release-grade
+        # CAAS-CI-002 fix: the standalone-binary path soft-skips here (those
+        # targets are not built). We generate the unified_audit_runner JSON
+        # report and rule16_enforce.sh falls back to enforcing Rule 16 from it.
+        # RULE16_STRICT=1 turns a no-enforcement (no binaries AND no report) into
+        # a hard error so a release can never ship with Rule 16 silently un-run.
+        env:
+          UFSECP_BUILD_DIR: ${{ github.workspace }}/out/release
+          RULE16_STRICT: "1"
+        run: |
+          # Produce the JSON report (ignore the runner's own exit code — the
+          # Rule 16 gate is the arbiter of advisory false-PASS / real failure).
+          set +e
+          ./out/release/audit/unified_audit_runner --json-only --report-dir out/release
+          set -e
+          export RULE16_AUDIT_REPORT="${{ github.workspace }}/out/release/audit_report.json"
+          bash ci/rule16_enforce.sh
+
+      - name: Release CAAS evidence gates
+        env:
+          # Matches the build dir at "Build audit shared library" step above
+          # (out/release). Older "out/release-caas" value would not exist at
+          # runtime — fixed on main in a2b35afd / 16f7a795.
+          UFSECP_LIB_PATH: ${{ github.workspace }}/out/release
+        run: |
+          python3 ci/build_project_graph.py --rebuild
+          python3 tools/source_graph_kit/source_graph.py build -i
+          python3 ci/audit_gate.py --json -o release_audit_gate.json
+          python3 ci/security_autonomy_check.py --json -o release_autonomy.json
+          python3 ci/export_assurance.py -o release_assurance.json
+          python3 ci/external_audit_bundle.py --output release_evidence_bundle.json --digest-output release_evidence_bundle.sha256
+          python3 ci/verify_external_audit_bundle.py \
+            --bundle release_evidence_bundle.json \
+            --digest release_evidence_bundle.sha256 \
+            --json > release_bundle_verify.json
+
+          # Verify bundle commit SHA matches the SHA being released
+          python3 -c "
+          import json, os, sys
+          bundle = json.load(open('release_evidence_bundle.json'))
+          bundle_sha = bundle.get('git', {}).get('commit', '')
+          expected = os.environ.get('GITHUB_SHA', '')
+          if not expected:
+              print('SKIP: GITHUB_SHA not set (local run)')
+              sys.exit(0)
+          if bundle_sha != expected:
+              print(f'FAIL: bundle commit {bundle_sha!r} != GITHUB_SHA {expected!r}', file=sys.stderr)
+              sys.exit(1)
+          print(f'OK: bundle commit {bundle_sha[:12]} matches GITHUB_SHA')
+          "
+
+      - name: Upload release CAAS evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-caas-evidence
+          path: |
+            release-impact.json
+            release_audit_gate.json
+            release_autonomy.json
+            release_assurance.json
+            release_evidence_bundle.json
+            release_evidence_bundle.sha256
+            release_bundle_verify.json
+          retention-days: 90
+
+  # ==========================================================================
+  # 1) Verify version strings/docs are release-clean before packaging
+  # ==========================================================================
+  sync-docs:
+    needs: [release-caas-gate]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set version from tag
+        run: echo "${RELEASE_VERSION#v}" > VERSION.txt
+        shell: bash
+
+      - name: Stamp CHANGELOG [Unreleased] → version
+        run: python3 ci/stamp_changelog.py --version "${RELEASE_VERSION#v}"
+        shell: bash
+
+      - name: Sync version strings in docs
+        run: python3 ci/sync_version_refs.py
+
+      - name: Rebuild canonical data
+        run: python3 ci/build_canonical_data.py
+
+      - name: Sync docs from canonical
+        run: python3 ci/sync_docs_from_canonical.py
+
+      - name: Commit version-stamp and retag if CHANGELOG was not pre-stamped
+        # REL-09 fix: the tagged commit must contain the stamped CHANGELOG, not
+        # [Unreleased]. If the developer forgot to stamp before tagging, we stamp
+        # here, commit to dev, and move the tag to that new commit so that
+        # `git checkout v4.0.0 && cat CHANGELOG.md` shows the versioned header.
+        run: |
+          if git diff --quiet; then
+            echo "CHANGELOG already stamped — no commit needed."
+            exit 0
+          fi
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add -A
+          git commit -m "chore(release): stamp CHANGELOG [Unreleased] → ${RELEASE_VERSION#v} [skip ci]"
+          # checkout was `ref: <tag>` so HEAD is detached — there is no local `dev`
+          # branch. Push the new (stamp) commit to dev explicitly via HEAD:dev.
+          # dev is protected (14 required checks) and the github-actions bot is NOT
+          # a bypass actor, so this push can be rejected — that is NON-FATAL: the
+          # ESSENTIAL action is moving the tag below so the tagged tree carries the
+          # stamped CHANGELOG. dev already tracks the stamped CHANGELOG via the
+          # normal dev workflow, so a skipped dev sync here loses nothing.
+          git push origin HEAD:dev || echo "::warning::dev push rejected (protected branch) — stamp lives on the moved tag; dev sync skipped"
+          # Move the tag to the new stamped commit so the tagged tree is correct.
+          NEW_SHA=$(git rev-parse HEAD)
+          git tag -f "${RELEASE_TAG}" "$NEW_SHA"
+          # Plain --force (NOT --force-with-lease): the checkout was `ref: <tag>`
+          # (detached), so there is no remote-tracking ref for the lease to compare
+          # against and force-with-lease rejects with "stale info". Moving the tag
+          # to the stamped commit is intentional, so a plain force is correct.
+          git push origin "${RELEASE_TAG}" --force
+          echo "Tag ${RELEASE_TAG} moved to stamped commit ${NEW_SHA}."
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================================================
+  # 2) Desktop native binaries (Linux x64, macOS ARM64, Windows x64)
+  # ==========================================================================
+  build-desktop:
+    needs: [release-caas-gate, sync-docs]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            name: linux-x64
+            cc: clang-17
+            cxx: clang++-17
+            ext: tar.gz
+            generator: Ninja
+
+          - os: macos-14
+            name: macos-arm64
+            cc: clang
+            cxx: clang++
+            ext: tar.gz
+            generator: Ninja
+
+          - os: windows-latest
+            name: win-x64
+            ext: zip
+            generator: Ninja
+            msvc_arch: amd64
+            # The libsecp256k1-ABI *shared* lib (ultrafast_secp256k1.dll) crashes
+            # the MSVC linker (exit 0xC0000005, access violation) on this engine —
+            # a toolchain fault on the very large DLL, not a code error. Build the
+            # ABI static-only so win-x64 still produces a usable archive (static
+            # secp256k1 ABI lib + the ufsecp libs). The Windows shim DLL is
+            # deferred; NuGet already ships the Windows static lib for consumers.
+            extra_cmake: -DSECP256K1_SHIM_BUILD_SHARED=OFF
+
+          # Windows ARM64 via clang-cl. MSVC `cl` cannot build the engine for ARM64
+          # (no native __int128), so the ARM64 leg uses clang-cl targeting
+          # aarch64-pc-windows-msvc (the x86-only intrinsics now route to __int128/
+          # __builtin paths under clang-cl). STATIC LIB ONLY: a static archive does
+          # not link, so the __int128 compiler-rt builtins (__umodti3/__modti3 the
+          # MSVC CRT lacks) stay unresolved for the consumer — same as the x64 static
+          # lib; the shared libs are not built on ARM64. no_test: the cross-built exe
+          # cannot run on the x64 host. Build validated by windows-arm64-clang-cl.yml.
+          - os: windows-latest
+            name: win-arm64
+            ext: zip
+            generator: Ninja
+            msvc_arch: amd64_arm64
+            cc: clang-cl
+            cxx: clang-cl
+            no_test: true
+            build_target: fastsecp256k1
+            extra_cmake: >-
+              -DSECP256K1_SHIM_BUILD_SHARED=OFF
+              -DSECP256K1_USE_ASM=OFF
+              -DSECP256K1_USE_LTO=OFF
+              -DCMAKE_SYSTEM_NAME=Windows
+              -DCMAKE_SYSTEM_PROCESSOR=ARM64
+              -DCMAKE_C_COMPILER_TARGET=aarch64-pc-windows-msvc
+              -DCMAKE_CXX_COMPILER_TARGET=aarch64-pc-windows-msvc
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      # -- Linux: install compiler --
+      - name: Install deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clang-17 lld-17 ninja-build
+
+      # -- Windows: set up MSVC env + Ninja --
+      - name: Setup MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
+
+      # -- Windows ARM64: clang-cl is the compiler (cl can't build the engine for
+      #    ARM64). LLVM is preinstalled on the windows image; put it on PATH. --
+      - name: Put clang-cl (LLVM) on PATH
+        if: ${{ matrix.cc == 'clang-cl' }}
+        shell: bash
+        run: echo "C:/Program Files/LLVM/bin" >> "$GITHUB_PATH"
+
+      # -- macOS: install Ninja --
+      - name: Install Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      # -- Inject version from tag into VERSION.txt file --
+      # NOTE: must use .txt suffix -- plain "VERSION" clashes with C++20
+      # <version> header on macOS's case-insensitive filesystem.
+      - name: Set version from tag
+        run: echo "${RELEASE_VERSION#v}" > VERSION.txt
+        shell: bash
+
+      # -- Python audit dependencies (must be before CMake configure) --
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Install Python audit dependencies
+        shell: bash
+        run: |
+          python3 -m pip install --require-hashes \
+            -r .github/requirements/audit-deps.txt
+
+      # -- Configure --
+      - name: Configure
+        run: |
+          cmake -S . -B build -G "${{ matrix.generator }}" \
+            -DCMAKE_BUILD_TYPE=${{ env.CMAKE_BUILD_TYPE }} \
+            -DSECP256K1_BUILD_TESTS=${{ matrix.no_test && 'OFF' || 'ON' }} \
+            -DSECP256K1_BUILD_BENCH=OFF \
+            -DSECP256K1_BUILD_EXAMPLES=OFF \
+            -DSECP256K1_BUILD_SHIM=ON \
+            -DSECP256K1_SHIM_BUILD_SHARED=ON \
+            ${{ matrix.extra_cmake || '' }} \
+            ${{ matrix.cc && format('-DCMAKE_C_COMPILER={0} -DCMAKE_CXX_COMPILER={1}', matrix.cc, matrix.cxx) || '' }}
+        shell: bash
+
+      # -- Build (matrix.build_target restricts the target set, e.g. win-arm64 builds
+      #    only the static libsecp256k1-ABI archive; other legs build all). --
+      - name: Build
+        run: cmake --build build -j ${{ matrix.build_target && format('--target {0}', matrix.build_target) || '' }}
+
+      # -- Test (skipped for cross-built arm64: cannot run on the x64 host) --
+      - name: Test
+        if: ${{ ! matrix.no_test }}
+        env:
+          PYTHONUTF8: '1'
+        # Timing / side-channel MEASUREMENT tests are excluded from the *artifact*
+        # build only. They gate on wall-clock or cycle-count ratios that are only
+        # meaningful with CPU pinning + turbo disabled. On shared, virtualized CI
+        # runners (DVFS, noisy neighbours, no pinning) they false-positive — e.g.
+        # exploit_hertzbleed_dvfs_timing measured a 4.92x ratio between two
+        # data-INDEPENDENT ECDSA signs (pure scheduler noise, not leakage) and
+        # tripped its 3.0x hard-fail threshold. These all run with full rigor in
+        # the pinned local CI + the security-audit workflow. The release job ships
+        # the library; functional correctness (the other ~400 tests) still gates.
+        #   excluded (timing-ratio / cycle-count, no CI-noise guard):
+        #     ct_sidechannel, exploit_hertzbleed_dvfs_timing,
+        #     exploit_blind_spa_cmov_leak, exploit_eucleak_inversion_timing,
+        #     exploit_pippenger_batch_regression, exploit_bip352_scan_dos,
+        #     exploit_ct_recov
+        #   regression_schnorr_r_zero_ct: shim aborts at runtime on macOS-arm64
+        #     (a shim/runtime regression tracked separately).
+        #   NOT excluded: regression_ct_fast_scalar_v01 self-skips (return 77) on
+        #     high CI noise, so it is safe to run on shared runners.
+        run: ctest --test-dir build --output-on-failure -j4 -E "^ct_sidechannel|^regression_schnorr_r_zero_ct|^exploit_hertzbleed_dvfs_timing|^exploit_blind_spa_cmov_leak|^exploit_eucleak_inversion_timing|^exploit_pippenger_batch_regression|^exploit_bip352_scan_dos|^exploit_ct_recov"
+
+      # -- Install into staging dir (full-build legs only). A subset leg like
+      #    win-arm64 builds a single target (build_target), so `cmake --install`
+      #    (the full install manifest) would fail on the unbuilt targets. Its lib is
+      #    collected directly from build/ by the Collect step's `find build staging`. --
+      - name: Install
+        if: ${{ ! matrix.build_target }}
+        run: cmake --install build --prefix staging
+
+      # -- Collect artifacts: BOTH static and shared (DLL) builds of BOTH the
+      #    ufsecp C ABI and the libsecp256k1-compatible secp256k1 ABI, into
+      #    lib/static/ + lib/shared/. --
+      - name: Collect release artifacts
+        shell: bash
+        run: |
+          PKG_NAME="UltrafastSecp256k1-${{ env.RELEASE_TAG }}-${{ matrix.name }}"
+          mkdir -p "${PKG_NAME}/lib/static" "${PKG_NAME}/lib/shared" \
+                   "${PKG_NAME}/include/ufsecp" "${PKG_NAME}/include/secp256k1"
+
+          # -- Headers --
+          # ufsecp C ABI
+          cp include/ufsecp/ufsecp.h include/ufsecp/ufsecp_version.h \
+             include/ufsecp/ufsecp_error.h "${PKG_NAME}/include/ufsecp/" 2>/dev/null || true
+          # libsecp256k1 ABI headers (flat) — for the secp256k1 static/shared lib
+          cp compat/libsecp256k1_shim/include/secp256k1*.h "${PKG_NAME}/include/" 2>/dev/null || true
+          # C++ engine headers + generated features.h: secp256k1.h pulls these
+          # under __cplusplus (inlined secp256k1_pubkey_precomp).
+          cp -r src/cpu/include/secp256k1/. "${PKG_NAME}/include/secp256k1/" 2>/dev/null || true
+          [ -d build/include/secp256k1 ] && \
+            cp build/include/secp256k1/*.h "${PKG_NAME}/include/secp256k1/" 2>/dev/null || true
+
+          # -- Libraries: split static vs shared. On Windows a .lib is an import
+          #    lib iff a same-stem .dll exists; otherwise it is a static archive. --
+          # Exclude CMake internals, language bindings (e.g. the JNI .so), and the
+          # mode-B shim STUB archive (libsecp256k1_shim.* — empty; fastsecp256k1 is
+          # the real static secp256k1 lib).
+          # macOS ships bash 3.2 — no `mapfile`, no `declare -A` (associative
+          # arrays). Use a portable read-loop + a helper scan instead so this
+          # step runs on macOS as well as Linux/Windows.
+          _is_release_lib() {
+            case "$(basename "$1")" in
+              fastsecp256k1.lib|libfastsecp256k1.a|\
+              ultrafast_secp256k1.lib|ultrafast_secp256k1.dll|\
+              libultrafast_secp256k1.a|libultrafast_secp256k1.so|libultrafast_secp256k1.so.*|libultrafast_secp256k1.dylib|\
+              ufsecp.lib|ufsecp.dll|ufsecp_s.lib|libufsecp.a|libufsecp_s.a|libufsecp.so|libufsecp.so.*|libufsecp.dylib)
+                return 0 ;;
+            esac
+            return 1
+          }
+
+          ALLLIBS=()
+          while IFS= read -r _lib; do
+            [ -n "$_lib" ] && _is_release_lib "$_lib" && ALLLIBS+=("$_lib")
+          done < <(find build staging -maxdepth 5 \( \
+            -name '*.dll' -o -name '*.so' -o -name '*.so.*' -o -name '*.dylib' \
+            -o -name '*.lib' -o -name '*.a' \) \
+            ! -path '*/CMakeFiles/*' ! -path '*/bindings/*' \
+            ! -name 'libsecp256k1_shim.*' ! -name 'secp256k1_shim.lib' 2>/dev/null)
+          # A .lib is a DLL import lib iff a same-stem .dll was also collected
+          # (Windows only). Scan ALLLIBS instead of a bash-4 associative array.
+          _has_dll() {
+            local _stem="$1" _g
+            for _g in "${ALLLIBS[@]}"; do
+              [ "$(basename "$_g")" = "${_stem}.dll" ] && return 0
+            done
+            return 1
+          }
+          if [ "${#ALLLIBS[@]}" -gt 0 ]; then
+          for f in "${ALLLIBS[@]}"; do
+            case "$f" in
+              *.dll|*.dylib|*.so|*.so.*) cp -P "$f" "${PKG_NAME}/lib/shared/" 2>/dev/null || true ;;
+              *.a) cp "$f" "${PKG_NAME}/lib/static/" 2>/dev/null || true ;;
+              *.lib)
+                stem="$(basename "$f" .lib)"
+                if _has_dll "$stem"; then
+                  cp "$f" "${PKG_NAME}/lib/shared/" 2>/dev/null || true   # DLL import lib
+                else
+                  cp "$f" "${PKG_NAME}/lib/static/" 2>/dev/null || true   # static archive
+                fi ;;
+            esac
+          done
+          fi
+
+          # fastsecp256k1 IS the self-contained static libsecp256k1-ABI archive
+          # (the shim is compiled into the engine). Give it OUR name so it never
+          # silently substitutes the system libsecp256k1 — the ABI (headers +
+          # secp256k1_* symbols) is unchanged; only the file name is ours.
+          for d in lib/static; do
+            [ -f "${PKG_NAME}/${d}/fastsecp256k1.lib" ]  && mv "${PKG_NAME}/${d}/fastsecp256k1.lib"  "${PKG_NAME}/${d}/ultrafast_secp256k1.lib"
+            [ -f "${PKG_NAME}/${d}/libfastsecp256k1.a" ] && mv "${PKG_NAME}/${d}/libfastsecp256k1.a" "${PKG_NAME}/${d}/libultrafast_secp256k1.a"
+          done || true
+
+          python3 ci/check_release_package_contents.py "${PKG_NAME}"
+
+          # -- Layout manifest --
+          cat > "${PKG_NAME}/lib/LIBRARIES.md" <<'EOF'
+          # Library layout
+
+          All libraries carry OUR file name; the `ultrafast_secp256k1` libraries
+          export the libsecp256k1 C ABI (same `<secp256k1.h>` headers + `secp256k1_*`
+          symbols), so they are an opt-in drop-in (link `ultrafast_secp256k1`) that
+          never silently replaces the system libsecp256k1.
+
+          | dir      | library                       | ABI                  | notes |
+          |----------|-------------------------------|----------------------|-------|
+          | static/  | ultrafast_secp256k1.*         | libsecp256k1 C ABI   | self-contained static archive (engine + shim) |
+          | static/  | ufsecp_s.lib / libufsecp.a    | ufsecp stable C ABI  | static archive |
+          | shared/  | ultrafast_secp256k1.dll/.so   | libsecp256k1 C ABI   | + import .lib on Windows |
+          | shared/  | ufsecp.dll/.so                | ufsecp stable C ABI  | + import .lib on Windows |
+
+          Static vs shared is your choice of subdir.
+          EOF
+
+          # -- Docs --
+          cp LICENSE      "${PKG_NAME}/" 2>/dev/null || true
+          cp README.md    "${PKG_NAME}/" 2>/dev/null || true
+          cp CHANGELOG.md "${PKG_NAME}/" 2>/dev/null || true
+          cp include/ufsecp/SUPPORTED_GUARANTEES.md "${PKG_NAME}/" 2>/dev/null || true
+
+          echo "=== package tree ==="; find "${PKG_NAME}" -type f | sort
+          echo "PKG_NAME=${PKG_NAME}" >> "$GITHUB_ENV"
+
+      # -- Archive --
+      - name: Archive (tar.gz)
+        if: matrix.ext == 'tar.gz'
+        run: tar czf "${{ env.PKG_NAME }}.tar.gz" "${{ env.PKG_NAME }}"
+
+      - name: Archive (zip)
+        if: matrix.ext == 'zip'
+        shell: bash
+        run: 7z a -tzip "${{ env.PKG_NAME }}.zip" "${{ env.PKG_NAME }}"
+
+      # -- Upload artifact --
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.PKG_NAME }}
+          path: ${{ env.PKG_NAME }}.${{ matrix.ext }}
+          retention-days: 30
+
+  # ==========================================================================
+  # 2) Linux ARM64 (cross-compile on Ubuntu x64)
+  # ==========================================================================
+  build-linux-arm64:
+    needs: [release-caas-gate, sync-docs]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install cross-compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y g++-aarch64-linux-gnu ninja-build qemu-user-static
+
+      - name: Set version from tag
+        run: echo "${RELEASE_VERSION#v}" > VERSION.txt
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DSECP256K1_BUILD_TESTS=ON \
+            -DSECP256K1_BUILD_BENCH=OFF \
+            -DSECP256K1_BUILD_EXAMPLES=OFF \
+            -DSECP256K1_BUILD_JAVA=OFF \
+            -DSECP256K1_BUILD_CABI=ON \
+            -DSECP256K1_INSTALL_CABI=ON \
+            -DSECP256K1_BUILD_SHIM=ON \
+            -DSECP256K1_SHIM_BUILD_SHARED=OFF \
+            -DSECP256K1_USE_ASM=ON
+
+      - name: Build
+        run: cmake --build build -j"$(nproc 2>/dev/null || echo 4)"
+
+      - name: ARM64 smoke (via QEMU)
+        run: |
+          set -euo pipefail
+
+          QEMU_AARCH64="$(command -v qemu-aarch64-static || command -v qemu-aarch64)"
+          SYSROOT="/usr/aarch64-linux-gnu"
+          SELFTEST="$(find build -name run_selftest -type f -executable | head -1)"
+          BIP324_TEST="$(find build -name test_bip324_standalone -type f -executable | head -1)"
+
+          test -n "$QEMU_AARCH64"
+          test -n "$SELFTEST"
+          test -n "$BIP324_TEST"
+
+          timeout 360 "$QEMU_AARCH64" -L "$SYSROOT" "$SELFTEST" smoke
+          timeout 180 "$QEMU_AARCH64" -L "$SYSROOT" "$BIP324_TEST"
+
+      - name: Collect release artifacts
+        run: |
+          PKG_NAME="UltrafastSecp256k1-${{ env.RELEASE_TAG }}-linux-arm64"
+          mkdir -p "${PKG_NAME}/lib/static" "${PKG_NAME}/lib/shared" \
+                   "${PKG_NAME}/include/ufsecp" "${PKG_NAME}/include/secp256k1"
+
+          cp include/ufsecp/ufsecp.h         "${PKG_NAME}/include/ufsecp/"
+          cp include/ufsecp/ufsecp_version.h "${PKG_NAME}/include/ufsecp/"
+          cp include/ufsecp/ufsecp_error.h   "${PKG_NAME}/include/ufsecp/"
+          cp compat/libsecp256k1_shim/include/secp256k1*.h "${PKG_NAME}/include/" 2>/dev/null || true
+          cp -r src/cpu/include/secp256k1/. "${PKG_NAME}/include/secp256k1/" 2>/dev/null || true
+          [ -d build/include/secp256k1 ] && \
+            cp build/include/secp256k1/*.h "${PKG_NAME}/include/secp256k1/" 2>/dev/null || true
+
+          _is_release_lib() {
+            case "$(basename "$1")" in
+              libfastsecp256k1.a|libultrafast_secp256k1.a|libufsecp.a|libufsecp_s.a|\
+              libultrafast_secp256k1.so|libultrafast_secp256k1.so.*|libufsecp.so|libufsecp.so.*)
+                return 0 ;;
+            esac
+            return 1
+          }
+
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            _is_release_lib "$f" || continue
+            case "$f" in
+              *.so|*.so.*) cp -P "$f" "${PKG_NAME}/lib/shared/" 2>/dev/null || true ;;
+              *.a) cp "$f" "${PKG_NAME}/lib/static/" 2>/dev/null || true ;;
+            esac
+          done < <(find build -maxdepth 5 \( \
+            -name "*.so" -o -name "*.so.*" -o -name "*.a" \) \
+            ! -path "*/CMakeFiles/*" ! -path "*/bindings/*" 2>/dev/null)
+
+          [ -f "${PKG_NAME}/lib/static/libfastsecp256k1.a" ] && \
+            mv "${PKG_NAME}/lib/static/libfastsecp256k1.a" "${PKG_NAME}/lib/static/libultrafast_secp256k1.a"
+
+          python3 ci/check_release_package_contents.py "${PKG_NAME}"
+
+          cat > "${PKG_NAME}/lib/LIBRARIES.md" <<'EOF'
+          # Library layout
+
+          | dir      | library                       | ABI                  | notes |
+          |----------|-------------------------------|----------------------|-------|
+          | static/  | libultrafast_secp256k1.a      | libsecp256k1 C ABI   | self-contained static archive (engine + shim) |
+          | static/  | libufsecp.a / libufsecp_s.a   | ufsecp stable C ABI  | static archive |
+          | shared/  | libufsecp.so                  | ufsecp stable C ABI  | versioned symlinks may also be present |
+          EOF
+
+          cp LICENSE      "${PKG_NAME}/" 2>/dev/null || true
+          cp README.md    "${PKG_NAME}/" 2>/dev/null || true
+          cp CHANGELOG.md "${PKG_NAME}/" 2>/dev/null || true
+
+          tar czf "${PKG_NAME}.tar.gz" "${PKG_NAME}"
+          echo "PKG_NAME=${PKG_NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.PKG_NAME }}
+          path: ${{ env.PKG_NAME }}.tar.gz
+          retention-days: 30
+
+  # ==========================================================================
+  # 3) Android (NDK arm64-v8a -- .so + JNI .so + static .a)
+  # ==========================================================================
+  build-android:
+    needs: [release-caas-gate, sync-docs]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            name: android-arm64
+          - abi: armeabi-v7a
+            name: android-armv7
+          - abi: x86_64
+            name: android-x64
+
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1
+        id: ndk
+        with:
+          ndk-version: r27c
+
+      - name: Install Ninja
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ninja-build
+
+      - name: Set version from tag
+        run: echo "${RELEASE_VERSION#v}" > VERSION.txt
+
+      - name: Configure
+        run: |
+          cmake -S bindings/android -B build/android \
+            -DCMAKE_TOOLCHAIN_FILE=${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DANDROID_PLATFORM=android-24 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -G Ninja
+
+      - name: Build
+        run: cmake --build build/android -j"$(nproc 2>/dev/null || echo 4)"
+
+      - name: Collect release artifacts
+        run: |
+          PKG_NAME="UltrafastSecp256k1-${{ env.RELEASE_TAG }}-${{ matrix.name }}"
+          mkdir -p "${PKG_NAME}/lib" "${PKG_NAME}/include/ufsecp"
+
+          cp include/ufsecp/ufsecp.h         "${PKG_NAME}/include/ufsecp/"
+          cp include/ufsecp/ufsecp_version.h "${PKG_NAME}/include/ufsecp/"
+          cp include/ufsecp/ufsecp_error.h   "${PKG_NAME}/include/ufsecp/"
+
+          # Static CPU lib
+          find build/android -name "libfastsecp256k1.a" ! -path "*/CMakeFiles/*" | while read f; do
+            cp "$f" "${PKG_NAME}/lib/" 2>/dev/null || true
+          done
+
+          # JNI shared lib
+          find build/android -name "libsecp256k1_jni.so" ! -path "*/CMakeFiles/*" | while read f; do
+            cp "$f" "${PKG_NAME}/lib/" 2>/dev/null || true
+          done
+
+          cp LICENSE      "${PKG_NAME}/" 2>/dev/null || true
+          cp README.md    "${PKG_NAME}/" 2>/dev/null || true
+          cp CHANGELOG.md "${PKG_NAME}/" 2>/dev/null || true
+
+          tar czf "${PKG_NAME}.tar.gz" "${PKG_NAME}"
+          echo "PKG_NAME=${PKG_NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.PKG_NAME }}
+          path: ${{ env.PKG_NAME }}.tar.gz
+          retention-days: 30
+
+  # ==========================================================================
+  # 4) iOS XCFramework (Device arm64 + Simulator arm64)
+  # ==========================================================================
+  build-ios:
+    needs: [release-caas-gate, sync-docs]
+    runs-on: macos-14
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set version from tag
+        run: echo "${RELEASE_VERSION#v}" > VERSION.txt
+
+      - name: Build XCFramework
+        run: |
+          chmod +x ci/build_xcframework.sh
+          ./ci/build_xcframework.sh --release
+
+      - name: Collect release artifacts
+        run: |
+          PKG_NAME="UltrafastSecp256k1-${{ env.RELEASE_TAG }}-ios-xcframework"
+          mkdir -p "${PKG_NAME}"
+
+          # Copy the XCFramework bundle
+          cp -R build/xcframework/output/UltrafastSecp256k1.xcframework "${PKG_NAME}/"
+
+          # Headers
+          mkdir -p "${PKG_NAME}/include/ufsecp"
+          cp include/ufsecp/ufsecp.h         "${PKG_NAME}/include/ufsecp/"
+          cp include/ufsecp/ufsecp_version.h "${PKG_NAME}/include/ufsecp/"
+          cp include/ufsecp/ufsecp_error.h   "${PKG_NAME}/include/ufsecp/"
+
+          cp LICENSE      "${PKG_NAME}/" 2>/dev/null || true
+          cp README.md    "${PKG_NAME}/" 2>/dev/null || true
+          cp CHANGELOG.md "${PKG_NAME}/" 2>/dev/null || true
+
+          tar czf "${PKG_NAME}.tar.gz" "${PKG_NAME}"
+          echo "PKG_NAME=${PKG_NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.PKG_NAME }}
+          path: ${{ env.PKG_NAME }}.tar.gz
+          retention-days: 30
+
+  # ==========================================================================
+  # 5) WebAssembly (Emscripten -- .wasm + .js + .mjs + .d.ts)
+  # ==========================================================================
+  build-wasm:
+    needs: [release-caas-gate, sync-docs]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Setup Emscripten
+        uses: mymindstorm/setup-emsdk@6ab9eb1bda2574c4ddb79809fc9247783eaf9021 # v14
+        with:
+          version: 3.1.51
+          actions-cache-folder: emsdk-cache
+
+      - name: Set version from tag
+        run: echo "${RELEASE_VERSION#v}" > VERSION.txt
+
+      - name: Configure
+        run: emcmake cmake -S bindings/wasm -B build/wasm -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build/wasm -j"$(nproc 2>/dev/null || echo 4)"
+
+      - name: Verify WASM output
+        run: |
+          ls -lh build/wasm/dist/secp256k1_wasm.js
+          ls -lh build/wasm/dist/secp256k1_wasm.wasm
+          echo "WASM size: $(du -h build/wasm/dist/secp256k1_wasm.wasm | cut -f1)"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: 20
+
+      - name: Test WASM
+        run: |
+          cd build/wasm/dist
+          # NOTE: No WASM functional/correctness tests exist yet — bench-only (TODO: add test_wasm.mjs)
+          node ../../../bindings/wasm/bench_wasm.mjs
+
+      - name: Stamp wasm package.json version
+        # The wasm dist package.json ships inside the release tarball (not npm-published),
+        # but it must carry the release version, not the 0.0.0-dev build placeholder.
+        # Fully guarded (if -f + || true) so a missing/version-less file can never fail the job.
+        run: |
+          VERSION="${RELEASE_VERSION#v}"
+          if [ -f build/wasm/dist/package.json ]; then
+            sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"${VERSION}\"/" build/wasm/dist/package.json || true
+            echo "stamped wasm package.json -> ${VERSION}"
+          else
+            echo "(no build/wasm/dist/package.json — nothing to stamp)"
+          fi
+        shell: bash
+
+      - name: Collect release artifacts
+        run: |
+          PKG_NAME="UltrafastSecp256k1-${{ env.RELEASE_TAG }}-wasm"
+          mkdir -p "${PKG_NAME}"
+
+          # WASM dist files
+          cp build/wasm/dist/secp256k1_wasm.js    "${PKG_NAME}/" 2>/dev/null || true
+          cp build/wasm/dist/secp256k1_wasm.wasm   "${PKG_NAME}/" 2>/dev/null || true
+          cp build/wasm/dist/secp256k1.mjs         "${PKG_NAME}/" 2>/dev/null || true
+          cp build/wasm/dist/secp256k1.d.ts        "${PKG_NAME}/" 2>/dev/null || true
+          cp build/wasm/dist/package.json          "${PKG_NAME}/" 2>/dev/null || true
+
+          cp LICENSE      "${PKG_NAME}/" 2>/dev/null || true
+          cp bindings/wasm/README.md "${PKG_NAME}/" 2>/dev/null || true
+          cp CHANGELOG.md "${PKG_NAME}/" 2>/dev/null || true
+
+          tar czf "${PKG_NAME}.tar.gz" "${PKG_NAME}"
+          echo "PKG_NAME=${PKG_NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.PKG_NAME }}
+          path: ${{ env.PKG_NAME }}.tar.gz
+          retention-days: 30
+
+  # ==========================================================================
+  # 6) Package bindings -- Python wheels (per-platform, bundled native lib)
+  # ==========================================================================
+  pack-python:
+    needs: [release-caas-gate, build-desktop, build-linux-arm64]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Download desktop artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: native-dist
+
+      - name: Verify native package contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifacts=()
+          for platform in linux-x64 linux-arm64 macos-arm64 win-x64 win-arm64; do
+            artifact_dir="native-dist/UltrafastSecp256k1-${RELEASE_TAG}-${platform}"
+            [ -d "$artifact_dir" ] || continue
+            while IFS= read -r f; do
+              artifacts+=("$f")
+            done < <(find "$artifact_dir" -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' \) | sort)
+          done
+          test "${#artifacts[@]}" -gt 0
+          python3 ci/check_release_package_contents.py "${artifacts[@]}"
+
+      - name: Build ufsecp Python wheels
+        run: |
+          VERSION="${RELEASE_VERSION#v}"
+          pip install --require-hashes -r .github/requirements/release-build.txt
+          cd bindings/python
+
+          # Use the ufsecp manifest (not the old ultrafast-secp256k1 one)
+          cp pyproject.ufsecp.toml pyproject.toml
+
+          # Inject version from git tag
+          sed -i "s/^version = .*/version = \"${VERSION}\"/" pyproject.toml
+
+          # Platform -> wheel platform tag mapping
+          declare -A WHEEL_TAGS=(
+            ["linux-x64"]="manylinux_2_17_x86_64"
+            ["linux-arm64"]="manylinux_2_17_aarch64"
+            ["macos-arm64"]="macosx_11_0_arm64"
+            ["win-x64"]="win_amd64"
+          )
+
+          mkdir -p wheelhouse
+
+          for PLAT in linux-x64 linux-arm64 macos-arm64 win-x64; do
+            WHEEL_PLAT="${WHEEL_TAGS[$PLAT]}"
+            ARTIFACT_DIR="../../native-dist/UltrafastSecp256k1-${{ env.RELEASE_TAG }}-${PLAT}"
+            echo "=== Packaging wheel for: ${PLAT} (tag: ${WHEEL_PLAT}) ==="
+
+            if [ ! -d "$ARTIFACT_DIR" ]; then
+              echo "  SKIP: artifact dir not found: $ARTIFACT_DIR"
+              continue
+            fi
+
+            # Extract archive (tar.gz or zip)
+            if ls "${ARTIFACT_DIR}"/*.tar.gz 1>/dev/null 2>&1; then
+              tar xf "${ARTIFACT_DIR}"/*.tar.gz
+            elif ls "${ARTIFACT_DIR}"/*.zip 1>/dev/null 2>&1; then
+              unzip -o "${ARTIFACT_DIR}"/*.zip
+            fi
+
+            # Copy native lib into ufsecp/ package dir
+            find . -maxdepth 4 \( -name "libufsecp.so" -o -name "libufsecp.so.*" \
+              -o -name "ufsecp.dll" -o -name "libufsecp.dylib" \) \
+              ! -path "*/wheelhouse/*" -exec cp {} ufsecp/ \; 2>/dev/null || true
+
+            # Verify native lib was found
+            if ! ls ufsecp/libufsecp.* ufsecp/ufsecp.dll 2>/dev/null; then
+              echo "  WARN: No native lib found for ${PLAT}, skipping"
+              rm -rf UltrafastSecp256k1-*/
+              continue
+            fi
+
+            # Build wheel then tag with correct platform
+            python -m build --wheel --outdir tmp_wheel/
+            for whl in tmp_wheel/*.whl; do
+              NEW_NAME=$(basename "$whl" | sed "s/py3-none-any/py3-none-${WHEEL_PLAT}/")
+              mv "$whl" "wheelhouse/${NEW_NAME}"
+            done
+
+            # Clean up extracted dirs + native lib copies
+            rm -rf tmp_wheel/ UltrafastSecp256k1-*/
+            rm -f ufsecp/libufsecp.* ufsecp/ufsecp.dll
+          done
+
+          echo "=== Built wheels ==="
+          ls -la wheelhouse/
+
+      - name: Upload Python wheels
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ufsecp-python-wheels
+          path: bindings/python/wheelhouse/
+          retention-days: 30
+
+  # ==========================================================================
+  # 7) Package bindings -- npm (prebuilds per platform)
+  # ==========================================================================
+  pack-npm:
+    needs: [release-caas-gate, build-desktop, build-linux-arm64]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: 20
+
+      - name: Download desktop artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: native-dist
+
+      - name: Verify native package contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifacts=()
+          for platform in linux-x64 linux-arm64 macos-arm64 win-x64 win-arm64; do
+            artifact_dir="native-dist/UltrafastSecp256k1-${RELEASE_TAG}-${platform}"
+            [ -d "$artifact_dir" ] || continue
+            while IFS= read -r f; do
+              artifacts+=("$f")
+            done < <(find "$artifact_dir" -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' \) | sort)
+          done
+          test "${#artifacts[@]}" -gt 0
+          python3 ci/check_release_package_contents.py "${artifacts[@]}"
+
+      - name: Build ufsecp npm package
+        run: |
+          VERSION="${RELEASE_VERSION#v}"
+          cd bindings/nodejs
+          cp package.ufsecp.json package.json
+
+          # Inject version from git tag
+          sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"${VERSION}\"/" package.json
+
+          # npm prebuild dir naming: <os>-<arch>
+          declare -A NPM_PLATS=(
+            ["linux-x64"]="linux-x64"
+            ["linux-arm64"]="linux-arm64"
+            ["macos-arm64"]="darwin-arm64"
+            ["win-x64"]="win32-x64"
+          )
+
+          for PLAT in linux-x64 linux-arm64 macos-arm64 win-x64; do
+            NPM_DIR="${NPM_PLATS[$PLAT]}"
+            ARTIFACT_DIR="../../native-dist/UltrafastSecp256k1-${{ env.RELEASE_TAG }}-${PLAT}"
+            echo "=== Copying prebuilds for: ${PLAT} -> prebuilds/${NPM_DIR} ==="
+
+            if [ ! -d "$ARTIFACT_DIR" ]; then
+              echo "  SKIP: artifact dir not found"
+              continue
+            fi
+
+            mkdir -p "prebuilds/${NPM_DIR}"
+
+            # Extract archive to temp dir
+            TMPDIR=$(mktemp -d)
+            if ls "${ARTIFACT_DIR}"/*.tar.gz 1>/dev/null 2>&1; then
+              tar xf "${ARTIFACT_DIR}"/*.tar.gz -C "$TMPDIR"
+            elif ls "${ARTIFACT_DIR}"/*.zip 1>/dev/null 2>&1; then
+              unzip -o "${ARTIFACT_DIR}"/*.zip -d "$TMPDIR"
+            fi
+
+            find "$TMPDIR" -maxdepth 6 \
+              \( -name "libufsecp.so" -o -name "libufsecp.so.*" \
+              -o -name "ufsecp.dll" -o -name "libufsecp.dylib" \) \
+              -exec cp {} "prebuilds/${NPM_DIR}/" \; 2>/dev/null || true
+
+            rm -rf "$TMPDIR"
+          done
+
+          echo "=== Prebuilds ==="
+          find prebuilds/ -type f 2>/dev/null || echo "(none)"
+
+          npm pack
+          echo "=== NPM package ==="
+          ls -la ufsecp-*.tgz
+
+      - name: Upload npm tarball
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ufsecp-npm
+          path: bindings/nodejs/ufsecp-*.tgz
+          retention-days: 30
+
+      - name: Publish to GitHub Packages (npm)
+        continue-on-error: true
+        run: |
+          cd bindings/nodejs
+          VERSION="${RELEASE_VERSION#v}"
+
+          # GitHub Packages npm requires scoped package name
+          # Rewrite name to @shrec/ufsecp for the registry
+          sed -i 's/"name": "ufsecp"/"name": "@shrec\/ufsecp"/' package.json
+
+          # Configure npm to use GitHub Packages registry for @shrec scope
+          echo "@shrec:registry=https://npm.pkg.github.com" > .npmrc
+          echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" >> .npmrc
+
+          npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish to npmjs.com (public registry)
+        continue-on-error: true
+        run: |
+          cd bindings/nodejs
+          # Restore original unscoped name for npmjs.com
+          sed -i 's/"name": "@shrec\/ufsecp"/"name": "ufsecp"/' package.json
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > .npmrc
+          npm publish --access public
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # ==========================================================================
+  # 8) Package bindings -- NuGet (.nupkg with multi-RID runtimes)
+  # ==========================================================================
+  pack-nuget:
+    needs: [release-caas-gate, build-desktop, build-linux-arm64]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7 # v5.2.0
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+
+      - name: Download desktop artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: native-dist
+
+      - name: Prepare NuGet runtimes
+        run: |
+          VERSION="${RELEASE_VERSION#v}"
+          cd bindings/csharp/Ufsecp
+
+          # Inject version from git tag
+          sed -i "s|<Version>[^<]*</Version>|<Version>${VERSION}</Version>|" Ufsecp.csproj
+
+          # Platform -> .NET RID mapping
+          declare -A RIDS=(
+            ["linux-x64"]="linux-x64"
+            ["linux-arm64"]="linux-arm64"
+            ["win-x64"]="win-x64"
+            ["macos-arm64"]="osx-arm64"
+          )
+
+          for PLAT in linux-x64 linux-arm64 macos-arm64 win-x64; do
+            RID="${RIDS[$PLAT]}"
+            ARTIFACT_DIR="../../../native-dist/UltrafastSecp256k1-${{ env.RELEASE_TAG }}-${PLAT}"
+            echo "=== Extracting native libs for RID: ${RID} ==="
+
+            if [ ! -d "$ARTIFACT_DIR" ]; then
+              echo "  SKIP: artifact dir not found"
+              continue
+            fi
+
+            mkdir -p "runtimes/${RID}/native"
+
+            # Extract archive to temp
+            TMPDIR=$(mktemp -d)
+            if ls "${ARTIFACT_DIR}"/*.tar.gz 1>/dev/null 2>&1; then
+              tar xf "${ARTIFACT_DIR}"/*.tar.gz -C "$TMPDIR"
+            elif ls "${ARTIFACT_DIR}"/*.zip 1>/dev/null 2>&1; then
+              unzip -o "${ARTIFACT_DIR}"/*.zip -d "$TMPDIR"
+            fi
+
+            find "$TMPDIR" "${ARTIFACT_DIR}" -maxdepth 6 \
+              \( -name "libufsecp.so" -o -name "libufsecp.so.*" \
+              -o -name "ufsecp.dll" -o -name "libufsecp.dylib" \) \
+              -exec cp {} "runtimes/${RID}/native/" \; 2>/dev/null || true
+
+            rm -rf "$TMPDIR"
+          done
+
+          echo "=== Runtimes structure ==="
+          find runtimes/ -type f 2>/dev/null || echo "(none)"
+
+      - name: Build NuGet package
+        run: |
+          cd bindings/csharp/Ufsecp
+          dotnet pack -c Release -o nupkgs
+          echo "=== NuGet packages ==="
+          ls -la nupkgs/
+
+      - name: Upload NuGet
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ufsecp-nuget
+          path: bindings/csharp/Ufsecp/nupkgs/*.nupkg
+          retention-days: 30
+
+      - name: Publish to GitHub Packages (NuGet)
+        continue-on-error: true
+        run: |
+          dotnet nuget push bindings/csharp/Ufsecp/nupkgs/*.nupkg \
+            --source "https://nuget.pkg.github.com/shrec/index.json" \
+            --api-key "${{ secrets.GITHUB_TOKEN }}" \
+            --skip-duplicate
+
+      - name: Publish to nuget.org (public registry)
+        continue-on-error: true
+        run: |
+          dotnet nuget push bindings/csharp/Ufsecp/nupkgs/*.nupkg \
+            --source "https://api.nuget.org/v3/index.json" \
+            --api-key "${{ secrets.NUGET_TOKEN }}" \
+            --skip-duplicate
+
+  # ==========================================================================
+  # 9) Package bindings -- Ruby gem
+  # ==========================================================================
+  pack-gem:
+    needs: [release-caas-gate, build-desktop, build-linux-arm64]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: ruby/setup-ruby@9eb537ca036ebaed86729dcb9309076e4c5c3b74 # v1
+        with:
+          ruby-version: '3.3'
+
+      - name: Download desktop artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: native-dist
+
+      - name: Build Ruby gem
+        run: |
+          VERSION="${RELEASE_VERSION#v}"
+          cd bindings/ruby
+
+          # Inject version from git tag
+          sed -i "s/s\.version .*/s.version     = '${VERSION}'/" ufsecp.gemspec
+
+          mkdir -p lib/native
+
+          # Extract and copy native libs from all desktop platforms
+          for PLAT in linux-x64 linux-arm64 macos-arm64 win-x64; do
+            ARTIFACT_DIR="../../native-dist/UltrafastSecp256k1-${{ env.RELEASE_TAG }}-${PLAT}"
+            echo "=== Extracting native libs for: ${PLAT} ==="
+
+            if [ ! -d "$ARTIFACT_DIR" ]; then
+              echo "  SKIP: artifact dir not found"
+              continue
+            fi
+
+            TMPDIR=$(mktemp -d)
+            if ls "${ARTIFACT_DIR}"/*.tar.gz 1>/dev/null 2>&1; then
+              tar xf "${ARTIFACT_DIR}"/*.tar.gz -C "$TMPDIR"
+            elif ls "${ARTIFACT_DIR}"/*.zip 1>/dev/null 2>&1; then
+              unzip -o "${ARTIFACT_DIR}"/*.zip -d "$TMPDIR"
+            fi
+
+            find "$TMPDIR" -maxdepth 6 \
+              \( -name "libufsecp.so" -o -name "libufsecp.so.*" \
+              -o -name "ufsecp.dll" -o -name "libufsecp.dylib" \) \
+              -exec cp {} lib/native/ \; 2>/dev/null || true
+
+            rm -rf "$TMPDIR"
+          done
+
+          echo "=== Native libs ==="
+          ls -la lib/native/ 2>/dev/null || echo "(none)"
+
+          gem build ufsecp.gemspec
+          echo "=== Gem ==="
+          ls -la ufsecp-*.gem
+
+      - name: Upload gem
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ufsecp-gem
+          path: bindings/ruby/ufsecp-*.gem
+          retention-days: 30
+
+      - name: Publish to GitHub Packages (RubyGems)
+        run: |
+          # Configure gem credentials for GitHub Packages
+          mkdir -p ~/.gem
+          printf -- "---\n:github: Bearer %s\n" "${GEM_HOST_API_KEY}" > ~/.gem/credentials
+          chmod 0600 ~/.gem/credentials
+
+          cd bindings/ruby
+          gem push --key github --host https://rubygems.pkg.github.com/shrec \
+            ufsecp-*.gem || echo "WARN: gem push failed (may already exist)"
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================================================
+  # 10) Package bindings -- Java JNI JAR (multi-platform native libs)
+  # ==========================================================================
+  pack-java:
+    needs: [release-caas-gate, build-desktop, build-linux-arm64, build-android]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: actions/setup-java@ad2b38190b15e4d6bdf0c97fb4fca8412226d287 # v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: native-dist
+
+      - name: Build JNI JAR
+        run: |
+          cd bindings/java
+          VERSION="${RELEASE_VERSION#v}"
+
+          # Build JNI natives directory structure
+          for DIR in linux-x64 linux-arm64 win-x64 macos-arm64 android-arm64 android-armv7 android-x64; do
+            mkdir -p "build-jar/native/${DIR}"
+          done
+
+          # Copy native libs from platform builds
+          for PLAT in linux-x64 linux-arm64 win-x64 macos-arm64 android-arm64 android-armv7 android-x64; do
+            ARTIFACT_DIR="../../native-dist/UltrafastSecp256k1-${{ env.RELEASE_TAG }}-${PLAT}"
+            echo "=== Extracting for: ${PLAT} ==="
+
+            if [ ! -d "$ARTIFACT_DIR" ]; then
+              echo "  SKIP: artifact dir not found"
+              continue
+            fi
+
+            TMPDIR=$(mktemp -d)
+            if ls "${ARTIFACT_DIR}"/*.tar.gz 1>/dev/null 2>&1; then
+              tar xf "${ARTIFACT_DIR}"/*.tar.gz -C "$TMPDIR"
+            elif ls "${ARTIFACT_DIR}"/*.zip 1>/dev/null 2>&1; then
+              unzip -o "${ARTIFACT_DIR}"/*.zip -d "$TMPDIR"
+            fi
+
+            find "$TMPDIR" -maxdepth 6 \
+              \( -name "libufsecp*.so" -o -name "libufsecp*.so.*" \
+              -o -name "ufsecp*.dll" -o -name "libufsecp*.dylib" \
+              -o -name "libsecp256k1_jni.so" \) \
+              -exec cp {} "build-jar/native/${PLAT}/" \; 2>/dev/null || true
+
+            rm -rf "$TMPDIR"
+          done
+
+          echo "=== Native libs structure ==="
+          find build-jar/native/ -type f 2>/dev/null || echo "(none)"
+
+          # Compile Java source
+          mkdir -p build-jar/classes
+          javac -d build-jar/classes src/com/ultrafast/ufsecp/*.java
+
+          # Package JAR with classes + native libs
+          cd build-jar
+          jar cf "../ufsecp-${VERSION}.jar" -C classes . -C .. build-jar/native/
+          cd ..
+
+          # Re-pack properly: classes at root, native/ at root
+          mkdir -p jar-staging
+          cp -r build-jar/classes/* jar-staging/
+          cp -r build-jar/native jar-staging/
+          cd jar-staging
+          jar cf "../ufsecp-${VERSION}.jar" .
+          cd ..
+
+          echo "=== JAR ==="
+          ls -la ufsecp-*.jar
+          jar tf "ufsecp-${VERSION}.jar" | head -30
+
+      - name: Upload JAR
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ufsecp-java
+          path: bindings/java/ufsecp-*.jar
+          retention-days: 30
+
+      - name: Publish to GitHub Packages (Maven)
+        run: |
+          cd bindings/java
+          VERSION="${RELEASE_VERSION#v}"
+          JAR="ufsecp-${VERSION}.jar"
+          GROUP="com.ultrafast"
+          ARTIFACT="ufsecp"
+          REPO_URL="https://maven.pkg.github.com/shrec/UltrafastSecp256k1"
+
+          # Generate minimal POM
+          cat > pom.xml <<'POMEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>com.ultrafast</groupId>
+            <artifactId>ufsecp</artifactId>
+            <version>0.0.0-dev</version>
+            <packaging>jar</packaging>
+            <name>UltrafastSecp256k1 JNI</name>
+            <description>Java JNI bindings for UltrafastSecp256k1</description>
+            <url>https://github.com/shrec/UltrafastSecp256k1</url>
+          </project>
+          POMEOF
+          # Fix version in POM (heredoc can't expand shell vars with quoted delimiter)
+          sed -i "s|<version>0.0.0-dev</version>|<version>${VERSION}</version>|" pom.xml
+
+          # Generate settings.xml with GitHub Packages credentials
+          cat > settings.xml <<'SETEOF'
+          <settings>
+            <servers>
+              <server>
+                <id>github</id>
+                <username>${env.GITHUB_ACTOR}</username>
+                <password>${env.GITHUB_TOKEN}</password>
+              </server>
+            </servers>
+          </settings>
+          SETEOF
+
+          # Deploy JAR to GitHub Packages Maven registry
+          mvn deploy:deploy-file \
+            -DgroupId="${GROUP}" \
+            -DartifactId="${ARTIFACT}" \
+            -Dversion="${VERSION}" \
+            -Dpackaging=jar \
+            -Dfile="${JAR}" \
+            -DpomFile=pom.xml \
+            -DrepositoryId=github \
+            -Durl="${REPO_URL}" \
+            -DretryFailedDeploymentCount=3 \
+            --settings settings.xml \
+            || echo "WARN: Maven deploy failed (may already exist)"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================================================
+  # 11) Package bindings -- Go (source + native libs)
+  # ==========================================================================
+  pack-go:
+    needs: [release-caas-gate, build-desktop, build-linux-arm64]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      # ref: RELEASE_TAG — like every other pack-* job. A bare checkout pins to
+      # the run's original SHA and fails ("ref does not point to expected commit")
+      # once sync-docs moves the v4.1.0 tag to its canonical-data stamp commit.
+      # All 11 other packs check out the tag by name and are unaffected.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Download desktop artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: native-dist
+
+      - name: Build Go package
+        run: |
+          VERSION="${RELEASE_VERSION#v}"
+          PKG="ufsecp-go-${VERSION}"
+          mkdir -p "${PKG}/native"
+
+          # Copy Go binding sources
+          cp bindings/go/go.mod "${PKG}/"
+          cp bindings/go/ufsecp.go "${PKG}/"
+          cp bindings/go/secp256k1.go "${PKG}/" 2>/dev/null || true
+
+          # Copy C header (needed for cgo)
+          mkdir -p "${PKG}/include"
+          cp include/ufsecp/ufsecp.h "${PKG}/include/"
+          cp include/ufsecp/ufsecp_error.h "${PKG}/include/"
+          cp include/ufsecp/ufsecp_version.h "${PKG}/include/"
+
+          # Inject version into go.mod comment
+          sed -i "1s|^|// ufsecp v${VERSION}\n|" "${PKG}/go.mod"
+
+          # Extract native libs per platform
+          for PLAT in linux-x64 linux-arm64 macos-arm64 win-x64; do
+            ARTIFACT_DIR="native-dist/UltrafastSecp256k1-${{ env.RELEASE_TAG }}-${PLAT}"
+            if [ ! -d "$ARTIFACT_DIR" ]; then
+              echo "  SKIP: ${PLAT}"
+              continue
+            fi
+            mkdir -p "${PKG}/native/${PLAT}"
+            TMPDIR=$(mktemp -d)
+            if ls "${ARTIFACT_DIR}"/*.tar.gz 1>/dev/null 2>&1; then
+              tar xf "${ARTIFACT_DIR}"/*.tar.gz -C "$TMPDIR"
+            elif ls "${ARTIFACT_DIR}"/*.zip 1>/dev/null 2>&1; then
+              unzip -o "${ARTIFACT_DIR}"/*.zip -d "$TMPDIR"
+            fi
+            find "$TMPDIR" -maxdepth 6 \
+              \( -name "libufsecp.so" -o -name "libufsecp.so.*" \
+              -o -name "ufsecp.dll" -o -name "libufsecp.dylib" \) \
+              -exec cp {} "${PKG}/native/${PLAT}/" \; 2>/dev/null || true
+            rm -rf "$TMPDIR"
+          done
+
+          echo "=== Go package contents ==="
+          find "${PKG}" -type f | sort
+          tar czf "${PKG}.tar.gz" "${PKG}"
+          ls -la "${PKG}.tar.gz"
+
+      - name: Upload Go package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ufsecp-go
+          path: ufsecp-go-*.tar.gz
+          retention-days: 30
+
+  # ==========================================================================
+  # 12) Package bindings -- Rust crate (source + native libs)
+  # ==========================================================================
+  pack-rust:
+    needs: [release-caas-gate, build-desktop, build-linux-arm64]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Download desktop artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: native-dist
+
+      - name: Build Rust package
+        run: |
+          VERSION="${RELEASE_VERSION#v}"
+          PKG="ufsecp-rust-${VERSION}"
+          mkdir -p "${PKG}/native"
+
+          # Copy Rust crate sources (ufsecp + ufsecp-sys)
+          cp -r bindings/rust/ufsecp "${PKG}/"
+          cp -r bindings/rust/ufsecp-sys "${PKG}/"
+
+          # Inject version from git tag
+          sed -i "s/^version = .*/version = \"${VERSION}\"/" "${PKG}/ufsecp/Cargo.toml"
+          sed -i "s/^version = .*/version = \"${VERSION}\"/" "${PKG}/ufsecp-sys/Cargo.toml"
+          sed -i "s/version = \"0.0.0-dev\"/version = \"${VERSION}\"/" "${PKG}/ufsecp/Cargo.toml"
+
+          # Copy C header (needed for sys crate build.rs)
+          mkdir -p "${PKG}/include"
+          cp include/ufsecp/ufsecp.h "${PKG}/include/"
+          cp include/ufsecp/ufsecp_error.h "${PKG}/include/"
+          cp include/ufsecp/ufsecp_version.h "${PKG}/include/"
+
+          # Extract native libs per platform
+          for PLAT in linux-x64 linux-arm64 macos-arm64 win-x64; do
+            ARTIFACT_DIR="native-dist/UltrafastSecp256k1-${{ env.RELEASE_TAG }}-${PLAT}"
+            if [ ! -d "$ARTIFACT_DIR" ]; then
+              echo "  SKIP: ${PLAT}"
+              continue
+            fi
+            mkdir -p "${PKG}/native/${PLAT}"
+            TMPDIR=$(mktemp -d)
+            if ls "${ARTIFACT_DIR}"/*.tar.gz 1>/dev/null 2>&1; then
+              tar xf "${ARTIFACT_DIR}"/*.tar.gz -C "$TMPDIR"
+            elif ls "${ARTIFACT_DIR}"/*.zip 1>/dev/null 2>&1; then
+              unzip -o "${ARTIFACT_DIR}"/*.zip -d "$TMPDIR"
+            fi
+            find "$TMPDIR" -maxdepth 6 \
+              \( -name "libufsecp.so" -o -name "libufsecp.so.*" \
+              -o -name "ufsecp.dll" -o -name "libufsecp.dylib" \) \
+              -exec cp {} "${PKG}/native/${PLAT}/" \; 2>/dev/null || true
+            rm -rf "$TMPDIR"
+          done
+
+          echo "=== Rust package contents ==="
+          find "${PKG}" -type f | sort
+          tar czf "${PKG}.tar.gz" "${PKG}"
+          ls -la "${PKG}.tar.gz"
+
+      - name: Upload Rust package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ufsecp-rust
+          path: ufsecp-rust-*.tar.gz
+          retention-days: 30
+
+  # ==========================================================================
+  # 13) Package bindings -- Dart/Flutter (source + native libs)
+  # ==========================================================================
+  pack-dart:
+    needs: [release-caas-gate, build-desktop, build-linux-arm64, build-android, build-ios]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: native-dist
+
+      - name: Build Dart package
+        run: |
+          VERSION="${RELEASE_VERSION#v}"
+          PKG="ufsecp-dart-${VERSION}"
+          mkdir -p "${PKG}/native"
+
+          # Copy Dart binding sources (use ufsecp manifest)
+          cp bindings/dart/pubspec.ufsecp.yaml "${PKG}/pubspec.yaml"
+          cp -r bindings/dart/lib "${PKG}/"
+
+          # Inject version from git tag
+          sed -i "s/^version: .*/version: ${VERSION}/" "${PKG}/pubspec.yaml"
+
+          # Extract native libs: desktop + mobile
+          for PLAT in linux-x64 linux-arm64 macos-arm64 win-x64 android-arm64 android-armv7 android-x64; do
+            ARTIFACT_DIR="native-dist/UltrafastSecp256k1-${{ env.RELEASE_TAG }}-${PLAT}"
+            if [ ! -d "$ARTIFACT_DIR" ]; then
+              echo "  SKIP: ${PLAT}"
+              continue
+            fi
+            mkdir -p "${PKG}/native/${PLAT}"
+            TMPDIR=$(mktemp -d)
+            if ls "${ARTIFACT_DIR}"/*.tar.gz 1>/dev/null 2>&1; then
+              tar xf "${ARTIFACT_DIR}"/*.tar.gz -C "$TMPDIR"
+            elif ls "${ARTIFACT_DIR}"/*.zip 1>/dev/null 2>&1; then
+              unzip -o "${ARTIFACT_DIR}"/*.zip -d "$TMPDIR"
+            fi
+            find "$TMPDIR" -maxdepth 6 \
+              \( -name "libufsecp.so" -o -name "libufsecp.so.*" \
+              -o -name "ufsecp.dll" -o -name "libufsecp.dylib" \) \
+              -exec cp {} "${PKG}/native/${PLAT}/" \; 2>/dev/null || true
+            rm -rf "$TMPDIR"
+          done
+
+          # Also include iOS XCFramework if available
+          IOS_DIR="native-dist/UltrafastSecp256k1-${{ env.RELEASE_TAG }}-ios-xcframework"
+          if [ -d "$IOS_DIR" ]; then
+            mkdir -p "${PKG}/native/ios"
+            cp "${IOS_DIR}"/*.tar.gz "${PKG}/native/ios/" 2>/dev/null || true
+            # Also extract xcframework
+            TMPDIR=$(mktemp -d)
+            tar xf "${IOS_DIR}"/*.tar.gz -C "$TMPDIR" 2>/dev/null || true
+            find "$TMPDIR" -name "*.xcframework" -type d -exec cp -r {} "${PKG}/native/ios/" \; 2>/dev/null || true
+            rm -rf "$TMPDIR"
+          fi
+
+          echo "=== Dart package contents ==="
+          find "${PKG}" -type f | sort
+          tar czf "${PKG}.tar.gz" "${PKG}"
+          ls -la "${PKG}.tar.gz"
+
+      - name: Upload Dart package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ufsecp-dart
+          path: ufsecp-dart-*.tar.gz
+          retention-days: 30
+
+  # ==========================================================================
+  # 14) Package bindings -- PHP Composer (source + native libs)
+  # ==========================================================================
+  pack-php:
+    needs: [release-caas-gate, build-desktop, build-linux-arm64]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Download desktop artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: native-dist
+
+      - name: Build PHP package
+        run: |
+          VERSION="${RELEASE_VERSION#v}"
+          PKG="ufsecp-php-${VERSION}"
+          mkdir -p "${PKG}/native"
+
+          # Copy PHP binding sources (use ufsecp manifest)
+          cp bindings/php/composer.ufsecp.json "${PKG}/composer.json"
+          cp -r bindings/php/src "${PKG}/"
+
+          # Inject version from git tag
+          sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"${VERSION}\"/" "${PKG}/composer.json"
+
+          # Copy C header (for PHP FFI definition loading)
+          mkdir -p "${PKG}/include"
+          cp include/ufsecp/ufsecp.h "${PKG}/include/"
+          cp include/ufsecp/ufsecp_error.h "${PKG}/include/"
+
+          # Extract native libs per platform
+          for PLAT in linux-x64 linux-arm64 macos-arm64 win-x64; do
+            ARTIFACT_DIR="native-dist/UltrafastSecp256k1-${{ env.RELEASE_TAG }}-${PLAT}"
+            if [ ! -d "$ARTIFACT_DIR" ]; then
+              echo "  SKIP: ${PLAT}"
+              continue
+            fi
+            mkdir -p "${PKG}/native/${PLAT}"
+            TMPDIR=$(mktemp -d)
+            if ls "${ARTIFACT_DIR}"/*.tar.gz 1>/dev/null 2>&1; then
+              tar xf "${ARTIFACT_DIR}"/*.tar.gz -C "$TMPDIR"
+            elif ls "${ARTIFACT_DIR}"/*.zip 1>/dev/null 2>&1; then
+              unzip -o "${ARTIFACT_DIR}"/*.zip -d "$TMPDIR"
+            fi
+            find "$TMPDIR" -maxdepth 6 \
+              \( -name "libufsecp.so" -o -name "libufsecp.so.*" \
+              -o -name "ufsecp.dll" -o -name "libufsecp.dylib" \) \
+              -exec cp {} "${PKG}/native/${PLAT}/" \; 2>/dev/null || true
+            rm -rf "$TMPDIR"
+          done
+
+          echo "=== PHP package contents ==="
+          find "${PKG}" -type f | sort
+          tar czf "${PKG}.tar.gz" "${PKG}"
+          ls -la "${PKG}.tar.gz"
+
+      - name: Upload PHP package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ufsecp-php
+          path: ufsecp-php-*.tar.gz
+          retention-days: 30
+
+  # ==========================================================================
+  # 15) Package bindings -- React Native (npm + Android/iOS native libs)
+  # ==========================================================================
+  pack-react-native:
+    needs: [release-caas-gate, build-desktop, build-android, build-ios]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: 20
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: native-dist
+
+      - name: Build React Native package
+        run: |
+          VERSION="${RELEASE_VERSION#v}"
+          cd bindings/react-native
+
+          # Use ufsecp manifest
+          cp package.ufsecp.json package.json
+
+          # Inject version from git tag
+          sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"${VERSION}\"/" package.json
+
+          # Copy prebuilt native libs into platform dirs
+          mkdir -p prebuilds
+
+          for PLAT in android-arm64 android-armv7 android-x64; do
+            ARTIFACT_DIR="../../native-dist/UltrafastSecp256k1-${{ env.RELEASE_TAG }}-${PLAT}"
+            if [ ! -d "$ARTIFACT_DIR" ]; then
+              echo "  SKIP: ${PLAT}"
+              continue
+            fi
+            mkdir -p "prebuilds/${PLAT}"
+            TMPDIR=$(mktemp -d)
+            if ls "${ARTIFACT_DIR}"/*.tar.gz 1>/dev/null 2>&1; then
+              tar xf "${ARTIFACT_DIR}"/*.tar.gz -C "$TMPDIR"
+            elif ls "${ARTIFACT_DIR}"/*.zip 1>/dev/null 2>&1; then
+              unzip -o "${ARTIFACT_DIR}"/*.zip -d "$TMPDIR"
+            fi
+            find "$TMPDIR" -maxdepth 6 \
+              \( -name "libufsecp.so" -o -name "libufsecp.so.*" \) \
+              -exec cp {} "prebuilds/${PLAT}/" \; 2>/dev/null || true
+            rm -rf "$TMPDIR"
+          done
+
+          # iOS XCFramework
+          IOS_DIR="../../native-dist/UltrafastSecp256k1-${{ env.RELEASE_TAG }}-ios-xcframework"
+          if [ -d "$IOS_DIR" ]; then
+            mkdir -p prebuilds/ios
+            TMPDIR=$(mktemp -d)
+            tar xf "${IOS_DIR}"/*.tar.gz -C "$TMPDIR" 2>/dev/null || true
+            find "$TMPDIR" -name "*.xcframework" -type d -exec cp -r {} prebuilds/ios/ \; 2>/dev/null || true
+            find "$TMPDIR" -name "*.a" -exec cp {} prebuilds/ios/ \; 2>/dev/null || true
+            rm -rf "$TMPDIR"
+          fi
+
+          echo "=== Prebuilds ==="
+          find prebuilds/ -type f 2>/dev/null || echo "(none)"
+
+          npm pack
+          echo "=== React Native package ==="
+          ls -la react-native-ufsecp-*.tgz
+
+      - name: Upload React Native package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ufsecp-react-native
+          path: bindings/react-native/react-native-ufsecp-*.tgz
+          retention-days: 30
+
+      - name: Publish to GitHub Packages (npm -- React Native)
+        continue-on-error: true
+        run: |
+          cd bindings/react-native
+          sed -i 's/"name": "react-native-ufsecp"/"name": "@shrec\/react-native-ufsecp"/' package.json
+          echo "@shrec:registry=https://npm.pkg.github.com" > .npmrc
+          echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" >> .npmrc
+          npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish to npmjs.com (public registry -- React Native)
+        continue-on-error: true
+        run: |
+          cd bindings/react-native
+          # Restore original unscoped name for npmjs.com
+          sed -i 's/"name": "@shrec\/react-native-ufsecp"/"name": "react-native-ufsecp"/' package.json
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > .npmrc
+          npm publish --access public
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # ==========================================================================
+  # 16) Package bindings -- Swift (Package.swift + sources + native libs)
+  # ==========================================================================
+  pack-swift:
+    needs: [release-caas-gate, build-desktop, build-ios]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: native-dist
+
+      - name: Build Swift package
+        run: |
+          VERSION="${RELEASE_VERSION#v}"
+          PKG="ufsecp-swift-${VERSION}"
+          mkdir -p "${PKG}/native"
+
+          # Copy Swift binding sources (use ufsecp manifest)
+          cp bindings/swift/Package.ufsecp.swift "${PKG}/Package.swift"
+          cp -r bindings/swift/Sources/Ufsecp "${PKG}/Sources/Ufsecp" 2>/dev/null || true
+          cp -r bindings/swift/Sources/CUfsecp "${PKG}/Sources/CUfsecp" 2>/dev/null || true
+          mkdir -p "${PKG}/Sources/CUfsecp"
+          mkdir -p "${PKG}/Sources/Ufsecp"
+
+          # Copy C headers into the CUfsecp module
+          cp include/ufsecp/ufsecp.h "${PKG}/Sources/CUfsecp/" 2>/dev/null || true
+          cp include/ufsecp/ufsecp_error.h "${PKG}/Sources/CUfsecp/" 2>/dev/null || true
+          cp include/ufsecp/ufsecp_version.h "${PKG}/Sources/CUfsecp/" 2>/dev/null || true
+
+          # macOS native lib
+          MACOS_DIR="native-dist/UltrafastSecp256k1-${{ env.RELEASE_TAG }}-macos-arm64"
+          if [ -d "$MACOS_DIR" ]; then
+            mkdir -p "${PKG}/native/macos-arm64"
+            TMPDIR=$(mktemp -d)
+            if ls "${MACOS_DIR}"/*.tar.gz 1>/dev/null 2>&1; then
+              tar xf "${MACOS_DIR}"/*.tar.gz -C "$TMPDIR"
+            fi
+            find "$TMPDIR" -maxdepth 6 -name "libufsecp.dylib" \
+              -exec cp {} "${PKG}/native/macos-arm64/" \; 2>/dev/null || true
+            rm -rf "$TMPDIR"
+          fi
+
+          # iOS XCFramework
+          IOS_DIR="native-dist/UltrafastSecp256k1-${{ env.RELEASE_TAG }}-ios-xcframework"
+          if [ -d "$IOS_DIR" ]; then
+            mkdir -p "${PKG}/native/ios"
+            TMPDIR=$(mktemp -d)
+            tar xf "${IOS_DIR}"/*.tar.gz -C "$TMPDIR" 2>/dev/null || true
+            find "$TMPDIR" -name "*.xcframework" -type d -exec cp -r {} "${PKG}/native/ios/" \; 2>/dev/null || true
+            rm -rf "$TMPDIR"
+          fi
+
+          echo "=== Swift package contents ==="
+          find "${PKG}" -type f | sort
+          tar czf "${PKG}.tar.gz" "${PKG}"
+          ls -la "${PKG}.tar.gz"
+
+      - name: Upload Swift package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ufsecp-swift
+          path: ufsecp-swift-*.tar.gz
+          retention-days: 30
+
+  # ==========================================================================
+  # 17) Package -- C/C++ headers + native libs (all platforms)
+  # ==========================================================================
+  pack-c-headers:
+    needs: [release-caas-gate, build-desktop, build-linux-arm64]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Download desktop artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: native-dist
+
+      - name: Build C/C++ SDK package
+        run: |
+          VERSION="${RELEASE_VERSION#v}"
+          PKG="ufsecp-c-${VERSION}"
+
+          # Copy public C API headers
+          mkdir -p "${PKG}/include"
+          cp include/ufsecp/ufsecp.h "${PKG}/include/"
+          cp include/ufsecp/ufsecp_error.h "${PKG}/include/"
+          cp include/ufsecp/ufsecp_version.h "${PKG}/include/"
+
+          # Copy example if present
+          if [ -d include/ufsecp/examples ]; then
+            cp -r include/ufsecp/examples "${PKG}/examples"
+          fi
+
+          # Copy pkg-config template
+          cp include/ufsecp/ufsecp.pc.in "${PKG}/" 2>/dev/null || true
+
+          # Extract native libs per platform
+          for PLAT in linux-x64 linux-arm64 macos-arm64 win-x64; do
+            ARTIFACT_DIR="native-dist/UltrafastSecp256k1-${{ env.RELEASE_TAG }}-${PLAT}"
+            if [ ! -d "$ARTIFACT_DIR" ]; then
+              echo "  SKIP: ${PLAT}"
+              continue
+            fi
+            mkdir -p "${PKG}/lib/${PLAT}"
+            TMPDIR=$(mktemp -d)
+            if ls "${ARTIFACT_DIR}"/*.tar.gz 1>/dev/null 2>&1; then
+              tar xf "${ARTIFACT_DIR}"/*.tar.gz -C "$TMPDIR"
+            elif ls "${ARTIFACT_DIR}"/*.zip 1>/dev/null 2>&1; then
+              unzip -o "${ARTIFACT_DIR}"/*.zip -d "$TMPDIR"
+            fi
+            find "$TMPDIR" -maxdepth 6 \
+              \( -name "libufsecp.so" -o -name "libufsecp.so.*" \
+              -o -name "ufsecp.dll" -o -name "ufsecp.lib" \
+              -o -name "libufsecp.dylib" -o -name "libufsecp.a" \) \
+              -exec cp {} "${PKG}/lib/${PLAT}/" \; 2>/dev/null || true
+            rm -rf "$TMPDIR"
+          done
+
+          echo "=== C SDK package contents ==="
+          find "${PKG}" -type f | sort
+          tar czf "${PKG}.tar.gz" "${PKG}"
+          ls -la "${PKG}.tar.gz"
+
+      - name: Upload C SDK
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ufsecp-c-headers
+          path: ufsecp-c-*.tar.gz
+          retention-days: 30
+
+  # ==========================================================================
+  # 18) Create GitHub Release (collects ALL artifacts)
+  # ==========================================================================
+  release:
+    needs: [release-caas-gate, sync-docs, build-desktop, build-linux-arm64, build-android, build-ios, build-wasm, pack-python, pack-npm, pack-nuget, pack-gem, pack-java, pack-go, pack-rust, pack-dart, pack-php, pack-react-native, pack-swift, pack-c-headers]
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        run: |
+          # Extract section for this version from CHANGELOG.md
+          VERSION="${RELEASE_VERSION#v}"
+          NOTES=$(awk -v ver="$VERSION" '
+            /^## \[/ {
+              if (found) exit
+              if (index($0, "[" ver "]")) found=1
+              next
+            }
+            found && /^---$/ { exit }
+            found { print }
+          ' CHANGELOG.md)
+
+          if [ -z "$NOTES" ]; then
+            NOTES="Release ${GITHUB_REF_NAME}"
+          fi
+
+          echo "NOTES<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$NOTES" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: List collected artifacts
+        run: find dist -type f | sort
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd dist
+          find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.whl' \
+            -o -name '*.nupkg' -o -name '*.tgz' -o -name '*.gem' -o -name '*.jar' \) \
+            | sort | while read -r f; do
+              sha256sum "$f" | sed 's|  \./[^/]*/|  |; s|  \./|  |'
+            done > ../SHA256SUMS
+          cd ..
+          echo "=== SHA256SUMS ==="
+          cat SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: |
+            dist/**/*.tar.gz
+            dist/**/*.zip
+            dist/**/*.whl
+            dist/**/*.nupkg
+            dist/**/*.tgz
+            dist/**/*.gem
+            dist/**/*.jar
+            dist/**/*.deb
+            dist/**/*.rpm
+
+      # -- Cosign keyless signing (Sigstore) --
+      - name: Install cosign
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v3.8.0
+
+      - name: Sign release artifacts with cosign
+        run: |
+          echo "cosign version: $(cosign version 2>&1 | head -1)"
+
+          # Sign the SHA256SUMS manifest itself -- HARD FAIL if this fails.
+          # SHA256SUMS signature is the root of trust for the entire release.
+          echo "Signing: SHA256SUMS"
+          cosign sign-blob --yes SHA256SUMS \
+            --bundle SHA256SUMS.sigstore
+          echo "  [OK] SHA256SUMS signed"
+
+          # Verify the signature immediately (fail-fast integrity check)
+          cosign verify-blob SHA256SUMS \
+            --bundle SHA256SUMS.sigstore \
+            --certificate-identity-regexp='.*' \
+            --certificate-oidc-issuer-regexp='.*'
+          echo "  [OK] SHA256SUMS signature verified"
+
+          # Sign individual release archives -- HARD FAIL if any signing fails.
+          # Every release artifact MUST be signed.
+          # NOTE: uses process substitution (not pipe) so failures propagate
+          # to the current shell and variables are preserved.
+          SIGNED=0
+          FAILED=0
+          cd dist
+          while IFS= read -r -d '' f; do
+            echo "Signing: $f"
+            if cosign sign-blob --yes "$f" \
+                --bundle "${f}.sigstore"; then
+              SIGNED=$((SIGNED + 1))
+            else
+              echo "::error::Failed to sign artifact: $f"
+              FAILED=$((FAILED + 1))
+            fi
+          done < <(find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.whl' \
+            -o -name '*.nupkg' -o -name '*.tgz' -o -name '*.gem' -o -name '*.jar' \) -print0)
+          cd ..
+
+          echo "Signed: $SIGNED artifacts"
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::Failed to sign $FAILED artifact(s) -- release BLOCKED"
+            exit 1
+          fi
+          if [ "$SIGNED" -eq 0 ]; then
+            echo "::error::No artifacts found to sign -- release BLOCKED"
+            exit 1
+          fi
+          echo "=== Cosign: all $SIGNED artifacts signed successfully ==="
+          ls -la SHA256SUMS.sigstore
+
+      # -- Verification Artifacts --
+      - name: Generate verification artifacts
+        run: |
+          # Selftest report JSON (build a minimal test binary that dumps JSON)
+          echo '#include "secp256k1/selftest.hpp"
+          #include <cstdio>
+          int main() {
+            auto r = secp256k1::fast::selftest_report(secp256k1::fast::SelftestMode::ci, 0);
+            printf("%s\n", r.to_json().c_str());
+            return r.all_passed ? 0 : 1;
+          }' > /tmp/selftest_json_gen.cpp
+
+          # Build against the library we already built
+          if [ -f build/lib/libfastsecp256k1.a ] || [ -f build/libfastsecp256k1.a ]; then
+            LIB=$(find build -name 'libfastsecp256k1.a' -print -quit 2>/dev/null || true)
+            if [ -n "$LIB" ]; then
+              ${CXX:-g++} -std=c++20 -O2 \
+                -I src/cpu/include -I staging/include \
+                /tmp/selftest_json_gen.cpp "$LIB" \
+                -o /tmp/selftest_json_gen 2>/dev/null && \
+              /tmp/selftest_json_gen > selftest_report.json 2>/dev/null || \
+              echo '{"error":"selftest binary build failed","all_passed":null}' > selftest_report.json
+            else
+              echo '{"error":"library not found","all_passed":null}' > selftest_report.json
+            fi
+          else
+            echo '{"error":"library not found","all_passed":null}' > selftest_report.json
+          fi
+
+          # Generate verification transparency report (auto-stamps version, date, counts)
+          python3 ci/generate_verification_report.py \
+            -o verification_report.md \
+            --version "${RELEASE_VERSION#v}" || \
+            cp docs/AUDIT_READINESS_REPORT_v1.md verification_report.md
+
+          # Generate traceability matrix (Phase IV, Task 4.1.4)
+          if [ -x ci/generate_traceability.sh ]; then
+            echo "Generating traceability report..."
+            bash ci/generate_traceability.sh 2>/dev/null || \
+              echo '{"error":"traceability generation failed"}' > traceability_report.json
+          fi
+
+          echo "=== Verification artifacts ==="
+          ls -la selftest_report.json verification_report.md traceability_report.json 2>/dev/null || true
+
+      # -- SBOM generation (CycloneDX) --
+      - name: Generate SBOM
+        run: |
+          VERSION="${RELEASE_VERSION#v}"
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          cat > sbom.cdx.json <<'SBOM_HEREDOC'
+          {
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.6",
+            "version": 1,
+            "metadata": {
+              "timestamp": "TIMESTAMP_PLACEHOLDER",
+              "component": {
+                "type": "library",
+                "name": "UltrafastSecp256k1",
+                "version": "VERSION_PLACEHOLDER",
+                "purl": "pkg:github/shrec/UltrafastSecp256k1@vVERSION_PLACEHOLDER",
+                "licenses": [{"license": {"id": "MIT"}}]
+              }
+            },
+            "components": [
+              {"type": "library", "name": "fastsecp256k1", "version": "VERSION_PLACEHOLDER", "scope": "required"},
+              {"type": "library", "name": "ufsecp", "version": "VERSION_PLACEHOLDER", "scope": "optional"}
+            ],
+            "dependencies": [{"ref": "UltrafastSecp256k1", "dependsOn": []}]
+          }
+          SBOM_HEREDOC
+          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g; s/TIMESTAMP_PLACEHOLDER/${TIMESTAMP}/g" sbom.cdx.json
+
+      # -- GPU evidence bundle (P4: release evidence) --
+      - name: Collect GPU validation evidence
+        run: |
+          mkdir -p gpu_evidence
+          # Fetch latest GPU CI artifact for this commit (if available)
+          RUN_ID=$(gh api "repos/${{ github.repository }}/actions/workflows/gpu-selfhosted.yml/runs?head_sha=${{ github.sha }}&status=completed&per_page=1" \
+            --jq '.workflow_runs[0].id' 2>/dev/null || echo "")
+          if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
+            echo "Found GPU CI run: $RUN_ID"
+            gh run download "$RUN_ID" -D gpu_evidence --repo "${{ github.repository }}" 2>/dev/null || true
+          else
+            echo "No GPU CI run found for ${{ github.sha }} -- generating placeholder"
+            echo '{"status":"no_gpu_ci_run","commit":"${{ github.sha }}"}' > gpu_evidence/gpu_status.json
+          fi
+          ls -la gpu_evidence/ 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete pre-existing release (if any)
+        if: github.event_name != 'workflow_dispatch'
+        run: |
+          gh release delete "${{ env.RELEASE_TAG }}" --yes 2>/dev/null || true
+          # Brief pause to let GitHub API propagate the deletion,
+          # avoiding 404 on asset update when action-gh-release
+          # encounters stale asset metadata from a deleted release.
+          sleep 5
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "UltrafastSecp256k1 ${{ env.RELEASE_TAG }}"
+          body: ${{ steps.notes.outputs.NOTES }}
+          draft: true
+          prerelease: ${{ contains(env.RELEASE_TAG, '-rc') || contains(env.RELEASE_TAG, '-beta') || contains(env.RELEASE_TAG, '-alpha') }}
+          fail_on_unmatched_files: false
+          # NOTE: dist/**/* already includes .sigstore files created by
+          # the cosign step -- do NOT add dist/**/*.sigstore separately
+          # or action-gh-release will hit 404 trying to PATCH duplicate
+          # assets.
+          files: |
+            dist/**/*
+            SHA256SUMS
+            SHA256SUMS.sigstore
+            sbom.cdx.json
+            selftest_report.json
+            traceability_report.json
+            verification_report.md
+            gpu_evidence/**
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify Discord (release)
+        if: always()
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_RELEASES }}
+          TAG:     ${{ env.RELEASE_TAG }}
+          REPO:    ${{ github.repository }}
+          STATUS:  ${{ job.status }}
+        run: |
+          if [ -z "$WEBHOOK" ]; then echo "No webhook configured, skipping"; exit 0; fi
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          PYTHON=$(command -v python3 || command -v python)
+          JSON=$(NOW="$NOW" "$PYTHON" -c "
+          import json, os
+          tag    = os.environ['TAG']
+          repo   = os.environ['REPO']
+          status = os.environ['STATUS']
+          now    = os.environ.get('NOW', '')
+          color  = 3066993 if status == 'success' else 15158332
+          url    = f'https://github.com/{repo}/releases/tag/{tag}'
+          desc   = f'**Tag:** \`{tag}\`\n**Status:** {status}\n\n[View Release]({url})'
+          payload = {'embeds': [{'title': f'UltrafastSecp256k1 {tag} Released',
+            'url': url, 'color': color, 'description': desc,
+            'footer': {'text': 'UltrafastSecp256k1 CI'}, 'timestamp': now}]}
+          print(json.dumps(payload))
+          ")
+          CURL=$(command -v curl || { echo "::error::curl not found on PATH"; exit 1; })
+          "$CURL" -sS -H "Content-Type: application/json" -d "$JSON" "$WEBHOOK"

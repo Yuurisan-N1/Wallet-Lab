@@ -1,0 +1,13 @@
+name: ultrafast_secp256k1
+description: High-performance secp256k1 elliptic curve cryptography bindings via dart:ffi.
+version: 4.0.0
+homepage: https://github.com/shrec/UltrafastSecp256k1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  ffi: ^2.1.0
+
+dev_dependencies:
+  test: ^1.24.0

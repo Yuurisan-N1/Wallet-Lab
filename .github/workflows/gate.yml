@@ -1,0 +1,882 @@
+name: Gate / PR-Push
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+  # CI-003 fix: paths-ignore removed — rely on detect-impact's docs_only
+  # classification to skip non-security jobs. Skipping the entire gate via
+  # paths-ignore allowed CI bypass on .github/agents/** changes.
+
+permissions:
+  contents: read
+  # No SARIF/code-scanning upload happens in this workflow, so security-events
+  # write is not granted (Scorecard TokenPermissions). Static-analysis SARIF is
+  # uploaded by the dedicated infer.yml / clang-sa.yml workflows.
+
+concurrency:
+  group: gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  detect-impact:
+    name: Block 0 / Detect Impact
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      gate: ${{ steps.detect.outputs.gate }}
+      profiles: ${{ steps.detect.outputs.profiles }}
+      reason: ${{ steps.detect.outputs.reason }}
+      docs_only: ${{ steps.detect.outputs.docs_only }}
+      run_core: ${{ steps.detect.outputs.run_core }}
+      run_caas: ${{ steps.detect.outputs.run_caas }}
+      run_bindings: ${{ steps.detect.outputs.run_bindings }}
+      run_wasm: ${{ steps.detect.outputs.run_wasm }}
+      run_gpu: ${{ steps.detect.outputs.run_gpu }}
+      run_compat: ${{ steps.detect.outputs.run_compat }}
+      run_deep: ${{ steps.detect.outputs.run_deep }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed profiles
+        id: detect
+        shell: bash
+        run: |
+          set +e
+          BASE_REF="origin/${{ github.event.pull_request.base.ref || 'main' }}"
+          BEFORE_SHA="${{ github.event.before }}"
+          python3 ci/ci_gate_detect.py \
+            --base "$BASE_REF" \
+            ${BEFORE_SHA:+--before-sha "$BEFORE_SHA"} \
+            --github-output "$GITHUB_OUTPUT" \
+            > ci-impact.json
+          rc=$?
+          set -e
+          if [ "$rc" -gt 1 ]; then
+            exit "$rc"
+          fi
+          # M-2 / P1-CI-002 fix: verify completion sentinel.
+          # ci_gate_detect.py writes gate_detect_complete=true as its LAST line.
+          # If it crashed mid-way, the sentinel is absent even if run_caas=false
+          # was already written — detect this and force run_caas=true (fail-safe).
+          for key in gate run_caas; do
+            if ! grep -q "^${key}=" "$GITHUB_OUTPUT" 2>/dev/null; then
+              echo "::error::ci_gate_detect.py did not write '${key}' to GITHUB_OUTPUT" \
+                   "(exit rc=${rc}); impact detection failed — cannot safely skip gates"
+              exit 2
+            fi
+          done
+          if ! grep -q "^gate_detect_complete=true" "$GITHUB_OUTPUT" 2>/dev/null; then
+            echo "::warning::ci_gate_detect.py crashed before writing completion sentinel — forcing run_caas=true"
+            echo "run_caas=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "## Block 0 / Detect Impact" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat ci-impact.json >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload impact report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gate-impact-${{ github.run_id }}
+          path: ci-impact.json
+          retention-days: 30
+
+  fast-gates:
+    name: Block 1 / Fast CAAS Gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    needs: detect-impact
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Validate CI path references
+        # Best-effort static CI path scan: catches most explicit path references in
+        # workflow YAML. Does not cover inline-bash, variable-interpolated, or
+        # subprocess paths. Runtime positive-path steps provide remaining coverage.
+        # Prevents "No such file or directory" breakage after common refactors.
+        run: python3 ci/check_ci_paths.py
+
+      - name: Fast deterministic gates
+        # Single source of truth — same script as ci_local.sh runs.
+        # local passes → GitHub passes. No divergence.
+        run: bash ci/run_fast_gates.sh
+
+  # ---------------------------------------------------------------------------
+  # Security Gate — aggregates all Block 3 static/security jobs.
+  # Block 2 (build + unit tests) starts ONLY after this passes.
+  # Runs unconditionally (if: always()) so build-test is never blocked by a
+  # skipped dependency; evaluates each Block 3 result and propagates failures.
+  # ---------------------------------------------------------------------------
+  caas-gate:
+    name: Block 3 / Security Gate (aggregator)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    needs: [detect-impact, fast-gates, caas-security, bindings-smoke, gpu-wasm-smoke, shim-gate]
+    if: always()
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - name: Evaluate security phase
+        run: |
+          FG="${{ needs.fast-gates.result }}"
+          CG="${{ needs.caas-security.result }}"
+          BS="${{ needs.bindings-smoke.result }}"
+          GW="${{ needs.gpu-wasm-smoke.result }}"
+          SG="${{ needs.shim-gate.result }}"
+
+          FAILED=0
+          for label_result in "fast-gates:$FG" "caas-security:$CG" \
+                              "bindings-smoke:$BS" "gpu-wasm-smoke:$GW" \
+                              "shim-gate:$SG"; do
+            label="${label_result%%:*}"
+            result="${label_result##*:}"
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "::error::$label → $result — blocking build phase"
+              FAILED=1
+            elif [ "$result" = "skipped" ] && \
+                 { [ "$label" = "caas-security" ] || [ "$label" = "shim-gate" ]; } && \
+                 [ "${{ needs.detect-impact.outputs.docs_only }}" != "true" ]; then
+              # caas-security and shim-gate must not skip on a non-docs-only change.
+              # shim-gate carries mandatory shim security regression tests (CRIT-1, HIGH-2/3,
+              # SHIM-001/010/012) that must run whenever any core, compat, caas, or bindings
+              # file changes. For docs-only changes detect-impact sets docs_only=true → skip
+              # is expected. CAAS-001 fix (2026-05-26).
+              echo "::error::$label → skipped — security gate must not skip on non-docs-only changes"
+              FAILED=1
+            else
+              echo "$label → $result"
+            fi
+          done
+          [ "$FAILED" -eq 0 ] || exit 1
+          echo "::notice::Security phase passed — build phase may proceed"
+        shell: bash
+
+  build-test:
+    name: Block 2 / Build + Unit Tests
+    runs-on: ubuntu-24.04
+    # Library-only build: ~5 min warm, ~15 min cold.
+    # Full tests only run when src/ changed (run_core=true); ~25 min cold.
+    # 2026-05-24: bumped 30→45 min — BUILD_TESTING=ON (added so run_selftest is
+    # produced for the Selftest smoke step) pulls in ~25 test_*.cpp compilations
+    # which pushed cold-cache builds past the prior 30min limit (run 26349000352
+    # hit "exceeded maximum execution time of 30m0s" after 30m16s).
+    # Starts ONLY after the security gate (Block 3) has completed.
+    timeout-minutes: 45
+    needs: [detect-impact, caas-gate]
+    if: needs.detect-impact.outputs.docs_only != 'true'
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install build dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends clang-17 lld-17 ninja-build ccache
+
+      - name: Cache ccache
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ~/.cache/ccache
+          key: ccache-gate-${{ hashFiles('src/cpu/src/**', 'src/cpu/include/**', 'include/**', 'CMakeLists.txt') }}
+          restore-keys: |
+            ccache-gate-
+            ccache-gate-release-
+
+      - name: Configure (library + selftest only)
+        # 2026-05-23: BUILD_TESTING=ON is required so the run_selftest target
+        # (src/cpu/CMakeLists.txt:1147, wrapped in `if(BUILD_TESTING)`) is
+        # actually built. The next step assumes out/ci-release/run_selftest
+        # exists; without BUILD_TESTING=ON it does not, and the step errors
+        # with "selftest binary not found — cmake build may be misconfigured".
+        run: |
+          cmake -S . -B out/ci-release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang-17 \
+            -DCMAKE_CXX_COMPILER=clang++-17 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DSECP256K1_MARCH=x86-64-v3 \
+            -DBUILD_TESTING=ON \
+            -DSECP256K1_BUILD_TESTS=OFF \
+            -DSECP256K1_BUILD_BENCH=OFF \
+            -DSECP256K1_BUILD_EXAMPLES=OFF \
+            -DSECP256K1_BUILD_FUZZ_TESTS=OFF \
+            -DSECP256K1_BUILD_PROTOCOL_TESTS=OFF
+
+      - name: Build library + selftest only
+        # 2026-05-24: was `cmake --build out/ci-release` (builds the default
+        # target = "all" which, with BUILD_TESTING=ON, pulls in ~50 standalone
+        # test_*.cpp executables and pushed cold-cache builds past the 45-min
+        # job timeout twice (runs 26349000352, 26351304185 both cancelled).
+        # Build only the targets the downstream steps actually need:
+        #   - run_selftest: required by "Selftest smoke" step
+        #   - ufsecp_shared: required by "Determinism gate" (loads libufsecp.so
+        #     via UFSECP_LIB_PATH; without this target the python step fails
+        #     with "Cannot locate a loadable libufsecp.so").
+        run: cmake --build out/ci-release --target run_selftest ufsecp_shared -j"$(nproc)"
+
+      - name: Selftest smoke
+        # 2026-05-24: cmake places the binary at out/ci-release/src/cpu/run_selftest
+        # (CMakeLists.txt:1147 add_executable lives in src/cpu/CMakeLists.txt).
+        # The original cwd-root paths are kept as fallbacks for older build configs.
+        run: |
+          if [ -f out/ci-release/src/cpu/run_selftest ]; then
+            ./out/ci-release/src/cpu/run_selftest
+          elif [ -f out/ci-release/run_selftest ]; then
+            ./out/ci-release/run_selftest
+          elif [ -f out/ci-release/selftest ]; then
+            ./out/ci-release/selftest
+          else
+            # T-16: selftest binary absence = cmake misconfiguration, not a harmless skip.
+            echo "::error::selftest binary not found — cmake build may be misconfigured"
+            exit 1
+          fi
+
+      - name: Determinism gate (RFC 6979 + ECDH + BIP32)
+        env:
+          UFSECP_LIB_PATH: ${{ github.workspace }}/out/ci-release
+        run: python3 ci/check_determinism_gate.py
+
+      - name: Full unit tests (src changed only)
+        if: needs.detect-impact.outputs.run_core == 'true'
+        run: |
+          cmake -S . -B out/ci-tests -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang-17 \
+            -DCMAKE_CXX_COMPILER=clang++-17 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DSECP256K1_MARCH=x86-64-v3 \
+            -DSECP256K1_BUILD_TESTS=ON \
+            -DSECP256K1_BUILD_BENCH=OFF \
+            -DSECP256K1_BUILD_EXAMPLES=OFF \
+            -DSECP256K1_BUILD_FUZZ_TESTS=OFF \
+            -DSECP256K1_BUILD_PROTOCOL_TESTS=ON
+          cmake --build out/ci-tests -j"$(nproc)"
+          ctest --test-dir out/ci-tests --output-on-failure -j"$(nproc)" \
+            -E "^(ct_sidechannel|.*fuzz.*|exploit_gpu_secret_erase|exploit_gpu_memory_safety)$" \
+            --timeout 420
+
+  caas-security:
+    name: Block 3 / CAAS Security Gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: [detect-impact, fast-gates]
+    if: >-
+      needs.detect-impact.outputs.run_caas == 'true' ||
+      needs.detect-impact.outputs.run_core == 'true' ||
+      needs.detect-impact.outputs.run_compat == 'true' ||
+      needs.detect-impact.outputs.run_bindings == 'true' ||
+      needs.detect-impact.outputs.run_gpu == 'true' ||
+      needs.detect-impact.outputs.run_wasm == 'true'
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Install build dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends g++-14 ninja-build
+
+      - name: Build audit shared library
+        run: |
+          cmake -S . -B out/ci-audit -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DBUILD_TESTING=OFF \
+            -DSECP256K1_BUILD_PROTOCOL_TESTS=OFF \
+            -DSECP256K1_BUILD_FUZZ_TESTS=OFF
+          cmake --build out/ci-audit --target ufsecp_shared -j"$(nproc)"
+
+      - name: Build graphs
+        run: |
+          python3 ci/build_project_graph.py --rebuild
+          python3 tools/source_graph_kit/source_graph.py build -i
+
+      - name: Rule 16 enforcement (advisory skip-return) — post-build
+        # CAAS-002 fix (2026-05-26): caas-security builds only ufsecp_shared (no standalone
+        # audit binaries), so rule16_enforce.sh returns rc=77 (soft-skip) — this is expected.
+        # The step is kept here to surface any future regression where an advisory module
+        # accidentally returns 0 (silent false-PASS) in a build that does produce binaries.
+        # A hard failure (rc != 0 && rc != 77) is still a gate failure.
+        env:
+          UFSECP_BUILD_DIR: ${{ github.workspace }}/out/ci-audit
+        run: bash ci/rule16_enforce.sh
+
+      - name: Audit gate (P0–P18)
+        id: audit_gate
+        run: python3 ci/audit_gate.py --json -o caas_audit_gate.json
+
+      - name: Security autonomy check (100/100 or advisory-skip if GPU/infra absent)
+        id: security_autonomy
+        if: always()
+        run: |
+          python3 ci/security_autonomy_check.py --json -o caas_autonomy.json; rc=$?
+          if [ $rc -eq 77 ]; then
+            # rc=77 (advisory-skip) is only benign when audit_gate passed.
+            # If audit_gate failed, a 77 here could mask a real regression — treat as failure.
+            if [ "${{ steps.audit_gate.outcome }}" != "success" ]; then
+              echo "::error::security_autonomy returned advisory-skip (77) but audit_gate did not pass — treating as failure to prevent masking regressions"
+              exit 1
+            fi
+            echo "::notice::security_autonomy advisory-skip (exit 77 — GPU/infrastructure absent; score not verifiable on this runner)"
+            exit 0
+          fi
+          exit $rc
+
+      - name: Annotate autonomy report on failed audit gate (CI-015)
+        # CI-015 fix: if audit_gate failed, the autonomy.json may still show 100/100
+        # because it measures a different dimension. Annotate the JSON so external
+        # auditors reading only the autonomy report cannot mistake it for an OK signal.
+        if: always() && steps.audit_gate.outcome != 'success'
+        run: |
+          if [ -f caas_autonomy.json ]; then
+            python3 - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("caas_autonomy.json")
+          d = json.loads(p.read_text())
+          d["audit_gate_result"] = "FAIL"
+          d["warning"] = ("audit_gate failed — autonomy score is not a valid "
+                          "signal of release readiness; see caas_audit_gate.json")
+          p.write_text(json.dumps(d, indent=2))
+          PY
+          fi
+
+      - name: Source graph quality check
+        id: source_graph_quality
+        if: always()
+        run: python3 ci/check_source_graph_quality.py
+
+      - name: Libsecp shim parity check
+        id: shim_parity
+        if: always()
+        run: python3 ci/check_libsecp_shim_parity.py
+
+      - name: Core build mode check
+        id: core_build_mode
+        if: always()
+        run: python3 ci/check_core_build_mode.py
+
+      - name: Export assurance report
+        id: export_assurance
+        # CI-002: only export when audit_gate passed — prevents a "PASS" assurance
+        # report being uploaded alongside a failed audit gate in the same artifact.
+        if: steps.audit_gate.outcome == 'success'
+        run: python3 ci/export_assurance.py -o assurance_report.json
+
+      - name: Static bundle baseline verify (F-02 fix)
+        # SW-01/F-02 fix: verify the existing evidence bundle on every push/PR
+        # so a regression in verify_external_audit_bundle.py is caught immediately.
+        # A committed bundle is a baseline artifact and cannot self-reference the
+        # commit that contains it. Verify hashes with an explicit commit-mismatch
+        # allowance here, then produce and verify a current-run bundle below.
+        # Audit-fix: removed || true + continue-on-error so a bundle with
+        # mismatched hashes actually blocks the gate (was silently passing).
+        # CI-016: use an absolute workspace path and, if a runner checkout exposes
+        # the commit tree but misses the workspace file, materialize the committed
+        # baseline from HEAD before verification. Absence from HEAD remains a hard
+        # failure.
+        id: static_bundle_verify
+        if: always()
+        run: |
+          BUNDLE="${GITHUB_WORKSPACE}/docs/EXTERNAL_AUDIT_BUNDLE.json"
+          DIGEST="${GITHUB_WORKSPACE}/docs/EXTERNAL_AUDIT_BUNDLE.sha256"
+          if { [ ! -f "$BUNDLE" ] || [ ! -f "$DIGEST" ]; } &&
+             git cat-file -e HEAD:docs/EXTERNAL_AUDIT_BUNDLE.json &&
+             git cat-file -e HEAD:docs/EXTERNAL_AUDIT_BUNDLE.sha256; then
+            echo "::warning::workspace audit bundle missing; materializing committed baseline from HEAD"
+            mkdir -p "${GITHUB_WORKSPACE}/docs"
+            git show HEAD:docs/EXTERNAL_AUDIT_BUNDLE.json > "$BUNDLE"
+            git show HEAD:docs/EXTERNAL_AUDIT_BUNDLE.sha256 > "$DIGEST"
+          fi
+          if [ -f "$BUNDLE" ] && [ -f "$DIGEST" ]; then
+            python3 ci/verify_external_audit_bundle.py \
+              --bundle "$BUNDLE" \
+              --digest "$DIGEST" \
+              --json \
+              --allow-commit-mismatch \
+              > caas_bundle_verify_static.json
+          else
+            echo "::error::docs/EXTERNAL_AUDIT_BUNDLE.json or .sha256 not present in workspace/HEAD — bundle integrity cannot be verified"
+            exit 1
+          fi
+
+      - name: Produce and verify current-run audit bundle (strict HEAD binding)
+        # CAAS bastion hardening: protected CI must prove that an audit bundle
+        # can be produced for the exact commit under test. The strict verifier
+        # rejects commit mismatch here; --allow-commit-mismatch is only for
+        # offline third-party review of historical bundles.
+        id: bundle_verify
+        if: always()
+        run: |
+          mkdir -p out/current_audit
+          python3 ci/external_audit_bundle.py \
+            --output out/current_audit/EXTERNAL_AUDIT_BUNDLE.json \
+            --digest-output out/current_audit/EXTERNAL_AUDIT_BUNDLE.sha256
+          python3 ci/verify_external_audit_bundle.py \
+            --bundle out/current_audit/EXTERNAL_AUDIT_BUNDLE.json \
+            --digest out/current_audit/EXTERNAL_AUDIT_BUNDLE.sha256 \
+            --json > caas_bundle_verify.json
+
+      - name: Evidence chain integrity check (SW-01 fix)
+        # SW-01 fix: validate the evidence chain on every PR.
+        # CAAS6-02 fix (2026-06-10): `validate` mode now ALWAYS runs the structural
+        # /ordering/hash-link checks with the public in-repo key (those do not depend
+        # on the secret) and returns 0/1 by validity — it no longer advisory-skips
+        # (exit 77) when CAAS_HMAC_KEY is absent. Only `record` mode advisory-skips.
+        # So the chain is genuinely validated on every protected-branch push; the
+        # forgery-resistance claim is downgraded (hmac_key_is_default=true) when the
+        # secret is missing. The exit-77 branch below is retained only as harmless
+        # defense-in-depth.
+        if: always()
+        shell: bash
+        run: |
+          set +e   # we capture exit code from python3 explicitly; set -e would
+                  # kill the step before we can branch on the advisory-skip code
+          if [ -f docs/EVIDENCE_CHAIN.json ]; then
+            python3 ci/evidence_governance.py validate
+            RC=$?
+            if [ "$RC" -eq 77 ]; then
+              echo "::notice::Evidence chain: advisory skip (CAAS_HMAC_KEY not provisioned)"
+              exit 0
+            elif [ "$RC" -ne 0 ]; then
+              echo "::error::Evidence chain validation failed — EVIDENCE_CHAIN.json may be corrupted or tampered"
+              exit 1
+            fi
+          else
+            echo "::error::docs/EVIDENCE_CHAIN.json not found — run ci/evidence_governance.py record to bootstrap."
+            exit 1
+          fi
+
+      - name: Secret path change gate (blocking)
+        # Placed here so CPU secret-bearing changes (ecdsa.cpp, schnorr.cpp,
+        # scalar.cpp, ecdh.cpp, etc.) that trigger run_core but NOT run_gpu/run_wasm
+        # are still checked.  caas-security runs for run_core|run_compat|run_bindings
+        # |run_gpu|run_wasm — full coverage of all secret-bearing profiles.
+        if: always()
+        run: |
+          BASE_REF="origin/${{ github.event.pull_request.base.ref || 'main' }}"
+          BEFORE_SHA="${{ github.event.before }}"
+          python3 ci/check_secret_path_changes.py \
+            --base "$BASE_REF" \
+            ${BEFORE_SHA:+--before-sha "$BEFORE_SHA"}
+
+      - name: Add shim audit cross-reference to assurance report
+        # CI-008: assurance_report.json (non-shim build) shows shim modules as
+        # advisory_skipped. A reviewer must also check the 'gate-shim-audit-*'
+        # artifact from the shim-gate job. This step annotates assurance_report.json
+        # with a cross-reference so the link is explicit in the primary evidence artifact.
+        if: always()
+        shell: bash
+        run: |
+          if [ -f assurance_report.json ]; then
+            python3 - <<'PYEOF'
+          import json, os
+          with open("assurance_report.json") as f:
+              report = json.load(f)
+          run_id = os.environ.get("GITHUB_RUN_ID", "unknown")
+          report["_ci008_shim_audit_cross_reference"] = {
+              "note": "Shim-dependent modules appear as advisory_skipped in this non-shim build. "
+                      "The mandatory shim security audit runs in the parallel shim-gate job.",
+              "shim_audit_artifact": f"gate-shim-audit-{run_id}",
+              "shim_modules_validated": [
+                  "exploit_shim_der_bip66", "exploit_shim_musig_secnonce",
+                  "exploit_shim_recovery_null_arg", "exploit_shim_pubkey_ct",
+                  "exploit_shim_noncefp_bypass", "regression_shim_pubkey_sort",
+                  "regression_shim_per_context_blinding", "regression_musig2_session_token",
+                  "exploit_shim_der_zero_r", "exploit_shim_null_ctx",
+              ],
+              "how_to_verify": "Download both gate-caas-evidence-<run_id> AND gate-shim-audit-<run_id> "
+                               "artifacts. Shim modules in shim_audit_report.json must show result=passed."
+          }
+          with open("assurance_report.json", "w") as f:
+              json.dump(report, f, indent=2)
+          print("CI-008: shim audit cross-reference added to assurance_report.json")
+          PYEOF
+          else
+            echo "::notice::assurance_report.json not present — skipping CI-008 cross-reference annotation"
+          fi
+
+      - name: Upload CAAS evidence
+        id: upload_caas_evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gate-caas-evidence-${{ github.run_id }}
+          path: |
+            caas_audit_gate.json
+            caas_autonomy.json
+            caas_bundle_verify.json
+            caas_bundle_verify_static.json
+            out/current_audit/EXTERNAL_AUDIT_BUNDLE.json
+            out/current_audit/EXTERNAL_AUDIT_BUNDLE.sha256
+            assurance_report.json
+          # CI-003 fix: warn instead of error so a gate failure that prevents
+          # assurance_report.json generation doesn't obscure the root-cause gate failure
+          # with a secondary artifact-upload error. Root cause is already visible
+          # from the audit_gate step's own failure status.
+          if-no-files-found: warn
+          # CAAS-001 fix: security/CAAS evidence artifacts retained for 365 days
+          # so retrospective audits can verify gate state beyond GitHub's 90-day default.
+          retention-days: 365
+
+      - name: Check CAAS evidence artifact not empty
+        # T-16 fix: empty artifact is a gate failure, not just a warning.
+        # caas_audit_gate.json is always written on non-crash runs; if it's absent
+        # the audit_gate step crashed, which must fail CI (not just warn).
+        if: always()
+        shell: bash
+        run: |
+          found=0
+          for f in caas_audit_gate.json caas_autonomy.json caas_bundle_verify.json assurance_report.json; do
+            [ -f "$f" ] && found=$((found + 1))
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "::error::CAAS evidence artifact is empty — gate crashed before writing any JSON output"
+            exit 1
+          fi
+          # CI-005 (closed P1-CI-003): caas_audit_gate.json is the primary verdict file.
+          # Previously absent → warning, which let a silent crash slip past CI as a soft
+          # pass. Promoted to hard failure: if any other CAAS file exists ($found > 0)
+          # but the primary verdict file does not, the audit_gate step ran far enough to
+          # write something else (e.g. assurance_report.json) and THEN crashed before
+          # writing the verdict — that is a real failure, not a warning.
+          if [ ! -f "caas_audit_gate.json" ]; then
+            echo "::error::caas_audit_gate.json absent — audit gate ran ($found other JSON file(s) present) but crashed before writing the verdict file"
+            exit 1
+          fi
+          echo "::notice::CAAS evidence artifact: $found file(s) present (caas_audit_gate.json confirmed)"
+
+  bindings-smoke:
+    name: Block 3 / Bindings Smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: [detect-impact, fast-gates]
+    if: needs.detect-impact.outputs.run_bindings == 'true'
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Build C API and Python smoke
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ninja-build g++-14
+          cmake -S bindings/c_api -B out/ci-bindings-capi -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build out/ci-bindings-capi -j"$(nproc)"
+          python3 -m py_compile bindings/python/ultrafast_secp256k1/__init__.py
+
+  shim-gate:
+    name: Block 3 / Shim Security Gate
+    # Builds the unified_audit_runner WITH the libsecp256k1 shim linked so that
+    # shim-dependent security regression modules (CRIT-1 MuSig2 secnonce, HIGH-2/3
+    # DER BIP-66, SPC pubkey CT, SHIM-001/010/012) run as mandatory (not advisory).
+    # Without this job those modules return ADVISORY_SKIP_CODE (77) and a live
+    # regression would produce all_pass:true in the CAAS pipeline.
+    runs-on: ubuntu-24.04
+    # Cold GitHub runners can spend most of the old 25-minute budget in apt
+    # setup before shim build/tests start. Keep the mandatory shim coverage, but
+    # give it the same cold-cache window as Block 2 so infra slowness does not
+    # cancel the security phase before tests run.
+    timeout-minutes: 45
+    needs: [detect-impact, fast-gates]
+    if: >-
+      needs.detect-impact.outputs.run_core == 'true' ||
+      needs.detect-impact.outputs.run_compat == 'true' ||
+      needs.detect-impact.outputs.run_caas == 'true' ||
+      needs.detect-impact.outputs.run_bindings == 'true'
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install build dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends g++-14 ninja-build
+
+      - name: Build with shim (unified_audit_runner + shim linked)
+        run: |
+          cmake -S . -B out/ci-shim -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DSECP256K1_BUILD_SHIM=ON \
+            -DBUILD_TESTING=ON \
+            -DSECP256K1_BUILD_TESTS=OFF \
+            -DSECP256K1_BUILD_BENCH=OFF \
+            -DSECP256K1_BUILD_EXAMPLES=OFF \
+            -DSECP256K1_BUILD_FUZZ_TESTS=OFF \
+            -DSECP256K1_BUILD_PROTOCOL_TESTS=OFF \
+            -DSECP256K1_MARCH=x86-64-v3
+          cmake --build out/ci-shim --target unified_audit_runner -j"$(nproc)"
+
+      - name: Rule 16 enforcement (advisory skip-return) — post-build
+        # P1-CI-01 fix (2026-05-23): post-build Rule 16 enforcement via the
+        # shared ci/rule16_enforce.sh wrapper. Soft-skip when standalone
+        # binaries aren't built (this shim-gate build only produces
+        # unified_audit_runner; standalone targets live in release-caas-gate).
+        env:
+          UFSECP_BUILD_DIR: ${{ github.workspace }}/out/ci-shim
+        run: bash ci/rule16_enforce.sh
+
+      - name: Run shim security regression modules
+        # Architecture note: root CMakeLists adds audit/ BEFORE
+        # compat/libsecp256k1_shim/, so audit/CMakeLists.txt's
+        # `if(TARGET secp256k1_shim)` blocks are FALSE at processing time.
+        # This means unified_audit_runner is linked with the
+        # ADVISORY_SKIP_CODE(77) stubs from shim_run_stubs_unified.cpp for
+        # shim regression tests — they appear as advisory-skipped in the
+        # JSON output, BY DESIGN. The real shim test bodies are exercised
+        # by the parallel standalone CTest targets (built but not invoked
+        # here; covered by other audit workflows). Trying to make these
+        # tests non-advisory-skipped in this binary requires reversing the
+        # CMakeLists order, which breaks the build (test files have API
+        # drift — confirmed locally 2026-05-13).
+        #
+        # Checks performed:
+        #   (b) Rule 16: GPU/CUDA/Metal/OpenCL advisory modules must return
+        #       ADVISORY_SKIP_CODE(77) when their runtime is absent — never
+        #       return 0 (false PASS). CI-012 fix.
+        #   (c) Any non-shim module that failed (passed=false AND not an
+        #       advisory-77 skip) is a real regression.
+        run: |
+          # unified_audit_runner CLI exposes --report-dir, NOT -o. It writes
+          # audit_report.json in the report dir. We rename it to keep the
+          # downstream artifact name stable.
+          ./out/ci-shim/audit/unified_audit_runner --json-only --report-dir .
+          mv audit_report.json shim_audit_report.json
+          python3 - <<'PYEOF'
+          import json, sys
+          with open("shim_audit_report.json") as f:
+              r = json.load(f)
+          # T-02 fix: modules are nested under sections[].modules[], not a flat top-level array.
+          # Field name is "id" (not "key"). Result is encoded as passed:bool + return_code:int.
+          modules = [m for s in r.get("sections", []) for m in s.get("modules", [])]
+          if not modules:
+              print("::error::Shim gate: no modules found in JSON — sections parse failed or empty report.")
+              sys.exit(1)
+
+          # (b) CI-012: Advisory modules that returned 0 when they should return 77 (Rule 16).
+          # In the current JSON format, return_code=77 sets passed=false. An advisory module
+          # with passed=true AND return_code=0 that should have skipped is a false-pass.
+          # We detect GPU-advisory modules specifically (no GPU in shim CI) — UNLESS the
+          # module is a source-code content check that does not require GPU runtime.
+          # Source-content tests legitimately return 0 (PASS) when their target file is
+          # found at the runtime cwd; they correctly return 77 only when the file path
+          # cannot be resolved. Their advisory=true reflects that source-tree availability
+          # is environmental, not their semantics.
+          source_content_allowlist = {
+              # Reads src/metal/shaders/secp256k1_extended.h and pattern-matches
+              # for the SECURITY FIX (CRITICAL-1) annotation. No Metal runtime invoked.
+              "test_exploit_metal_schnorr_aux_rand",
+              # Reads src/metal/shaders/secp256k1_kernels.metal; returns 0 when file found
+              # (source-tree cwd), 77 when absent (build-dir cwd). advisory=true by design.
+              "test_exploit_metal_batch_failclosed",
+              # Reads src/opencl/src/opencl_audit_runner.cpp; source-code content scan,
+              # no OpenCL runtime invoked. Returns 0 when file found (CI checkout),
+              # 77 when absent. advisory=true because file may be absent in some builds.
+              "test_exploit_opencl_runner_key_erase",
+          }
+          advisory_false_pass = []
+          for mod in modules:
+              if mod.get("advisory") is True and mod.get("passed") is True and mod.get("return_code") == 0:
+                  mid = mod.get("id", "")
+                  if mid in source_content_allowlist:
+                      continue
+                  # GPU-advisory modules should always return 77 in a no-GPU CI environment.
+                  if any(kw in mid for kw in ("gpu", "cuda", "metal", "opencl")):
+                      advisory_false_pass.append(mid)
+          if advisory_false_pass:
+              print(f"::error::GPU advisory modules showing false-pass (returned 0 instead of 77): {advisory_false_pass}")
+              print("Rule 16 violation: advisory skip paths must return ADVISORY_SKIP_CODE (77), not 0.")
+              sys.exit(1)
+
+          # (c) Any non-advisory module that failed is a real regression. Shim modules are
+          # advisory-stubbed (advisory=true, return_code=77) by design in this build.
+          failed = [m.get("id", "?") for m in modules
+                    if not m.get("passed") and not m.get("advisory")]
+          if failed:
+              print(f"::error::Shim security modules FAILED: {failed}")
+              sys.exit(1)
+
+          advisory_skipped_count = len([m for m in modules
+                                        if m.get("advisory") is True and m.get("return_code") == 77])
+          print(f"::notice::Shim gate passed — "
+                f"{advisory_skipped_count} advisory-skipped (shim stubs or GPU infrastructure absent), "
+                f"0 false-pass, 0 failed")
+          PYEOF
+
+      - name: Run standalone shim regression CTest targets
+        # if: always() — run even if the unified_audit_runner step above exited non-zero
+        # (e.g. an advisory module failed). The build succeeded; CTest targets are present.
+        # Without this, a single advisory FAIL in the runner silently skips all shim
+        # regression CTest targets (CAAS-001 fix).
+        if: always()
+        # The unified_audit_runner above has advisory stubs for shim tests (by-design
+        # CMakeLists ordering). The standalone CTest targets are built with the real
+        # shim-linked test bodies. Invoke them explicitly so shim security regressions
+        # produce a hard FAIL, not a silent advisory-skip.
+        run: |
+          cmake --build out/ci-shim --target shim_security_gate_standalones -j"$(nproc)"
+          ctest --test-dir out/ci-shim \
+            -R "regression_shim|regression_ecdsa_batch_curve|exploit_shim|test_shim" \
+            --output-on-failure -j"$(nproc)" --timeout 120 --no-tests=error
+
+      - name: Run libsecp shim API compatibility test
+        # Builds the normal standalone shim mode because secp256k1_shim_test is
+        # intentionally not emitted when SECP256K1_BUILD_SHIM=ON. This catches
+        # opaque ECDSA signature-layout regressions that downstream projects
+        # such as libbitcoin-system observe through secp256k1_ecdsa_signature.data.
+        run: bash ci/run_libsecp_shim_api_test.sh out/ci-gate-shim-api
+
+      - name: Upload shim audit report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gate-shim-audit-${{ github.run_id }}
+          path: shim_audit_report.json
+          retention-days: 365 # Match primary CAAS evidence retention for retrospective audit correlation
+
+  gpu-wasm-smoke:
+    name: Block 3 / GPU-WASM Routing Smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    needs: [detect-impact, fast-gates]
+    if: needs.detect-impact.outputs.run_gpu == 'true' || needs.detect-impact.outputs.run_wasm == 'true'
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+
+      - name: API contract checks
+        # H-1 fix: hard gate. A crypto engine has no low-priority API problems —
+        # any API contract violation is a blocking failure.
+        run: python3 ci/check_api_contracts.py --json
+
+      - name: CUDA/MSVC preflight
+        run: python3 ci/preflight.py --cuda-msvc
+
+  final-verdict:
+    name: Gate / Final Verdict
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs:
+      - detect-impact
+      - fast-gates
+      - caas-gate
+      - build-test
+      - caas-security
+      - bindings-smoke
+      - gpu-wasm-smoke
+      - shim-gate
+    if: always()
+    steps:
+      - name: Evaluate block results
+        run: |
+          echo "## Gate / Final Verdict" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Gate: ${{ needs.detect-impact.outputs.gate }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Profiles: ${{ needs.detect-impact.outputs.profiles }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Reason: ${{ needs.detect-impact.outputs.reason }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Block | Result |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| detect-impact | ${{ needs.detect-impact.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| fast-gates | ${{ needs.fast-gates.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| build-test | ${{ needs.build-test.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| caas-security | ${{ needs.caas-security.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| bindings-smoke | ${{ needs.bindings-smoke.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| gpu-wasm-smoke | ${{ needs.gpu-wasm-smoke.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| shim-gate | ${{ needs.shim-gate.result }} |" >> "$GITHUB_STEP_SUMMARY"
+
+          # caas-security must never be silently skipped for non-docs changes.
+          # docs_only=true is the only legitimate skip path (all changed files
+          # fell into docs-only profile, so no security-relevant code changed).
+          if [ "${{ needs.caas-security.result }}" = "skipped" ]; then
+            if [ "${{ needs.detect-impact.outputs.docs_only }}" != "true" ]; then
+              echo "::error::caas-security was skipped — security gates must always run for non-docs changes"
+              exit 1
+            fi
+          fi
+
+          # Verdict: failures and cancellations always fail the gate.
+          # Each block's job-level `if:` clause already governs WHEN it
+          # legitimately skips (build-test on docs_only, bindings-smoke when
+          # run_bindings=false, etc.). The only block where "skipped" must
+          # be specifically explained is caas-security — security gates must
+          # never be silently skipped on non-docs changes (already enforced
+          # by the explicit caas-security check above this loop).
+          #
+          # detect-impact and fast-gates must always run (no `if:` clause
+          # that allows skipping); skipped here = workflow misconfiguration.
+          for entry in \
+            "detect-impact:${{ needs.detect-impact.result }}:never" \
+            "fast-gates:${{ needs.fast-gates.result }}:never" \
+            "build-test:${{ needs.build-test.result }}:may_skip" \
+            "caas-security:${{ needs.caas-security.result }}:may_skip" \
+            "bindings-smoke:${{ needs.bindings-smoke.result }}:may_skip" \
+            "gpu-wasm-smoke:${{ needs.gpu-wasm-smoke.result }}:may_skip" \
+            "shim-gate:${{ needs.shim-gate.result }}:may_skip"; do
+            block="${entry%%:*}"
+            rest="${entry#*:}"
+            result="${rest%%:*}"
+            skip_policy="${rest#*:}"
+
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "::error::Gate block '$block' → $result"
+              exit 1
+            fi
+            if [ "$result" = "skipped" ] && [ "$skip_policy" = "never" ]; then
+              echo "::error::Gate block '$block' was skipped — this block must never be skipped"
+              exit 1
+            fi
+          done
+
+          echo "::notice::All selected gate blocks passed"

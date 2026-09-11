@@ -1,0 +1,274 @@
+/* ============================================================================
+ * libsecp256k1-compatible C API -- backed by UltrafastSecp256k1
+ *
+ * This header provides the same types and function declarations as
+ * bitcoin-core/secp256k1's secp256k1.h so that existing C/C++ code
+ * can link against UltrafastSecp256k1 without source changes.
+ * ========================================================================== */
+#ifndef SECP256K1_ULTRAFAST_SHIM_H
+#define SECP256K1_ULTRAFAST_SHIM_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <stddef.h>
+
+/* -- Visibility ----------------------------------------------------------- */
+#ifndef SECP256K1_API
+#  define SECP256K1_API extern
+#endif
+#define SECP256K1_WARN_UNUSED_RESULT
+#define SECP256K1_ARG_NONNULL(_x)
+#define SECP256K1_DEPRECATED(_msg)
+
+/* -- Opaque context ------------------------------------------------------- */
+/* Context flags: this shim follows libsecp256k1 v0.6+ semantics where
+ * SECP256K1_CONTEXT_NONE is valid for ALL operations (sign and verify).
+ * The legacy SECP256K1_CONTEXT_SIGN / SECP256K1_CONTEXT_VERIFY flags are
+ * accepted for compatibility but are no longer required. NULL context always
+ * triggers the illegal callback regardless of operation.
+ * Note: parse/serialize functions ignore context flags (as in upstream). */
+typedef struct secp256k1_context_struct secp256k1_context;
+
+/* -- Public key (64 bytes opaque) ----------------------------------------- */
+/* Drop-in compatible with upstream libsecp256k1. */
+typedef struct secp256k1_pubkey {
+    unsigned char data[64];
+} secp256k1_pubkey;
+
+/* -- Pre-computed public key (fast verify) --------------------------------- */
+/* Embeds pre-built GLV tables. Use secp256k1_ec_pubkey_precomp() to populate.
+ * Eliminates ~1,954 ns GLV table rebuild on every secp256k1_ecdsa_verify()
+ * call for unique pubkeys (ConnectBlock workload).
+ * Size: sizeof(secp256k1::EcdsaPublicKey) on x86-64, typically 1,400-1,504 bytes.
+ * The exact layout is opaque -- use only via the _precomp API below.
+ * C note: use alignas(8) / _Alignas(8) when declaring on stack. */
+#ifdef __cplusplus
+}  /* suspend extern "C" — ecdsa.hpp contains C++ templates, illegal under C linkage */
+#  include "secp256k1/ecdsa.hpp"
+   struct secp256k1_pubkey_precomp { secp256k1::EcdsaPublicKey epk; };
+extern "C" {  /* reopen C linkage for the rest of the shim API */
+#else
+   /* C-compatible: conservatively-sized buffer; static_assert in shim verifies. */
+#  define SECP256K1_PUBKEY_PRECOMP_SIZE 1504
+   struct secp256k1_pubkey_precomp {
+#    ifdef __STDC_VERSION__
+       _Alignas(8) unsigned char _data[SECP256K1_PUBKEY_PRECOMP_SIZE];
+#    else
+       unsigned char _data[SECP256K1_PUBKEY_PRECOMP_SIZE];
+#    endif
+   };
+#endif
+typedef struct secp256k1_pubkey_precomp secp256k1_pubkey_precomp;
+
+/* -- ECDSA signature (64 bytes opaque) ------------------------------------ */
+typedef struct secp256k1_ecdsa_signature {
+    unsigned char data[64];
+} secp256k1_ecdsa_signature;
+
+/* -- Nonce function type -------------------------------------------------- */
+typedef int (*secp256k1_nonce_function)(
+    unsigned char *nonce32,
+    const unsigned char *msg32,
+    const unsigned char *key32,
+    const unsigned char *algo16,
+    void *data,
+    unsigned int attempt
+);
+
+/* -- Flags ---------------------------------------------------------------- */
+#define SECP256K1_FLAGS_TYPE_MASK         ((1 << 8) - 1)
+#define SECP256K1_FLAGS_TYPE_CONTEXT      (1 << 0)
+#define SECP256K1_FLAGS_TYPE_COMPRESSION  (1 << 1)
+#define SECP256K1_FLAGS_BIT_CONTEXT_VERIFY    (1 << 8)
+#define SECP256K1_FLAGS_BIT_CONTEXT_SIGN      (1 << 9)
+#define SECP256K1_FLAGS_BIT_COMPRESSION       (1 << 8)
+
+#define SECP256K1_CONTEXT_NONE     (SECP256K1_FLAGS_TYPE_CONTEXT)
+#define SECP256K1_CONTEXT_VERIFY   (SECP256K1_FLAGS_TYPE_CONTEXT | SECP256K1_FLAGS_BIT_CONTEXT_VERIFY)
+#define SECP256K1_CONTEXT_SIGN     (SECP256K1_FLAGS_TYPE_CONTEXT | SECP256K1_FLAGS_BIT_CONTEXT_SIGN)
+
+#define SECP256K1_EC_COMPRESSED    (SECP256K1_FLAGS_TYPE_COMPRESSION | SECP256K1_FLAGS_BIT_COMPRESSION)
+#define SECP256K1_EC_UNCOMPRESSED  (SECP256K1_FLAGS_TYPE_COMPRESSION)
+
+#define SECP256K1_TAG_PUBKEY_EVEN          0x02
+#define SECP256K1_TAG_PUBKEY_ODD           0x03
+#define SECP256K1_TAG_PUBKEY_UNCOMPRESSED  0x04
+
+/* -- Illegal/error callback ----------------------------------------------- */
+/* Called when an illegal API usage or internal error is detected.
+ * The default behavior (when not set) is to call abort(). Pass a no-op
+ * function pointer to suppress the default abort (Bitcoin Core pattern). */
+typedef void (*secp256k1_callback_fn)(const char *text, void *data);
+
+/* -- Static context ------------------------------------------------------- */
+SECP256K1_API const secp256k1_context * const secp256k1_context_static;
+
+/* -- Context lifecycle ---------------------------------------------------- */
+SECP256K1_API secp256k1_context *secp256k1_context_create(unsigned int flags);
+SECP256K1_API secp256k1_context *secp256k1_context_clone(const secp256k1_context *ctx);
+SECP256K1_API void secp256k1_context_destroy(secp256k1_context *ctx);
+SECP256K1_API int  secp256k1_context_randomize(secp256k1_context *ctx, const unsigned char *seed32);
+SECP256K1_API void secp256k1_selftest(void);
+
+/* -- Preallocated context API (TASK-008) ---------------------------------- */
+/* These functions allow callers to provide their own memory for the context.
+ * secp256k1_context_preallocated_destroy does NOT free the buffer — the
+ * caller owns it. secp256k1_context_destroy DOES free (normal malloc path).
+ * Note: this shim's internal state is fully self-contained in the returned
+ * pointer; the prealloc buffer must be at least secp256k1_context_preallocated_size()
+ * bytes aligned to alignof(secp256k1_context). */
+SECP256K1_API size_t secp256k1_context_preallocated_size(unsigned int flags);
+SECP256K1_API secp256k1_context *secp256k1_context_preallocated_create(
+    void *prealloc, unsigned int flags);
+SECP256K1_API secp256k1_context *secp256k1_context_preallocated_clone(
+    const secp256k1_context *ctx, void *prealloc);
+SECP256K1_API void secp256k1_context_preallocated_destroy(secp256k1_context *ctx);
+
+/* Install a callback invoked on illegal API usage (NULL ctx, bad arg, etc.).
+ * The default callback calls abort(). Pass a no-op to suppress abort. */
+SECP256K1_API void secp256k1_context_set_illegal_callback(
+    secp256k1_context *ctx,
+    secp256k1_callback_fn fun,
+    const void *data);
+
+/* Install a callback for internal library errors (e.g., OOM during context ops).
+ * The default callback calls abort(). */
+SECP256K1_API void secp256k1_context_set_error_callback(
+    secp256k1_context *ctx,
+    secp256k1_callback_fn fun,
+    const void *data);
+
+/* -- Public key operations ------------------------------------------------ */
+SECP256K1_API int secp256k1_ec_pubkey_parse(
+    const secp256k1_context *ctx, secp256k1_pubkey *pubkey,
+    const unsigned char *input, size_t inputlen);
+
+SECP256K1_API int secp256k1_ec_pubkey_serialize(
+    const secp256k1_context *ctx, unsigned char *output, size_t *outputlen,
+    const secp256k1_pubkey *pubkey, unsigned int flags);
+
+SECP256K1_API int secp256k1_ec_pubkey_cmp(
+    const secp256k1_context *ctx,
+    const secp256k1_pubkey *pubkey1, const secp256k1_pubkey *pubkey2);
+
+SECP256K1_API int secp256k1_ec_pubkey_create(
+    const secp256k1_context *ctx, secp256k1_pubkey *pubkey,
+    const unsigned char *seckey);
+
+SECP256K1_API int secp256k1_ec_pubkey_negate(
+    const secp256k1_context *ctx, secp256k1_pubkey *pubkey);
+
+SECP256K1_API int secp256k1_ec_pubkey_tweak_add(
+    const secp256k1_context *ctx, secp256k1_pubkey *pubkey,
+    const unsigned char *tweak32);
+
+SECP256K1_API int secp256k1_ec_pubkey_tweak_mul(
+    const secp256k1_context *ctx, secp256k1_pubkey *pubkey,
+    const unsigned char *tweak32);
+
+SECP256K1_API int secp256k1_ec_pubkey_combine(
+    const secp256k1_context *ctx, secp256k1_pubkey *out,
+    const secp256k1_pubkey * const *ins, size_t n);
+
+SECP256K1_API void secp256k1_ec_pubkey_sort(
+    const secp256k1_context *ctx,
+    const secp256k1_pubkey **pubkeys,
+    size_t n_pubkeys);
+
+/* -- Secret key operations ------------------------------------------------ */
+SECP256K1_API int secp256k1_ec_seckey_verify(
+    const secp256k1_context *ctx, const unsigned char *seckey);
+
+SECP256K1_API int secp256k1_ec_seckey_negate(
+    const secp256k1_context *ctx, unsigned char *seckey);
+
+SECP256K1_API int secp256k1_ec_seckey_tweak_add(
+    const secp256k1_context *ctx, unsigned char *seckey,
+    const unsigned char *tweak32);
+
+SECP256K1_API int secp256k1_ec_seckey_tweak_mul(
+    const secp256k1_context *ctx, unsigned char *seckey,
+    const unsigned char *tweak32);
+
+/* -- Pre-computed pubkey API ---------------------------------------------- */
+/* Build pre-computed form from an already-parsed secp256k1_pubkey.
+ * Builds GLV verify tables once. Returns 1 on success, 0 on invalid key.
+ * Faster alternative: secp256k1_ec_pubkey_parse_precomp() parses + precomputes. */
+SECP256K1_API int secp256k1_ec_pubkey_precomp(
+    const secp256k1_context *ctx,
+    secp256k1_pubkey_precomp *out,
+    const secp256k1_pubkey *pubkey);
+
+/* Parse a raw pubkey and build pre-computed tables in one step.
+ * Equivalent to secp256k1_ec_pubkey_parse() + secp256k1_ec_pubkey_precomp()
+ * but with one fewer format round-trip. Returns 1 on success, 0 on failure.
+ * input/inputlen: 33-byte compressed or 65-byte uncompressed pubkey. */
+SECP256K1_API int secp256k1_ec_pubkey_parse_precomp(
+    const secp256k1_context *ctx,
+    secp256k1_pubkey_precomp *out,
+    const unsigned char *input, size_t inputlen);
+
+/* Verify an ECDSA signature against a pre-computed pubkey.
+ * Zero GLV table rebuild overhead — tables already in out.
+ * Drop-in replacement for secp256k1_ecdsa_verify() when the pubkey is
+ * already in secp256k1_pubkey_precomp form. */
+SECP256K1_API int secp256k1_ecdsa_verify_precomp(
+    const secp256k1_context *ctx,
+    const secp256k1_ecdsa_signature *sig,
+    const unsigned char *msghash32,
+    const secp256k1_pubkey_precomp *pubkey);
+
+/* -- ECDSA ---------------------------------------------------------------- */
+SECP256K1_API int secp256k1_ecdsa_signature_parse_compact(
+    const secp256k1_context *ctx, secp256k1_ecdsa_signature *sig,
+    const unsigned char *input64);
+
+SECP256K1_API int secp256k1_ecdsa_signature_parse_der(
+    const secp256k1_context *ctx, secp256k1_ecdsa_signature *sig,
+    const unsigned char *input, size_t inputlen);
+
+SECP256K1_API int secp256k1_ecdsa_signature_serialize_compact(
+    const secp256k1_context *ctx, unsigned char *output64,
+    const secp256k1_ecdsa_signature *sig);
+
+SECP256K1_API int secp256k1_ecdsa_signature_serialize_der(
+    const secp256k1_context *ctx, unsigned char *output, size_t *outputlen,
+    const secp256k1_ecdsa_signature *sig);
+
+SECP256K1_API int secp256k1_ecdsa_signature_normalize(
+    const secp256k1_context *ctx, secp256k1_ecdsa_signature *sigout,
+    const secp256k1_ecdsa_signature *sigin);
+
+SECP256K1_API int secp256k1_ecdsa_verify(
+    const secp256k1_context *ctx, const secp256k1_ecdsa_signature *sig,
+    const unsigned char *msghash32, const secp256k1_pubkey *pubkey);
+
+/* NOTE (shim divergence): custom noncefp values (other than NULL /
+ * secp256k1_nonce_function_rfc6979 / secp256k1_nonce_function_default)
+ * are rejected (return 0) rather than silently ignored. RFC 6979 is always
+ * used. ndata IS respected as auxiliary entropy (hedged signing path), which
+ * is how Bitcoin Core's R-grinding loop works. See BITCOIN_CORE_PR_BLOCKERS.md §B. */
+SECP256K1_API int secp256k1_ecdsa_sign(
+    const secp256k1_context *ctx, secp256k1_ecdsa_signature *sig,
+    const unsigned char *msghash32, const unsigned char *seckey,
+    secp256k1_nonce_function noncefp, const void *ndata);
+
+SECP256K1_API const secp256k1_nonce_function secp256k1_nonce_function_rfc6979;
+SECP256K1_API const secp256k1_nonce_function secp256k1_nonce_function_default;
+
+/* -- Tagged hash ---------------------------------------------------------- */
+SECP256K1_API int secp256k1_tagged_sha256(
+    const secp256k1_context *ctx, unsigned char *hash32,
+    const unsigned char *tag, size_t taglen,
+    const unsigned char *msg, size_t msglen);
+
+#ifdef __cplusplus
+}
+#endif
+
+/* Pull in ElligatorSwift (BIP-324 v2 transport) -- required by Bitcoin Core */
+#include "secp256k1_ellswift.h"
+
+#endif /* SECP256K1_ULTRAFAST_SHIM_H */

@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net9.0</TargetFrameworks>
+    <RootNamespace>Ultrafast.Ufsecp</RootNamespace>
+    <AssemblyName>Ufsecp</AssemblyName>
+    <Version>0.0.0-dev</Version>
+    <Authors>UltrafastSecp256k1 Contributors</Authors>
+    <Description>C# P/Invoke bindings for UltrafastSecp256k1 — high-performance secp256k1 ECC (ufsecp C ABI v1)</Description>
+    <PackageId>Ufsecp</PackageId>
+    <PackageTags>secp256k1;ecdsa;schnorr;bitcoin;cryptography;ufsecp;taproot;bip32</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/shrec/UltrafastSecp256k1</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/shrec/UltrafastSecp256k1</RepositoryUrl>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+  </PropertyGroup>
+
+  <!-- README for nuget.org -->
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <!-- Bundle native libraries for multi-RID NuGet package -->
+  <ItemGroup>
+    <Content Include="runtimes\**\*" Pack="true" PackagePath="runtimes" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

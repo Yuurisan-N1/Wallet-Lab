@@ -1,0 +1,4 @@
+{
+    global: secp256k1_*;
+    local: *;
+};

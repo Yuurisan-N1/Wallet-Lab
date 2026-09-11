@@ -1,0 +1,84 @@
+# Codecov configuration — https://docs.codecov.io/docs/codecov-yaml
+# Placed in repo root; auto-detected by Codecov on upload.
+
+codecov:
+  require_ci_to_pass: true
+  notify:
+    wait_for_ci: true
+
+coverage:
+  precision: 2
+  round: down
+  range: "40...90"
+
+  status:
+    project:
+      default:
+        target: auto        # compare against base commit
+        threshold: 1%       # allow 1% drop without failing
+        if_ci_failed: error
+    patch:
+      default:
+        target: 80%         # new code should have ≥80% coverage
+        threshold: 5%
+        # Hard gate: PRs that drop new-code coverage below 80% fail CI.
+        # Rationale: cryptographic code -- every new line of production
+        # arithmetic must be exercised by at least one audit check.
+
+  # Only measure coverage on production source code
+  # (exclude tests, benchmarks, examples, third-party, build artifacts,
+  #  build system files, and generated header templates)
+
+ignore:
+  - "src/cpu/tests/**"
+  - "src/cpu/bench/**"
+  - "src/cpu/examples/**"
+  - "tests/**"
+  - "bench/**"
+  - "examples/**"
+  - "audit/**"
+  - "bindings/wasm/**"
+  - "bindings/android/**"
+  - "bindings/**"
+  - "ci/**"
+  - "cmake/**"
+  - "docs/**"
+  # Build system and generated files — not compiled C++
+  - "**/CMakeLists.txt"
+  - "**/*.cmake"
+  - "**/*.h.in"       # CMake-generated header templates
+  - "CMakePresets.json"
+  - "**/*.json"
+  # Platform-specific code never compiled on Linux coverage runner
+  - "src/metal/**"
+  - "src/gpu/src/gpu_backend_metal.mm"
+  # Unicode NFKD: platform-dispatcher (Windows/macOS/Linux branches).
+  # Only the generic Linux path runs on the coverage runner; the other
+  # 2/3 of the file are OS-API wrappers never compiled on Linux.
+  # BIP-39 NFKD correctness is verified by test_exploit_bip39_nfkd.
+  - "src/cpu/src/unicode_nfkd.cpp"
+  # C ABI compat shims — tested by shim test suite, not CPU unit tests;
+  # not compiled into the coverage build.
+  - "compat/**"
+  # GPU kernels — cannot be instrumented on CPU-only CI runners.
+  - "src/cuda/**"
+  - "src/opencl/**"
+  - "src/gpu/**"
+  # GPU host ABI depends on backend/device availability; fail-closed behavior
+  # is covered by audit GPU negative tests and CAAS security gates instead of
+  # the CPU-only coverage runner.
+  - "src/cpu/src/ufsecp_gpu_impl.cpp"
+
+comment:
+  layout: "reach,diff,flags,files"
+  behavior: default
+  require_changes: false
+  require_base: false
+  require_head: true
+
+flags:
+  cpu:
+    paths:
+      - src/cpu/src/
+      - src/cpu/include/
+    carryforward: true

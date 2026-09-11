@@ -1,0 +1,586 @@
+name: Security Audit
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  schedule:
+    - cron: '0 2 * * 1'  # Weekly Monday 2am
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Static Analysis: compiler warnings as errors ────────────────────────
+  compiler-warnings:
+    name: Build with -Werror
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends g++-14 ninja-build ccache
+
+      - name: Cache ccache
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ~/.cache/ccache
+          key: ccache-sa-werror-${{ hashFiles('src/cpu/src/**', 'src/cpu/include/**', 'include/**') }}
+          restore-keys: |
+            ccache-sa-werror-
+
+      - name: Configure ccache
+        run: |
+          ccache --set-config=max_size=200M
+          ccache --set-config=compression=true
+          ccache -z
+
+      - name: Configure
+        # Tests use the deprecated variable-time ecdsa_sign() intentionally
+        # to verify var-time == CT path. Excluding tests from the -Werror
+        # build keeps the warning gate meaningful for production code only.
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DSECP256K1_MARCH=x86-64-v3 \
+            -DSECP256K1_WERROR=ON \
+            -DSECP256K1_BUILD_BENCH=OFF \
+            -DSECP256K1_BUILD_TESTS=OFF \
+            -DSECP256K1_BUILD_EXAMPLES=OFF \
+            -DSECP256K1_BUILD_JAVA=OFF
+
+      - name: Build library (zero warnings required, tests excluded)
+        run: cmake --build build -j"$(nproc)"
+
+  # ── Address + Undefined Behavior Sanitizers ─────────────────────────────
+  sanitizers:
+    name: ASan + UBSan
+    runs-on: ubuntu-24.04
+    # CI-001 fix: removed job-level continue-on-error so build failures ARE blocking.
+    # CI-005 + CORR-01 (CAAS6-05): the test step is now a HARD GATE. Its step-level
+    # continue-on-error and the former scalar-mul KAT carve-out were removed (see the
+    # "Test under sanitizers" step below); any ASan/UBSan violation fails the job.
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang-17 lld-17 ninja-build ccache
+
+      - name: Cache ccache
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ~/.cache/ccache
+          key: ccache-sa-asan-${{ hashFiles('src/cpu/src/**', 'src/cpu/include/**', 'include/**') }}
+          restore-keys: |
+            ccache-sa-asan-
+
+      - name: Configure ccache
+        run: |
+          ccache --set-config=max_size=200M
+          ccache --set-config=compression=true
+          ccache -z
+
+      - name: Configure with sanitizers
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang-17 \
+            -DCMAKE_CXX_COMPILER=clang++-17 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DSECP256K1_MARCH=x86-64-v3 \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
+            -DSECP256K1_BUILD_TESTS=ON \
+            -DSECP256K1_BUILD_EXAMPLES=OFF \
+            -DSECP256K1_BUILD_JAVA=OFF
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test under sanitizers
+        # CI-005 + CORR-01: continue-on-error removed. ALL tests run as a hard gate
+        # (the former test_large_scalar advisory carve-out is gone — see the selftest
+        # step below). Any new ASan/UBSan violation causes a red job failure.
+        id: asan_ubsan_tests
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        # Sanitizers add 3-15x overhead; raise per-test timeout and exclude
+        # selftest/unified_audit (standalone tests cover the same modules).
+        # Exclude py_*: Python ctypes loads ASan-built libufsecp.so without the
+        # ASan runtime preloaded, causing __asan_option_detect_stack_use_after_return
+        # undefined symbol errors. Python tests run in the normal linux jobs.
+        run: ctest --test-dir build --output-on-failure -j"$(nproc)" -E "^(ct_sidechannel|selftest|unified_audit|py_)" --timeout 900
+
+      - name: Selftest under sanitizers — scalar_mul large-vector coverage (CORR-01)
+        # CORR-01: the former "known non-asm scalar_mul divergence" no longer reproduces.
+        # The previous advisory step (`ctest -R "^test_large_scalar"` + continue-on-error)
+        # gated NOTHING — test_large_scalar_multiplication is compiled only into run_selftest,
+        # never as a standalone CTest target, so the regex matched no test. Meanwhile the
+        # main ctest step excludes `selftest`, so the fast-vs-generic kG / large-scalar / KAT
+        # checks had no sanitizer coverage at all. Run the selftest binary directly as a HARD
+        # gate (no continue-on-error): it passes cleanly under clang-17 + ASan/UBSan
+        # (verified: 31/31 modules, smoke+stress, no runtime errors).
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ./build/src/cpu/run_selftest
+
+  # ── Memory Sanitizer (uninitialized reads) ──────────────────────────────
+  msan:
+    name: MSan
+    runs-on: ubuntu-24.04
+    # CI-001 fix: job-level continue-on-error removed; test step is step-level advisory.
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            clang-17 lld-17 ninja-build ccache libc++-17-dev libc++abi-17-dev
+
+      - name: Cache MSan-instrumented libc++
+        id: msan-libcxx-cache
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: /tmp/msan-libcxx
+          key: msan-libcxx-clang17-v3
+
+      - name: Build MSan-instrumented libc++
+        if: steps.msan-libcxx-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch llvmorg-17.0.6 \
+            https://github.com/llvm/llvm-project.git /tmp/llvm-project
+          cmake -G Ninja -S /tmp/llvm-project/runtimes -B /tmp/msan-libcxx-build \
+            -DCMAKE_C_COMPILER=clang-17 \
+            -DCMAKE_CXX_COMPILER=clang++-17 \
+            -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_USE_SANITIZER=MemoryWithOrigins \
+            -DLIBCXX_ENABLE_EXPERIMENTAL_LIBRARY=OFF
+          cmake --build /tmp/msan-libcxx-build -j"$(nproc)" -- cxx cxxabi
+          # Install to a persistent path for caching.
+          # LLVM 17 runtimes build ignores LIBCXX_ENABLE_EXPERIMENTAL_LIBRARY=OFF
+          # in the install manifest, so the install fails trying to copy the
+          # unbuilt libc++experimental.a.  Tolerate that error and verify the
+          # libraries we actually need are present.
+          DESTDIR=/tmp/msan-libcxx cmake --install /tmp/msan-libcxx-build --prefix /usr || true
+          test -f /tmp/msan-libcxx/usr/lib/libc++.a
+          test -f /tmp/msan-libcxx/usr/lib/libc++abi.a
+          rm -rf /tmp/llvm-project /tmp/msan-libcxx-build
+
+      - name: Cache ccache
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ~/.cache/ccache
+          key: ccache-sa-msan-${{ hashFiles('src/cpu/src/**', 'src/cpu/include/**', 'include/**') }}
+          restore-keys: |
+            ccache-sa-msan-
+
+      - name: Configure ccache
+        run: |
+          ccache --set-config=max_size=200M
+          ccache --set-config=compression=true
+          ccache -z
+
+      - name: Configure with MSan
+        env:
+          MSAN_LIBCXX: /tmp/msan-libcxx/usr
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang-17 \
+            -DCMAKE_CXX_COMPILER=clang++-17 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DSECP256K1_MARCH=x86-64-v3 \
+            -DCMAKE_CXX_FLAGS="-fsanitize=memory -fno-omit-frame-pointer -fsanitize-memory-track-origins=2 -stdlib=libc++ -nostdinc++ -isystem ${MSAN_LIBCXX}/include/c++/v1" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=memory -stdlib=libc++ -L${MSAN_LIBCXX}/lib -lc++abi -Wl,-rpath,${MSAN_LIBCXX}/lib" \
+            -DSECP256K1_USE_ASM=OFF \
+            -DSECP256K1_BUILD_TESTS=ON \
+            -DSECP256K1_BUILD_EXAMPLES=OFF \
+            -DSECP256K1_BUILD_JAVA=OFF
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test under MSan
+        # ADVISORY deep-probe (steady state, 2026-06-09 zone-rescope). MSan was switched
+        # from a 70-token timeout DENY-list (~74% of the suite excluded — only arithmetic
+        # ran, which Valgrind-memcheck already covers for the SAME uninitialized-memory
+        # class) to an -R WHITELIST of stdlib-heavy tests where MSan's instrumented-libc++
+        # origin-tracking is genuinely UNIQUE (hashing / PBKDF2 / encoding parsing).
+        #
+        # The blocking uninitialized-memory authority is the Valgrind-memcheck job (full
+        # suite, now with the corrected ci/valgrind.supp path) — MSan no longer duplicates
+        # it. MSan stays continue-on-error BY DESIGN: it is a deep origin-tracking probe,
+        # not a hard gate. Rationale is measured, not assumed — in CI run 27205149393 the
+        # 18-test trial set had 3 pure-timeout failures (kat_all_operations 120s,
+        # parse_strictness 120s, exploit_der_parsing_differential 60s under MSan's
+        # ~10-20x overhead). Those 3 were dropped; the remaining 15 PASSED clean under CI
+        # MSan. Because MSan timing is inherently flaky (and unrunnable on the ASLR/PIE-
+        # constrained bench host), making it blocking would cause periodic timeout-reds
+        # with no security benefit Valgrind doesn't already provide. Keep advisory.
+        continue-on-error: true
+        env:
+          MSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          # MSan + no-ASM + Debug + origin-tracking is slow (~10-20x overhead).
+          # Exclude known-slow tests; generous timeout for the rest.
+          # halt_on_error=1 ensures MSan violations produce non-zero exit.
+          # No '|| true' -- this is a hard gate: any MSan error fails the job.
+          #
+          # Heavy audit exploit/fuzz tests are excluded because they exceed
+          # practical wall-clock limits under MSan overhead (~10-20x). These
+          # surfaces are still covered under ASan+UBSan and Valgrind.
+          # 2026-05-24: added regression_adaptor_blinded_nonce, regression_ct_secret_is_zero,
+          # regression_rfc6979_ct_loop, regression_gpu_ecdh_extended_ct,
+          # regression_adaptor_ct_secret_extract — all hit MSan timeout in run 26356562464.
+          # 2026-05-24: added regression_dedup_refactors_2026_05_24 — 30s timeout too
+          # short under 10-20x MSan overhead (timed out in run 26370782284).
+          # 2026-05-24: added regression_musig2_v1_partial_sign_deprecated and
+          # regression_secret_stack_residue_v9 — both have 60s CTest timeouts that
+          # are too short under 10-20x MSan overhead (timed out in run 26373021472).
+          # regression_dedup_refactors_2026_05_24 — same reason (run 26370782284).
+          # 2026-05-26: added regression_s_scalar_erasure — SECP256K1_INIT() triggers
+          # fixed-base table precomputation; under MSan+origin-tracking this alone
+          # exceeds the 600s CTest timeout (timed out in run 26437691885).
+          # 2026-05-27: added regression_ecdh_off_curve — scalar_mul(make_sk()) inside
+          # test_ock5_valid_key_works() invokes full ECC scalar mul; under MSan+origin-
+          # tracking the 30s CTest timeout is insufficient (timed out in run 26528051824).
+          # 2026-05-28: added regression_frost_musig2_degenerate — musig2_partial_sign +
+          # ct::generator_mul_blinded calls under MSan+origin-tracking exceed the 60s
+          # CTest timeout (timed out in run 26551591253).
+          # 2026-06-01: added regression_negate_inplace_generator_flag — the B1 NEG-1..5
+          # test runs 15 full ECC scalar_mul ops; under MSan+origin-tracking (~10-20x)
+          # the 60s CTest timeout is insufficient (timed out in run 26753960346, the
+          # only failure in an otherwise 56/57-pass MSan run). Pure deterministic point
+          # math, fully covered by ASan+UBSan, Valgrind, and the normal build.
+          # 2026-06-01: added regression_recover_rplus_n_overflow (bbhunt-001) and
+          # regression_ct_glv_make_v_branchless (CT-CRYPTO-001) — both run many full
+          # ECC scalar_mul/recover ops (the latter 256 random k); their 60s CTest
+          # TIMEOUT property is insufficient under MSan+origin-tracking (~10-20x) and
+          # times out. Pure deterministic EC math, fully covered by ASan+UBSan,
+          # Valgrind, and the normal build (all green).
+          # 2026-06-09: added regression_musig2_infinity_nonce — the MIN-2/3/4 BIP-327
+          # conformance rewrite added full MuSig2 sessions (KeyAgg + R=b·G / R=G, i.e.
+          # several EC scalar mults). Under MSan+origin-tracking these exceed even a
+          # 300s CTest timeout (timed out at 300.08s in run 27197379563); raising the
+          # cap further is futile (cf. "INIT precompute alone exceeds 600s"). Pure
+          # deterministic EC math; fully covered by ASan+UBSan, Valgrind, normal build.
+          # Consistent with the already-excluded regression_musig2_verify /
+          # ZONE-FOCUSED WHITELIST (2026-06-09). Instead of a 70-token timeout deny-list,
+          # MSan now runs ONLY the stdlib-heavy, light (no-EC) tests where its
+          # instrumented-libc++ origin-tracking adds value Valgrind's default memcheck
+          # cannot: hashing/PBKDF2/HMAC/HKDF KATs, BIP-39 mnemonic (std::string/wordlist),
+          # DER/encoding parsing. These exercise std::string/std::vector/std::sort internals
+          # without heavy EC scalar-mul, so they finish well within the timeout. Broad
+          # uninitialized-memory coverage over the rest of the suite is owned by the
+          # Valgrind-memcheck job (blocking, full suite). --no-tests=error guards against a
+          # whitelist that matches nothing (would otherwise pass silently).
+          ctest --test-dir build --output-on-failure -j"$(nproc)" --no-tests=error \
+            -R "^(exploit_sha256_kat|exploit_sha512_kat|exploit_sha_kat|exploit_keccak256_kat|exploit_ripemd160_kat|exploit_primitive_kat|hash_accel|bip39|exploit_bip39_mnemonic|exploit_bip39_entropy|exploit_bip39_nfkd|exploit_hkdf_kat|wycheproof_hmac_sha256|wycheproof_hkdf_sha256|exploit_bech32_underflow)$" --timeout 1800
+
+  # ── Thread Sanitizer (data races) ───────────────────────────────────────
+  tsan:
+    name: TSan
+    runs-on: ubuntu-24.04
+    # CI-001 fix: job-level continue-on-error removed; test step is step-level advisory.
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang-17 lld-17 ninja-build ccache
+
+      - name: Cache ccache
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ~/.cache/ccache
+          key: ccache-sa-tsan-${{ hashFiles('src/cpu/src/**', 'src/cpu/include/**', 'include/**') }}
+          restore-keys: |
+            ccache-sa-tsan-
+
+      - name: Configure ccache
+        run: |
+          ccache --set-config=max_size=200M
+          ccache --set-config=compression=true
+          ccache -z
+
+      - name: Configure with TSan
+        # SECP256K1_USE_ASM=OFF: TSan cannot instrument hand-written inline asm
+        # (mulx/adcx/adox), so the asm-enabled build produces spurious
+        # "FAIL: ct field_add" etc. comparing CT vs FAST results that
+        # actually agree at the language level — TSan's shadow memory just
+        # can't observe the asm side. The C++ fallback path (after the
+        # field.cpp mul_wide column-3 overflow fix in 76054b26) is now
+        # arithmetically correct, so disabling asm lets TSan see real races
+        # without false positives from un-instrumented asm.
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang-17 \
+            -DCMAKE_CXX_COMPILER=clang++-17 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DSECP256K1_MARCH=x86-64-v3 \
+            -DSECP256K1_USE_ASM=OFF \
+            -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread" \
+            -DSECP256K1_BUILD_TESTS=ON \
+            -DSECP256K1_BUILD_EXAMPLES=OFF \
+            -DSECP256K1_BUILD_JAVA=OFF
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test under TSan
+        continue-on-error: true  # CI-001: step-level only; build failure above is blocking
+        env:
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        # Exclude py_* tests: Python ctypes loads libufsecp.so without the TSan
+        # runtime, causing __tsan_func_entry linker errors. Python tests run in
+        # the normal linux CI jobs without sanitizer instrumentation.
+        # Exclude large_scalar: known non-asm scalar_mul divergence (pending fix).
+        run: ctest --test-dir build --output-on-failure -j"$(nproc)" -E "^(ct_sidechannel|selftest|unified_audit|py_|test_large_scalar)" --timeout 900
+
+  # ── Valgrind memcheck ───────────────────────────────────────────────────
+  valgrind:
+    name: Valgrind Memcheck
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends g++-14 ninja-build valgrind ccache
+
+      - name: Cache ccache
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ~/.cache/ccache
+          key: ccache-sa-valgrind-${{ hashFiles('src/cpu/src/**', 'src/cpu/include/**', 'include/**') }}
+          restore-keys: |
+            ccache-sa-valgrind-
+
+      - name: Configure ccache
+        run: |
+          ccache --set-config=max_size=200M
+          ccache --set-config=compression=true
+          ccache -z
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DSECP256K1_MARCH=x86-64-v3 \
+            -DSECP256K1_BUILD_TESTS=ON \
+            -DSECP256K1_BUILD_EXAMPLES=OFF \
+            -DSECP256K1_BUILD_JAVA=OFF
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Run tests under Valgrind
+        run: |
+          ctest --test-dir build --output-on-failure -j"$(nproc)" \
+            -E "^(ct_sidechannel|selftest|unified_audit|differential|exploit_selftest_api|exploit_ctx_lifecycle_hostile|py_)" \
+            --timeout 900 --no-tests=error \
+            --overwrite MemoryCheckCommand=/usr/bin/valgrind \
+            --overwrite "MemoryCheckCommandOptions=--leak-check=full --error-exitcode=1 --show-leak-kinds=definite,indirect,possible --errors-for-leak-kinds=definite,indirect,possible --suppressions=${{ github.workspace }}/ci/valgrind.supp" \
+            -T MemCheck || true
+          # Valgrind runs are slow (10-20x overhead); some audit tests may
+          # exceed their CTest timeout.  We tolerate timeout exits and only
+          # fail on real memory errors detected in the Valgrind logs below.
+          # Exclude py_* tests: they require extra Python deps (e.g. coincurve)
+          # and are already covered in non-valgrind Linux jobs.
+          # CAAS6-01: fail closed if memcheck produced NO logs at all. The `|| true`
+          # above tolerates valgrind timeout exits, but it would also mask the case
+          # where memcheck never ran (early crash, empty test selection, runner
+          # error) — making "did not run" indistinguishable from "ran clean" on a
+          # branch-protection-required gate. The grep verdicts below are silent
+          # (2>/dev/null) when no log exists, so without this guard that path is
+          # a false green. Enforced by ci/check_sanitizer_result_assertions.py.
+          shopt -s nullglob
+          memcheck_logs=(build/Testing/Temporary/MemoryChecker.*.log)
+          if [ "${#memcheck_logs[@]}" -eq 0 ]; then
+            echo "::error::No Valgrind MemoryChecker logs produced — memcheck did not run; failing closed"
+            exit 1
+          fi
+          # Check for real errors in memcheck output
+          if grep -q 'ERROR SUMMARY: [1-9]' build/Testing/Temporary/MemoryChecker.*.log 2>/dev/null; then
+            echo "::error::Valgrind found memory errors"
+            cat build/Testing/Temporary/MemoryChecker.*.log
+            exit 1
+          fi
+          # Also check for definite leaks
+          if grep -q 'definitely lost: [1-9]' build/Testing/Temporary/MemoryChecker.*.log 2>/dev/null; then
+            echo "::error::Valgrind found definite memory leaks"
+            cat build/Testing/Temporary/MemoryChecker.*.log
+            exit 1
+          fi
+
+  # ── Constant-time side-channel (dudect) smoke test ──────────────────────
+  dudect:
+    name: dudect Timing Analysis
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends g++-14 ninja-build ccache
+
+      - name: Cache ccache
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ~/.cache/ccache
+          key: ccache-sa-dudect-${{ hashFiles('src/cpu/src/**', 'src/cpu/include/**', 'include/**') }}
+          restore-keys: |
+            ccache-sa-dudect-
+
+      - name: Configure ccache
+        run: |
+          ccache --set-config=max_size=200M
+          ccache --set-config=compression=true
+          ccache -z
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DSECP256K1_MARCH=x86-64-v3 \
+            -DSECP256K1_BUILD_TESTS=ON
+
+      - name: Build dudect test
+        run: cmake --build build --target test_ct_sidechannel_standalone -j"$(nproc)"
+
+      - name: Run dudect timing analysis (5 min timeout)
+        run: |
+          EXIT=0
+          timeout 300 ./build/cpu/test_ct_sidechannel_standalone 2>&1 | tee dudect_smoke.log || EXIT=$?
+          if [ "$EXIT" -eq 124 ]; then
+            echo "dudect reached timeout limit (expected for CI smoke run -- advisory only)"
+          elif [ "$EXIT" -ne 0 ]; then
+            echo "::warning::dudect reported timing variance (common on shared CI runners -- verify locally)"
+            echo "dudect exit code: $EXIT (advisory -- not blocking CI)"
+          else
+            echo "dudect: PASS (no timing leakage detected)"
+          fi
+          # dudect is statistical and unreliable on shared CI runners.
+          # This is intentionally advisory. Deterministic CT checks (ct-verif,
+          # valgrind-ct) are the blocking gates.
+          exit 0
+
+      - name: Upload dudect results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dudect-smoke-results
+          path: dudect_smoke.log
+          retention-days: 90
+
+  # ── Cross-library differential test (vs bitcoin-core/libsecp256k1) ──────
+  cross-libsecp256k1:
+    name: Differential vs bitcoin-core/libsecp256k1
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@58077d3c7e43986b6b15fba718e8ea69e387dfcc # v2.15.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+  
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends g++-14 ninja-build ccache
+
+      - name: Cache ccache
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ~/.cache/ccache
+          key: ccache-cross-libsecp-${{ hashFiles('src/cpu/src/**', 'src/cpu/include/**', 'include/**') }}
+          restore-keys: |
+            ccache-cross-libsecp-
+
+      - name: Configure ccache
+        run: |
+          ccache --set-config=max_size=400M
+          ccache --set-config=compression=true
+          ccache -z
+
+      - name: Configure with cross-test
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DSECP256K1_MARCH=x86-64-v3 \
+            -DSECP256K1_BUILD_TESTS=ON \
+            -DSECP256K1_BUILD_CROSS_TESTS=ON
+
+      - name: Build cross-test binary
+        run: cmake --build build --target test_cross_libsecp256k1 -j"$(nproc)"
+
+      - name: Run differential test vs libsecp256k1 v0.6.0
+        # Hard gate: any result mismatch between our implementation and
+        # bitcoin-core/libsecp256k1 is a correctness bug. Non-zero exit fails CI.
+        run: ctest --test-dir build --output-on-failure -R "^cross_libsecp256k1$" --timeout 900

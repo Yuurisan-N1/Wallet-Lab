@@ -1,0 +1,239 @@
+# ============================================================================
+# Performance Smoke Test -- Per-Commit Quick Benchmark Check
+#
+# BENCH-006 LIMITATION NOTE:
+# This workflow uses --quick mode (3 internal passes / 50 warmup iterations).
+# Quick mode has +/-15-30% run-to-run variance on shared GitHub runners -- it
+# can only detect regressions of 50%+ reliably (alert-threshold: 200%).
+# It CANNOT detect 10-30% regressions. Do NOT call this a "regression gate".
+#
+# For real regression detection, use the local bench_unified protocol from
+# CLAUDE.md: CPU-pinned, turbo off, >=11 IQR-trimmed passes, controlled
+# before/after comparison on the same machine.
+# ============================================================================
+# Performance Smoke Alert -- Per-Commit Quick Benchmark Check
+# ============================================================================
+# Runs benchmarks on every push to main/dev and on PRs that touch perf-sensitive
+# paths. Emits an alert if any operation is >100% slower (i.e. more than 2x)
+# compared to the previous stored baseline, but does not fail push CI because
+# quick mode runs on shared GitHub runners and is not release-grade evidence.
+#
+# Separate from benchmark.yml (dashboard). Release-grade regression decisions
+# use the local controlled bench_unified protocol documented in CLAUDE.md.
+# ============================================================================
+
+name: Performance Smoke Test (quick mode -- not a regression gate)
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/bench-regression.yml'
+      - '.github/scripts/parse_benchmark.py'
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/bench-regression.yml'
+      - '.github/scripts/parse_benchmark.py'
+  schedule:
+    # Weekly unconditional run — catches regressions in audit/ci/bindings/docs paths
+    # excluded from the push path filter above.
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-regression-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bench-gate:
+    name: Benchmark Smoke Check (quick mode -- detects 50%+ regressions only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write       # needed to push baseline to gh-pages on push events
+      pull-requests: write  # needed to comment on PRs when regression detected
+
+    steps:
+    - name: Harden the runner
+      uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+      with:
+        egress-policy: audit
+
+    - name: Checkout
+      uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      with:
+        persist-credentials: false
+
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq ninja-build cmake ccache
+
+    - name: ccache
+      uses: hendrikmuhs/ccache-action@5ebbd400eff9e74630f759d94ddd7b6c26299639 # v1.2
+      with:
+        key: bench-regression-${{ runner.os }}
+
+    - name: Clone libsecp256k1 (for apple-to-apple comparison)
+      run: |
+        # Pin to a release tag: an unpinned master baseline is not apple-to-apple and
+        # post-release master drifted the internal ecmult_gen API, breaking the comparison
+        # provider link (undefined reference to secp256k1_ecmult_gen).
+        git clone --depth 1 --branch v0.7.0 https://github.com/bitcoin-core/secp256k1.git \
+          "$GITHUB_WORKSPACE/_libsecp256k1"
+
+    - name: Configure (Release)
+      run: |
+        cmake -S . -B out/bench-gate \
+          -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          -DBUILD_TESTING=ON \
+          -DSECP256K1_USE_ASM=ON \
+          -DSECP256K1_MARCH=x86-64-v2 \
+          -DLIBSECP_SRC_DIR="$GITHUB_WORKSPACE/_libsecp256k1/src"
+
+    - name: Build
+      run: cmake --build out/bench-gate -j$(nproc)
+
+    - name: Run benchmark suite
+      run: |
+        echo "::warning::Benchmark running on shared GitHub runner (no CPU pinning, no turbo control)."
+        echo "::warning::Variance ±15-30%. Alert threshold 200% (2×) — only regressions >100% are reliably detected."
+        echo "::warning::For controlled regression detection use local bench_unified protocol (CLAUDE.md §Performance)."
+        mkdir -p /tmp/benchmark_results
+        ./out/bench-gate/src/cpu/bench_unified --quick 2>&1 | tee /tmp/benchmark_results/raw_output.txt
+        python3 .github/scripts/parse_benchmark.py \
+          --run-mode quick \
+          /tmp/benchmark_results/raw_output.txt \
+          /tmp/benchmark_results/benchmark.json
+
+    - name: Validate benchmark JSON (reject zero-timing / empty)
+      run: |
+        python3 - /tmp/benchmark_results/benchmark.json <<'PYEOF'
+        import json, sys
+        path = sys.argv[1]
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"::error::benchmark.json is not valid JSON: {e}")
+            sys.exit(1)
+        if not isinstance(data, list) or len(data) == 0:
+            print("::error::benchmark.json is empty or not a list — corrupt benchmark output")
+            sys.exit(1)
+        zero_entries = [e.get("name", "?") for e in data if float(e.get("value", 0)) <= 0]
+        if zero_entries:
+            print(f"::error::benchmark.json has zero or negative timing entries: {zero_entries}")
+            sys.exit(1)
+        print(f"::notice::benchmark.json OK — {len(data)} entries, all non-zero")
+        PYEOF
+
+    - name: Reject quick-mode artifact as regression baseline
+      # quick-mode runs use 3 passes with high variance — unsuitable as a baseline.
+      # Fail-fast here so a stale quick-mode result is never stored to gh-pages as
+      # a release-grade baseline.
+      #
+      # NOTE: This workflow is a SMOKE check (name: "Performance Smoke Test (quick
+      # mode -- not a regression gate)"). On push, quick-mode is the EXPECTED and
+      # ONLY mode — failing on push made every push fail. Only the manual
+      # workflow_dispatch path can promote to baseline, so the guard belongs there.
+      if: github.event_name == 'workflow_dispatch'
+      run: |
+        META=/tmp/benchmark_results/benchmark.meta.json
+        if [ -f "$META" ]; then
+          RUN_MODE=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('run_mode','unknown'))" "$META")
+          PASSES=$(python3   -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('passes',0))"    "$META")
+          echo "::notice::Benchmark run_mode=${RUN_MODE} passes=${PASSES}"
+          if [ "$RUN_MODE" = "quick" ]; then
+            # CI-003: emit ::error:: and exit 1 to prevent quick-mode from ever being
+            # stored as a regression baseline. A ::warning:: was insufficient.
+            echo "::error::Benchmark artifact is quick-mode (${PASSES} passes) — aborting. " \
+                 "Regression baseline must be built from a full-mode (11-pass) run. " \
+                 "Re-trigger workflow_dispatch after temporarily switching to full-mode."
+            exit 1
+          fi
+        fi
+
+    - name: Store smoke result + advisory alert (push to main/dev or manual dispatch)
+      # CI-006 floating baseline note: auto-push is DISABLED. The stored baseline
+      # can become stale (e.g., from a slow build months ago). If the baseline is
+      # >30 days old, trigger workflow_dispatch on a known-good commit to refresh it.
+      # Baseline artifact is in the `dev/bench-gate` github-pages branch.
+      # A quick-mode baseline (±30% noise) masks regressions < 50% — not a real gate.
+      # For production evidence use the local CLAUDE.md §Performance protocol.
+      #
+      # 2026-07-07: fail-on-alert is false on push because this workflow is a
+      # quick smoke, not a regression gate. It still posts an alert/comment and
+      # validates non-corrupt benchmark JSON, but shared-runner quick-mode noise
+      # must not block releases. Controlled regression decisions use the local
+      # bench_unified full protocol documented in CLAUDE.md.
+      if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+      uses: benchmark-action/github-action-benchmark@a7bc2366eda11037936ea57d811a43b3418d3073 # v1
+      with:
+        name: 'Perf Regression Gate'
+        tool: 'customSmallerIsBetter'
+        output-file-path: /tmp/benchmark_results/benchmark.json
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        auto-push: false
+        alert-threshold: '200%'
+        comment-on-alert: true
+        fail-on-alert: false
+        benchmark-data-dir-path: 'dev/bench-gate'
+
+    - name: PR comparison (alert + block on regression)
+      # Compares PR benchmark against the stored baseline from push events.
+      # Does NOT store (auto-push: false) -- only the push to main/dev updates baseline.
+      # BLOCKS PR if regression exceeds threshold.
+      # 2026-05-23: same 150%→200% bump as the push step — see comment above.
+      if: github.event_name == 'pull_request'
+      uses: benchmark-action/github-action-benchmark@a7bc2366eda11037936ea57d811a43b3418d3073 # v1
+      with:
+        name: 'Perf Regression Gate'
+        tool: 'customSmallerIsBetter'
+        output-file-path: /tmp/benchmark_results/benchmark.json
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        auto-push: false
+        alert-threshold: '200%'
+        comment-on-alert: true
+        fail-on-alert: true
+        benchmark-data-dir-path: 'dev/bench-gate'
+
+    - name: Upload raw benchmark logs
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: bench-raw-logs-${{ github.sha }}
+        path: |
+          /tmp/benchmark_results/raw_output.txt
+          /tmp/benchmark_results/benchmark.json
+        retention-days: 30
+        if-no-files-found: warn
+
+    - name: Summary
+      if: always()
+      run: |
+        echo "## Benchmark Smoke Test (quick mode -- not a regression gate)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Event:** \`${{ github.event_name }}\`  **Threshold:** alert-threshold '200%' = any op running >2x baseline (>100% slower) fails. Quick-mode variance is ±15-30%, so 1.5× would trip on noise." >> $GITHUB_STEP_SUMMARY
+        if [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "**Baseline:** NOT auto-pushed (auto-push: false, CI-006 floating-baseline policy); refresh manually via workflow_dispatch on a known-good commit" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "**Baseline:** read-only comparison (PR — baseline not updated)" >> $GITHUB_STEP_SUMMARY
+        fi
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        head -50 /tmp/benchmark_results/raw_output.txt >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY

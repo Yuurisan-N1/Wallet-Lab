@@ -1,0 +1,273 @@
+#include "secp256k1/recovery.hpp"
+#include "secp256k1/sha256.hpp"
+#include "secp256k1/ct/point.hpp"
+#include "secp256k1/ct/scalar.hpp"
+#include "secp256k1/detail/secure_erase.hpp"
+#include "secp256k1/field_52_impl.hpp"
+#include "signing_helpers_p.hpp"
+#include <cstring>
+
+namespace secp256k1 {
+
+using fast::Scalar;
+using fast::Point;
+using fast::FieldElement;
+
+// -- Lift x-coordinate to curve point -----------------------------------------
+// Given x, compute y such that y^2 = x^3 + 7 (mod p).
+// parity selects which square root: 0 = even y, 1 = odd y.
+// Returns {Point, bool} where bool = true if point is valid.
+//
+// Hot-path (variable-time, public-data): operate directly in FE52 to avoid
+// FE→FE52→FE roundtrips inside FieldElement::sqrt() and at point construction.
+// Mirrors schnorr.cpp lift_x_from_limbs but selects parity from `parity` arg.
+static std::pair<Point, bool> lift_x(const FieldElement& x_fe, int parity) {
+#if defined(SECP256K1_FAST_52BIT)
+    using FE52 = fast::FieldElement52;
+    static const FE52 kSeven52 = FE52::from_fe(FieldElement::from_uint64(7));
+
+    FE52 const x52 = FE52::from_fe(x_fe);
+
+    // y² = x³ + 7
+    FE52 const x3 = x52.square() * x52;
+    FE52 const y2 = x3 + kSeven52;
+
+    // sqrt + verify (skip Jacobi pre-check: bench inputs are always QR)
+    FE52 y52 = y2.sqrt();
+    FE52 check = y52.square();
+    check.negate_assign(1);
+    check.add_assign(y2);
+    if (!check.normalizes_to_zero_var()) return {Point::infinity(), false};
+
+    // Parity adjust: read LSB from normalized limbs[0]
+    FE52 y_norm = y52;
+    y_norm.normalize();
+    bool const y_is_odd = (y_norm.n[0] & 1u) != 0;
+    if ((parity != 0) != y_is_odd) {
+        y52 = y52.negate(1);
+        y52.normalize_weak();
+    }
+
+    return {Point::from_affine52(x52, y52), true};
+#else
+    // y^2 = x^3 + 7
+    auto x3 = x_fe.square() * x_fe;
+    auto y2 = x3 + FieldElement::from_uint64(7);
+    auto y = y2.sqrt();
+    if (y.square() != y2) return {Point::infinity(), false};
+    bool const y_is_odd = (y.limbs()[0] & 1) != 0;
+    if ((parity != 0) != y_is_odd) {
+        y = FieldElement::zero() - y;
+    }
+    return {Point::from_affine(x_fe, y), true};
+#endif
+}
+
+// -- secp256k1 order n --------------------------------------------------------
+// n = FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+static const std::array<uint8_t, 32> SECP256K1_ORDER_BYTES = {
+    0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFE,
+    0xBA,0xAE,0xDC,0xE6, 0xAF,0x48,0xA0,0x3B,
+    0xBF,0xD2,0x5E,0x8C, 0xD0,0x36,0x41,0x41
+};
+
+// signing_generator_mul is provided by signing_helpers_p.hpp (shared with ecdsa.cpp)
+
+// -- Sign with Recovery ID ----------------------------------------------------
+// CT path: uses ct::generator_mul_blinded(k), ct::scalar_inverse(k),
+// ct::scalar_mul, and ct::scalar_add for all secret-bearing arithmetic.
+// Recovery ID computation branches only on public data (r, r_bytes).
+
+RecoverableSignature ecdsa_sign_recoverable(
+    const std::array<uint8_t, 32>& msg_hash,
+    const Scalar& private_key) {
+
+    if (private_key.is_zero_ct()) return {{Scalar::zero(), Scalar::zero()}, 0};
+
+    auto z = Scalar::from_bytes(msg_hash);
+    auto k = rfc6979_nonce(private_key, msg_hash);
+    if (k.is_zero_ct()) return {{Scalar::zero(), Scalar::zero()}, 0};
+
+    // R = k * G  (k is non-zero by check above; kG is never infinity)
+    auto R = signing_generator_mul(k);
+
+    // r = R.x mod n
+    auto r_fe = R.x();
+    auto r_bytes = r_fe.to_bytes();
+    auto r = Scalar::from_bytes(r_bytes);
+    if (r.is_zero_ct()) return {{Scalar::zero(), Scalar::zero()}, 0};
+
+    // Determine recovery ID
+    int recid = 0;
+
+    // bit 0: parity of R.y — R is already normalized by R.x() above.
+    // Avoid to_uncompressed() (65-byte array + 64 field muls): read parity
+    // directly from the affine y limbs. limbs()[0] is the least-significant
+    // 64-bit word; its LSB is the parity of the integer value mod p.
+    recid |= static_cast<int>(R.y().limbs()[0] & 1u);
+
+    // bit 1: whether R.x >= n (r overflowed past n); branchless comparison on r_bytes (public data)
+    unsigned gt = 0u, eq_run = 1u;
+    for (int oi = 0; oi < 32; ++oi) {
+        unsigned const rb = static_cast<unsigned>(r_bytes[static_cast<unsigned>(oi)]);
+        unsigned const ob = static_cast<unsigned>(SECP256K1_ORDER_BYTES[static_cast<unsigned>(oi)]);
+        unsigned const byte_gt = ((ob - rb) >> 31) & 1u;
+        unsigned const byte_lt = ((rb - ob) >> 31) & 1u;
+        gt     = gt | (eq_run & byte_gt);
+        eq_run = eq_run & (1u - byte_gt) & (1u - byte_lt);
+    }
+    recid |= (int)(gt << 1);
+
+    // s = k^-1 * (z + r * d) mod n
+    // All three multiplications and the addition use CT primitives — fast::Scalar
+    // operator* has secret-dependent branches (V7-01 audit finding).
+    auto k_inv      = ct::scalar_inverse(k);
+    auto r_times_d  = ct::scalar_mul(r, private_key);
+    auto z_plus_rd  = ct::scalar_add(z, r_times_d);
+    auto s          = ct::scalar_mul(k_inv, z_plus_rd);
+    if (s.is_zero_ct()) {
+        detail::secure_erase(&k,          sizeof(k));
+        detail::secure_erase(&k_inv,      sizeof(k_inv));
+        detail::secure_erase(&r_times_d,  sizeof(r_times_d));
+        detail::secure_erase(&z_plus_rd,  sizeof(z_plus_rd));
+        detail::secure_erase(&s,          sizeof(s));
+        return {{Scalar::zero(), Scalar::zero()}, 0};
+    }
+
+    // Normalize to low-S (BIP-62): CT path — no branch on secret s
+    ECDSASignature sig{r, s};
+    std::uint64_t const s_was_high = ct::scalar_is_high(s);
+    sig = ct::ct_normalize_low_s(sig);
+    recid ^= static_cast<int>(s_was_high & 1u); // flip y parity if s was negated
+
+    // Erase secret locals: k, k_inv, and intermediate products.
+    // These contain nonce material and key-derived values that must not linger
+    // on the stack after return (stack-scrubbing defence, mirrors ct_sign.cpp).
+    detail::secure_erase(&k,          sizeof(k));
+    detail::secure_erase(&k_inv,      sizeof(k_inv));
+    detail::secure_erase(&r_times_d,  sizeof(r_times_d));
+    detail::secure_erase(&z_plus_rd,  sizeof(z_plus_rd));
+    detail::secure_erase(&s,          sizeof(s));
+
+    return {sig, recid};
+}
+
+// -- Public Key Recovery ------------------------------------------------------
+
+std::pair<Point, bool> ecdsa_recover(
+    const std::array<uint8_t, 32>& msg_hash,
+    const ECDSASignature& sig,
+    int recid) {
+
+    if (recid < 0 || recid > 3) return {Point::infinity(), false};
+    if (sig.r.is_zero() || sig.s.is_zero()) return {Point::infinity(), false};
+
+    // Step 1: Reconstruct R.x
+    // if recid bit 1 is set, R.x = r + n (the x-coordinate overflowed)
+    auto r_bytes = sig.r.to_bytes();
+    FieldElement rx_fe;
+
+    if (recid & 2) {
+        // R.x = r + n -- need to add order to r as field element.
+        //
+        // bbhunt-001 fix: reject any r >= (p - n). For such r the sum r + n
+        // would overflow the field prime p and FieldElement::operator+ would
+        // silently reduce it mod p to (r + n - p) -- a DIFFERENT x-coordinate.
+        // A wrapped x that happens to lift to a valid point would then be
+        // returned as a bogus "success", whereas upstream libsecp256k1
+        // (secp256k1_ecdsa_sig_recover) returns 0 in exactly this case. This is
+        // attacker-craftable (recid&2 + r in [p-n, n) -- not the ~2^-128 honest
+        // case) and a cross-backend consensus divergence; we must match upstream.
+        //
+        // p - n = 0x...01 45512319 50B75FC4 402DA172 2FC9BAEE (low 129 bits set),
+        // i.e. upstream's secp256k1_ecdsa_const_p_minus_order, big-endian:
+        static const std::array<uint8_t, 32> SECP256K1_P_MINUS_ORDER_BYTES = {
+            0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x01,
+            0x45,0x51,0x23,0x19, 0x50,0xB7,0x5F,0xC4,
+            0x40,0x2D,0xA1,0x72, 0x2F,0xC9,0xBA,0xEE
+        };
+        // Branchless big-endian compare on public data (sig.r, recid): is r < p-n?
+        unsigned lt = 0u, eq_run = 1u;
+        for (int oi = 0; oi < 32; ++oi) {
+            unsigned const rb = static_cast<unsigned>(r_bytes[static_cast<unsigned>(oi)]);
+            unsigned const pb = static_cast<unsigned>(SECP256K1_P_MINUS_ORDER_BYTES[static_cast<unsigned>(oi)]);
+            unsigned const byte_lt = ((rb - pb) >> 31) & 1u; // rb < pb
+            unsigned const byte_gt = ((pb - rb) >> 31) & 1u; // rb > pb
+            lt     = lt | (eq_run & byte_lt);
+            eq_run = eq_run & (1u - byte_lt) & (1u - byte_gt);
+        }
+        // r >= (p - n) (including equality) -> reject, matching upstream's `>= 0`.
+        if (lt == 0u) return {Point::infinity(), false};
+
+        auto n_fe = FieldElement::from_bytes(SECP256K1_ORDER_BYTES);
+        auto r_fe_val = FieldElement::from_bytes(r_bytes);
+        rx_fe = r_fe_val + n_fe;
+    } else {
+        rx_fe = FieldElement::from_bytes(r_bytes);
+    }
+
+    // Step 2: Lift x to curve point R with correct y parity
+    int const y_parity = recid & 1;
+    auto [R, valid] = lift_x(rx_fe, y_parity);
+    if (!valid) return {Point::infinity(), false};
+
+    // Step 3: Recover public key
+    // Q = r^-1 * (s*R - z*G)
+    //   = (s * r^-1) * R  +  (-z * r^-1) * G
+    //   = u2 * R  +  u1 * G
+    // This is exactly dual_scalar_mul_gen_point(u1, u2, R) which uses
+    // 4-stream GLV Strauss with interleaved wNAF -- a single combined
+    // multi-scalar multiplication instead of 3 separate scalar muls.
+    auto z = Scalar::from_bytes(msg_hash);
+    auto r_inv = sig.r.inverse();
+    // Recovery path is variable-time: recid, signature, and message hash are all
+    // public. Use negate_var() to avoid the CT mask overhead (~3 ns saved).
+    auto u1 = z.negate_var() * r_inv;  // -z * r^-1 mod n  (G coefficient)
+    auto u2 = sig.s * r_inv;           //  s * r^-1 mod n  (R coefficient)
+
+    auto Q = Point::dual_scalar_mul_gen_point(u1, u2, R);
+
+    if (Q.is_infinity()) return {Point::infinity(), false};
+
+    return {Q, true};
+}
+
+// -- Compact Serialization ----------------------------------------------------
+
+std::array<uint8_t, 65> recoverable_to_compact(
+    const RecoverableSignature& rsig,
+    bool compressed) {
+
+    std::array<uint8_t, 65> out{};
+    out[0] = static_cast<uint8_t>(27 + rsig.recid + (compressed ? 4 : 0));
+
+    auto r_bytes = rsig.sig.r.to_bytes();
+    auto s_bytes = rsig.sig.s.to_bytes();
+    std::memcpy(out.data() + 1, r_bytes.data(), 32);
+    std::memcpy(out.data() + 33, s_bytes.data(), 32);
+
+    return out;
+}
+
+std::pair<RecoverableSignature, bool> recoverable_from_compact(
+    const std::array<uint8_t, 65>& data) {
+
+    uint8_t const header = data[0];
+    if (header < 27 || header > 34) return {{}, false};
+
+    int const recid = (header - 27) & 3;
+
+    std::array<uint8_t, 32> r_bytes{}, s_bytes{};
+    std::memcpy(r_bytes.data(), data.data() + 1, 32);
+    std::memcpy(s_bytes.data(), data.data() + 33, 32);
+
+    Scalar r, s;
+    if (!Scalar::parse_bytes_strict_nonzero(r_bytes, r)) return {{}, false};
+    if (!Scalar::parse_bytes_strict_nonzero(s_bytes, s)) return {{}, false};
+
+    return {{ECDSASignature{r, s}, recid}, true};
+}
+
+} // namespace secp256k1

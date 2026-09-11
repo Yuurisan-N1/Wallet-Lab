@@ -1,0 +1,34 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# Find threading support
+find_dependency(Threads)
+
+# Include targets
+include("${CMAKE_CURRENT_LIST_DIR}/secp256k1-fast-targets.cmake")
+
+# Check for required components.
+# LIBBITCOIN exposes the canonical bridge-free integration target
+# secp256k1::fastsecp256k1_libbitcoin (header-only <ufsecp/libbitcoin.hpp> +
+# engine), present when the package was built with SECP256K1_BUILD_LIBBITCOIN=ON.
+set(_SECP256K1_FAST_supported_components CPU CUDA OpenCL LIBBITCOIN)
+
+set(secp256k1-fast_CPU_FOUND FALSE)
+if(TARGET secp256k1::fastsecp256k1)
+    set(secp256k1-fast_CPU_FOUND TRUE)
+endif()
+
+set(secp256k1-fast_LIBBITCOIN_FOUND FALSE)
+if(TARGET secp256k1::fastsecp256k1_libbitcoin)
+    set(secp256k1-fast_LIBBITCOIN_FOUND TRUE)
+endif()
+
+foreach(_comp ${secp256k1-fast_FIND_COMPONENTS})
+    if(NOT _comp IN_LIST _SECP256K1_FAST_supported_components)
+        set(secp256k1-fast_FOUND False)
+        set(secp256k1-fast_NOT_FOUND_MESSAGE "Unsupported component: ${_comp}")
+    endif()
+endforeach()
+
+check_required_components(secp256k1-fast)

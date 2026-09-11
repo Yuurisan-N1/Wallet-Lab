@@ -1,0 +1,160 @@
+# Review-Validated Findings — Do Not Re-Flag
+
+This is a ledger of audit/review findings that have been **adversarially validated
+against the actual code** and resolved (fixed, or confirmed false-positive /
+intentional). Each entry says *why* — so the same finding does not get re-raised
+on every fresh review pass.
+
+> **For review agents / models:** before reporting a finding, check this file AND
+> the knowledge base (`python3 tools/knowledge_base/knowledge_base.py for <symbol>`,
+> or `query --tag review-validated-fp`). If a finding here matches your candidate,
+> do **not** re-report it — either cite this ledger as "already validated" or, if
+> you believe the code has since changed, quote the *current* code that contradicts
+> the entry. A finding without current contradicting code is a regression of a
+> known false-positive and must be suppressed.
+
+## How validation is done
+
+Findings are checked by reading the **actual files** (not the review summary),
+quoting the verbatim code, and reasoning about intent. Review summaries routinely
+mis-characterize code (e.g. inferring a "stale version" from a throughput value,
+or a "secret-dependent branch" from a constant-outcome guard). The verdict is set
+from the code, not the claim.
+
+---
+
+## 2026-06-01 — 10-Pass Multi-Agent Review (commit 40d7e92)
+
+Of the 6 P1 findings, **2 were real (fixed)** and **4 were false-positive /
+intentional**. One P2 (BENCH-001) was also a false-positive.
+
+| ID | Claim | Verdict | Why | KB id |
+|----|-------|---------|-----|-------|
+| RED-001 | `ufsecp_schnorr_sign_batch` doc says `aux_rands32=NULL` allowed, impl rejects | **REAL → fixed** (5ab0ce27) | Impl deliberately requires non-NULL (SEC-006). Doc was wrong; corrected in `ufsecp.h` + `API_REFERENCE.md`. `aux_rands32` is **required** (pass a zero-filled buffer to opt out of hedging). | `AUX-RANDS-REQUIRED-FIXED` |
+| TQ-001 | Wycheproof ECDSA/ECDH tests `(void)ecdsa_verify(...)` "no crash = pass" | **REAL → fixed** (5ab0ce27) | 6 edge probes now assert: tampered sigs → `CHECK(!ecdsa_verify)`, off-curve ECDH → `CHECK(determinism)`. Verified ECDSA 89/0, ECDH 36/0. | `WYCHEPROOF-ASSERTS-FIXED` |
+| RED-002 | Zero-count batch sign accepts `sigs64_out==NULL` | **FALSE POSITIVE** | NULL check returns `UFSECP_ERR_NULL_ARG` *before* the `count==0 → UFSECP_ERR_BAD_INPUT` check (Rule 15). Fail-closed ordering is intentional. | `BATCH-SIGN-NULL-COUNT-ORDERING` |
+| RED-003 | Batch `count==0` path skips output `memset` | **FALSE POSITIVE / non-issue** | `count==0` ⇒ output region is 0 bytes (nothing to expose) and the function returns `BAD_INPUT`. Cosmetic asymmetry only. | `BATCH-ZEROCOUNT-OUTPUT-NONISSUE` |
+| COMPAT-001 | `secp256k1_ec_pubkey_serialize` flag check diverges from libsecp | **FALSE POSITIVE** | The shim tests `flags & SECP256K1_FLAGS_BIT_COMPRESSION` (bit `0x100`) — **byte-identical** to upstream `secp256k1.c`. Same output for `0x02`, `0x102`, and invalid `0xDEAD`. Not a divergence. | `PUBKEY-SERIALIZE-FLAG-MATCHES-UPSTREAM` |
+| CT-001 | `if (!R.is_infinity())` in `ecdsa_sign` branches on secret nonce | **FALSE POSITIVE** | `R = k·G`, `k ∈ [1,n-1]` (rfc6979 strict-nonzero) ⇒ on the prime-order group `R` is **never** infinity, so the branch outcome is constant (always false) regardless of the secret value → leaks nothing. Defensive guard matching RFC6979/libsecp; removing it would be the real risk. | `CT-INFINITY-GUARD-BENIGN` |
+| BENCH-001 | `docs/BENCHMARKS.md` shows "stale version 3.14.0" | **FALSE POSITIVE** | The `3.14` is a throughput value (`field_add … 3.14 M/s`, line 911), not a version. The header carries no version string. | — |
+
+### CodeQL code-scanning (12 alerts, all `note` severity — dismissed)
+
+All dismissed with documented reasons (GitHub code-scanning, 2026-05-31):
+
+- **8× `cpp/include-non-header`** (`ufsecp_impl.cpp`): intentional **unity build** (the file `#include`s the domain impl `.cpp` files — see the comment at its line 405). `won't fix`.
+- **`cpp/unused-local-variable` point.cpp**: variable is already `[[maybe_unused]]`. `false positive`.
+- **`cpp/unused-local-variable` taproot.cpp / adaptor.cpp**: structured binding — the parity element *is* used; the first element is an unavoidable binding artifact. `false positive`.
+- **`cpp/unused-local-variable` address.cpp**: `s_base_state` *is* used — captured by-reference in the `compress_to_scalar` lambda (`s_base_state.data()` memcpy). CodeQL missed the lambda capture. `false positive`. (A naive "remove the dead variable" fix would break the build.)
+
+---
+
+## 2026-06-01 — 10-Pass Multi-Agent Review (commit d3313068)
+
+| ID | Claim | Verdict | Why | KB id |
+|----|-------|---------|-----|-------|
+| SHIM-001 | `secp256k1_schnorrsig_sign_custom` rejects `msglen != 32` while header/tests/upstream expect varlen | **REAL → fixed** (2026-06-01) | Confirmed against code: `shim_schnorr.cpp` did `if (msglen != 32) return 0;` (AUDIT-003 left-over), while upstream `secp256k1_schnorrsig_sign_custom` → `sign_internal(…, msg, msglen, …)` accepts any length, the shim header point 3 promised varlen, and `test_regression_schnorr_varlen_ct_fixes` (VCS-1..5) + `test_shim_security_edge_cases:265` asserted success. The rejection was added only because shim *verify* was 32-only at the time; verify is now varlen (SHIM-004), so the asymmetry is gone. Restored varlen signing via a new `ct::schnorr_sign(kp,msg,msglen,aux)` overload (mirror of the fixed-32 CT path); header comments corrected; VCS-7 round-trip added. | `SHIM-SCHNORR-VARLEN-RESTORED` |
+| TEST-003 | `valgrind_ct_check.sh` verdict ignores `UNINIT_ERRORS`/`VG_EXIT` (CT false-green) | **OPEN (real, not yet fixed)** | Separate finding from the same review; tracked in `workingdocs/REVIEW_2026-05-31_coder_report.md` §3 (P1-2). Not addressed in the SHIM-001 commit. | — |
+
+> Note: a separate observation surfaced while verifying SHIM-001 — the shim-linked
+> `test_shim_security_edge_cases_standalone` had failures: `secp256k1_schnorrsig_verify_batch`
+> returns 0 for a valid `sign32` signature (PERF-003, line 465; batch-varlen, line 276) and the
+> 4 `*_precomp` calls return 0 with a valid ctx (SHIM-004-PRECOMP, lines 400-412).
+>
+> **ROOT-CAUSED + FIXED 2026-06-01 — these were a TEST bug, NOT shim bugs.** The test built the
+> setup pubkeys/keypairs via `assert(secp256k1_ec_pubkey_create(...))`, `assert(keypair_create(...))`,
+> `assert(schnorrsig_sign32(...))`, etc. The test is compiled **Release (`-DNDEBUG`)**, under which
+> `assert()` expands to `((void)0)` — **its argument is never evaluated**, so every side-effecting
+> setup call silently vanished and `pub`/`unc`/`keypair` were left as **uninitialized stack garbage**.
+> The precomp / batch-verify checks then ran on garbage and "failed". Proven by an isolated repro
+> (create→precomp returns **1**, with the exact `out/ci-shim/libfastsecp256k1.a`, all ctx flags) and
+> by a DIAG dump showing `pub.data` = a stack pointer, not G. Fix: an NDEBUG-safe `assert` redefine
+> in the test that always evaluates its expression. Result: **pass=155 fail=0**. The shim
+> `*_precomp` and `schnorrsig_verify_batch` paths were correct all along. KB: `SHIM-TEST-ASSERT-NDEBUG`.
+>
+> (Local-only note: `ci/check_advisory_skip_returns.sh` (Rule 16) still flags this module because it
+> runs the *standalone* — which is built only with the shim, so it returns 0/1, never the 77 that the
+> gate expects of an advisory module. That is a pre-existing Rule-16-vs-shim-standalone classification
+> quirk, not a test or shim defect; on GitHub the fast-gates job has no build dir so Rule 16 skips. The
+> module must stay `advisory=true` because the no-shim runner builds (audit-report.yml) need the 77 skip.)
+
+## 2026-06-01 — 10-Pass Multi-Agent Review (commit 25c9c6c9)
+
+Headline P0-candidate **B1 confirmed REAL and fixed**; 2 P1 test-coverage gaps fixed;
+CT-001 re-confirmed false-positive; TQ-002 mostly false-positive (1 hardened-anyway).
+
+| ID | Claim | Verdict | Why | KB id |
+|----|-------|---------|-----|-------|
+| B1 | `Point::negate_inplace()` omits `is_generator_ = false` → `is_gen()` true for `-G` | **REAL → fixed** | `negate()` cleared it, `negate_inplace()` didn't. `scalar_mul()` dispatches the fixed-base path on `is_generator_` (`if (is_generator_) return scalar_mul_generator(scalar)`), so `(-G).scalar_mul(k)` returned `k*G` not `k*(-G)`. **Proved by reverting the fix:** NEG-2b/NEG-4/NEG-5 fail (`(-G)*k == G*k`); with the fix all 6 pass. Added `is_generator_ = false;` + regression `test_regression_negate_inplace_generator_flag` (NEG-1..5, math_invariants, blocking) — passes in the runner. | `B1-NEGATE-INPLACE-GEN-FLAG` |
+| TQ-001a | `test_wycheproof_ecdsa.cpp:374` `(void)high_s_accepted; g_pass++` | **REAL → fixed** | `ecdsa_verify` has no `is_low_s()` check ("must accept high-S to match single verify"), so the doc-intended outcome is deterministic → `CHECK(high_s_accepted, …)`. | — |
+| TQ-001b / B2 | `(void)ecdsa_verify` on a forged `r=n+1 (→1)` pair in `test_wycheproof_ecdsa_bitcoin.cpp:500` and `test_exploit_ecdsa_r_overflow.cpp:319` | **REAL → fixed** | `(r=1, s)` is not a legitimate signature for the fixed key/hash (verifies with prob ~2^-256) → `CHECK(!ecdsa_verify(…))`. Both now assert rejection. | — |
+| TQ-001 (ecdh) | `test_wycheproof_ecdh.cpp:156, 284` `(void)…; g_pass++` | **FALSE POSITIVE / intentional** | Line 156 is the **Debug `#else`** branch — the Release `#if` already asserts `"off-curve ECDH deterministic"` (and CI builds Release). Line 284 is an intentional **crash-freedom probe** over arbitrary x-coords whose on-curve outcome is genuinely indeterminate; asserting either way would be wrong. | — |
+| CT-001 | `if (!R.is_infinity())` in FAST-path `ecdsa_sign`/`ecdsa_sign_hedged` (ecdsa.cpp:657,722) branches on secret nonce | **FALSE POSITIVE** (re-flag) | `R = k·G` with `k ∈ [1,n-1]` (guarded by `is_zero_ct()` first) is **never** infinity on the prime-order group → the branch outcome is constant regardless of the secret, leaking nothing. Also a documented **non-production FAST path** (production = `ct::ecdsa_sign`, no such branch). Same finding as the prior review. | `CT-INFINITY-GUARD-BENIGN` |
+| TQ-002 | `(void)rc_sign/rc_rec/rc_kat/rc_create` discarded | **MOSTLY FALSE POSITIVE** | `ellswift_xdh_overflow.cpp:149` `rc_create` is **already used** in the `CHECK(is_rejected(rc_create) || …)` above — the `(void)` is redundant. `recoverable_sign_ct.cpp:173/177/209` are **not** false-greens (a sign/recover failure is caught by the downstream verify/KAT `CHECK`), but were hardened anyway with direct `check(rc_* == UFSECP_OK, …)` for clearer attribution. | — |
+| BENCH-001 | `BENCHMARKS.md` "stale version v3.14.0" | **FALSE POSITIVE** (re-flag) | `3.14` is a throughput value (`field_add … 3.14 M/s`), not a version — same as the prior review's BENCH-001. | — |
+
+> **Update 2026-06-01 (SHIM-001 test now actually executes):** `test_regression_schnorr_varlen_ct_fixes`
+> used **wrong libsecp context-flag constants** (`CTX_SIGN=0x0101`, `CTX_VERIFY=0x0102`); `0x0102`
+> sets the COMPRESSION type bit, so `secp256k1_context_create(SIGN|VERIFY=0x0103)` fired the
+> illegal callback and **aborted before any VCS assertion ran** — and in the unified runner the
+> module advisory-skips because the shim weak symbols are not linked into the audit binary. So the
+> varlen path had **never been functionally validated**. Corrected to the real values
+> (`VERIFY=0x0101`, `SIGN=0x0201` → `SIGN|VERIFY=0x0301`). With the fix, a standalone build linked
+> against the shim runs **VCS-1..7 ALL PASS** (64/33/256/300-byte msgs, determinism, 32-byte
+> fast-path delegation, sign/verify round-trip) — the varlen `ct::schnorr_sign` is now genuinely
+> verified, not just asserted-on-paper.
+
+## 2026-06-01 — Coder-agent review (commit 93c6127): CAAS-FG-01 + CORR-01
+
+| ID | Claim | Verdict | Why |
+|----|-------|---------|-----|
+| CAAS-FG-01 | 5 shim security PoCs run in no blocking job (advisory-only) | **REAL → fixed (deeper than reported)** | Confirmed: root `add_subdirectory(audit)` (L489) precedes `compat/libsecp256k1_shim` (L497), so the bare `if(TARGET secp256k1_shim)` guard around the `shim_exploit_test` registrations was always FALSE → the 5 standalones were never CTest targets (`ctest -N` empty). Registering them (guard → `OR SECP256K1_BUILD_SHIM`) exposed that **3 of the 5 no longer compile** against removed APIs: `legacy_capi_*` → removed `bindings/c_api/ultrafast_secp256k1.*`; `bchn_schnorr_strict` → removed BCH `secp256k1_schnorr_*`. **Resolution:** the macro guard is fixed (`OR SECP256K1_BUILD_SHIM`) so `exploit_context_flag_bypass` (9/9) + `exploit_musig_unknown_signer` (10/10) **register and pass** when the audit tests are built (verified locally with `SECP256K1_BUILD_TESTS=ON`); **retired** the 3 obsolete (properties covered by current-API strict-parse + BIP-340 lift_x tests); new guard `ci/check_advisory_has_blocking_test.py`. **CI-execution caveat (folded into the systemic item):** gate.yml's shim job builds with `SECP256K1_BUILD_TESTS=OFF`, so NO audit standalone CTest registers there — its existing `ctest -R "regression_shim|exploit_shim|test_shim"` step matches nothing and silently passes (the same vestigial pattern). A first attempt to add a `--no-tests=error` hard-gate step correctly failed (zero match under TESTS=OFF) and was reverted; making these (and the other shim standalones) actually execute as hard gates requires the gate-job to build with `TESTS=ON` and build the selected standalone targets — part of the systemic gate.yml refactor below. |
+| CAAS-FG-01-SYSTEMIC | (discovered) | **REAL — precisely characterized, scoped follow-up** | The bare-`if(TARGET secp256k1_shim)` registration anti-pattern appears in **31** audit-CMake blocks. Triage (compared bare-block `add_test(NAME …)` vs the live `ctest -N` set): **16 are GENUINELY DROPPED** (no other registration — `regression_shim_static_ctx`, `exploit_shim_recovery_null_arg`, `regression_shim_context_erase`, `regression_shim_keypair_null_cb`, `regression_shim_null_arg_cb`, `regression_shim_security_v8`, `regression_shim_pubkey_sort`, `regression_shim_per_context_blinding`, `regression_musig2_session_token`, `regression_shim_musig_null_ctx`, `regression_ellswift_ct_path`, `regression_musig2_nonce_strict`, `shim_der_zero_r`, `shim_null_ctx`, `regression_shim_rgrind_functional`, `regression_shim_preallocated_ctx`); the other **15 are DEAD DUPLICATES** (the same test is already registered + gated via an `OR SECP256K1_BUILD_SHIM`/unconditional block — the bare-if copy is inert, always-false). Blindly converting all guards to the OR pattern (or reordering root CMake) **breaks configure with duplicate-target errors** because some bare blocks register a dropped test AND a dead-duplicate test together, so the dup collides with its working registration. The correct fix is a careful per-block refactor: delete the 15 dead-duplicate bare blocks (split mixed blocks first), then convert the 16 genuinely-dropped guards and compile-triage them (most use the current shim API; any bit-rotted like the 3 retired get fixed or retired). The new guard WARNS the count so it cannot grow. **Deliberately not rushed** — a botched refactor would break the build (worse debt). Scoped as a dedicated pass. |
+| CORR-01 | non-x86-asm `scalar_mul` KAT divergence masked by `continue-on-error` | **STALE → resolved** | Could NOT reproduce on g++ (`-DSECP256K1_USE_ASM=OFF`) or clang-18, and — definitively — **not on clang-17 + ASan/UBSan + x86-64-v3 (the exact CI toolchain)**: `run_selftest` (which contains test_large_scalar_multiplication: fast-vs-generic kG, large scalars, KAT) passes 31/31 modules, smoke+stress, **zero UBSan runtime errors**. Two further discoveries: (1) there is **no standalone `test_large_scalar` CTest target** (the source is only compiled into run_selftest), so the advisory `ctest -R "^test_large_scalar"` matched nothing and **gated zero tests**; (2) the main sanitizer ctest step **excludes `selftest`**, so the scalar_mul large-vector paths had **no sanitizer coverage at all**. Fix: removed the stale `continue-on-error` advisory step + TODO, and added a **hard-gate step that runs the `run_selftest` binary under ASan/UBSan** — giving the scalar_mul paths real sanitizer coverage that previously did not exist. The divergence the TODO referenced (added 2026-05-20) was incidentally fixed by later changes. |
+
+## 2026-06-01 — CAAS-FG-01-SYSTEMIC: refactor COMPLETED (supersedes the "scoped follow-up" row above)
+
+The systemic bare-`if(TARGET secp256k1_shim)` refactor is **done**. All **31** bare registration
+guards were converted to `if(TARGET secp256k1_shim OR SECP256K1_BUILD_SHIM)`; the **2 genuine
+dead-duplicate** blocks (`regression_shim_security_v9`, `regression_musig_noncegen_extra_input` —
+each already registered unconditionally lower in the file, which also wires the .cpp into
+`unified_audit_runner`) were deleted; and `ci/check_advisory_has_blocking_test.py` was flipped from
+WARN to **ENFORCE** (0 bare registration guards may remain). The earlier "15 dead duplicates"
+estimate was wrong — only 2 caused real duplicate-target collisions (verified: reconfigure is clean
+after removing exactly those 2). Final state: **out/ci-shim builds all targets and `ctest` is
+415/415** (SHIM=ON, Release/gcc).
+
+**One guard MUST stay bare** (do not convert): the `unified_audit_runner` stubs/real **fork**
+(audit/CMakeLists.txt, `# Shim-dependent + internal-API tests: link real files when shim is
+available`). It is NOT a standalone registration — it is the runner's source fork. Because audit/
+is processed before compat/libsecp256k1_shim/, the bare guard is FALSE in the main build → the
+`else()` stubs branch (`shim_run_stubs_unified.cpp`) is taken so the runner links advisory-skip
+stubs while the **real** shim tests run as standalone CTest targets. Forcing it `OR
+SECP256K1_BUILD_SHIM` pulls real shim sources + `secp256k1_shim` into the runner, which
+multiply-defines `secp256k1_ecdsa_*` against the legacy `c_api` bindings AND drops the stubs that
+standalone-only shim tests depend on (undefined `_run()`). The blanket conversion hit it once; it
+was reverted with an inline warning. The ENFORCE guard does not flag it (it gates `target_sources`,
+not `add_test`/`add_executable`).
+
+Registering the previously-dropped tests exposed **19 bit-rotted tests** (dead so long they rotted).
+All were validated against the actual code + knowledge_base and **fixed as TEST bugs — zero were
+real shim defects** (the validate-before-fix rule prevented reverting two deliberate shim decisions):
+
+| Test | Failure | Verdict | Fix |
+|------|---------|---------|-----|
+| ecdsa_batch_curve_check | `ecdsa_sign` ptr arg + `to_affine_xy` removed | test | pass `d.msg` array; `pk.x()/y().to_bytes()` |
+| musig2_nonce_strict / _gen_seckey / musig_xonly_zero_tweak / session_token / p2_ct_shim_fixes | stale `musig_pubkey_agg`/`nonce_gen` arg order (removed scratch `nullptr`) | test | drop leading `nullptr` → current 5/9-arg sig; add missing `secp256k1_schnorrsig.h`/`_extrakeys.h` |
+| shim_security_v8, parse_strictness, p2_ct_shim_fixes | missing `secp256k1_batch.h` / `secp256k1_schnorrsig.h` / file-scope `secp256k1.h` | test | add the include (file scope — header is `extern "C"`-wrapped) |
+| shim_perf_correctness | 5 stale CT APIs (`ecdsa_sign_recoverable`/`ecdsa_sign`/`ecdsa_recover` optional→pair/`ecdsa_verify` arg order/`schnorr_sign` keypair + `x_only_bytes`) | test | restore `(msg, key)` order, `auto [pt,ok]=ecdsa_recover(msg,sig,recid)`, `schnorr_keypair_create` + `x_only_bytes()` |
+| pubkey_sort / musig_null_ctx / ellswift_ct_path / preallocated_ctx / recovery_null_arg / ecdh_xy64_erase / shim_null_ctx | illegal-callback `std::abort()` on intentionally-illegal arg / literal NULL ctx | test | install non-aborting counting illegal callback; for literal-NULL-ctx (unconditional abort, `SHIM_REQUIRE_CTX(NULL)`→default cb) rewrite to positive + NULL-non-ctx-arg + document (mirrors SHIM-004); fixed an assert()-under-NDEBUG setup bug in shim_null_ctx |
+| **SHIM-A10** (`xonly_pubkey_from_pubkey` off-curve) | shim "accepts" off-curve struct | **test — NOT shim bug** | superseded by **PERF-002-FIXED** (c67edc1c, trust-contract: curve checked once at parse). Test rewritten to the positive contract; re-adding the check would revert a deliberate perf decision + diverge from upstream. kb `SHIM-A10-TEST-TRUST-CONTRACT` |
+| **NEW-006** (keypair parity) | never finds odd-Y keypair | **test — NOT shim bug** | `keypair_create` BIP-340-normalizes to even-Y, so `keypair_xonly_pub` pk_parity is always 0 (matches libsecp). Test pins the normalization invariant. kb `NEW-006-KEYPAIR-NORMALIZE` |
+| **SXP-2** (`xonly_pubkey_parse` x-not-on-curve) | shim "accepts" x=1 | **test — NOT shim bug** | x=1 IS on-curve (1³+7=8 is a QR mod p; p≡7 mod 8 → 2 is a QR → 8 is a QR). Parse boundaries DO validate (PERF-002 only removed verify-path re-checks). Changed to x=5 (132 = non-QR). kb `SXP-2-TEST-LIFTABLE-X` |
+| **PAC-1** (`preallocated_size`) | `>= 256` over-assumption | test | the shim context struct is smaller; assert flag-independence + rely on PAC-2 for sufficiency |
+| shim_recovery_and_noncefp | link `undefined main` | build wiring | standalone CMake target was missing `target_compile_definitions(... STANDALONE_TEST)` (sibling pattern) — added |
+
+**MSan CI fix (run 26753960346):** the only MSan failure was the new B1 test
+`regression_negate_inplace_generator_flag` (15 full ECC `scalar_mul` ops) hitting its 60 s CTest
+timeout under MSan's ~10-20× overhead — added to the MSan `-E` exclusion (pure deterministic point
+math; fully covered by ASan+UBSan/Valgrind/normal), matching the established pattern for the other
+scalar-mul-heavy correctness tests.

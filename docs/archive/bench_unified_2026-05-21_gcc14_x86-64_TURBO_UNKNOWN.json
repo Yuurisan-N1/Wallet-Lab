@@ -1,0 +1,813 @@
+{
+  "metadata": {
+    "cpu": "Intel(R) Core(TM) i5-14400F",
+    "compiler": "GCC 14.2.0",
+    "arch": "x86-64",
+    "timer": "RDTSCP",
+    "tsc_ghz": 2.496,
+    "passes": 11,
+    "warmup": 500,
+    "pool_size": 64,
+    "generated_by": "bench_unified --json",
+    "date": "2026-05-21",
+    "turbo": "unknown (sysfs not available on this runner)",
+    "note": "Turbo status: sysfs not available. bench_unified was pinned to core 0 with nice -20. Warm-cache run (500 warmup/op, 11 passes, IQR trimming). FAST-path rows are diagnostic only \u2014 see section name for label."
+  },
+  "results": [
+    {
+      "section": "FIELD ARITHMETIC (Ultra)",
+      "name": "field_mul",
+      "ns": 10.5
+    },
+    {
+      "section": "FIELD ARITHMETIC (Ultra)",
+      "name": "field_sqr",
+      "ns": 9.84
+    },
+    {
+      "section": "FIELD ARITHMETIC (Ultra)",
+      "name": "field_inv",
+      "ns": 664.3
+    },
+    {
+      "section": "FIELD ARITHMETIC (Ultra)",
+      "name": "field_add",
+      "ns": 3.92
+    },
+    {
+      "section": "FIELD ARITHMETIC (Ultra)",
+      "name": "field_sub",
+      "ns": 4.19
+    },
+    {
+      "section": "FIELD ARITHMETIC (Ultra)",
+      "name": "field_negate",
+      "ns": 5.69
+    },
+    {
+      "section": "FIELD ARITHMETIC (Ultra)",
+      "name": "field_from_bytes (32B)",
+      "ns": 2.75
+    },
+    {
+      "section": "SCALAR ARITHMETIC (Ultra)",
+      "name": "scalar_mul",
+      "ns": 19.88
+    },
+    {
+      "section": "SCALAR ARITHMETIC (Ultra)",
+      "name": "scalar_inv",
+      "ns": 837.66
+    },
+    {
+      "section": "SCALAR ARITHMETIC (Ultra)",
+      "name": "scalar_add",
+      "ns": 5.33
+    },
+    {
+      "section": "SCALAR ARITHMETIC (Ultra)",
+      "name": "scalar_negate",
+      "ns": 2.35
+    },
+    {
+      "section": "SCALAR ARITHMETIC (Ultra)",
+      "name": "scalar_from_bytes (32B)",
+      "ns": 2.45
+    },
+    {
+      "section": "POINT ARITHMETIC (Ultra)",
+      "name": "pubkey_create (k*G)",
+      "ns": 4756.52
+    },
+    {
+      "section": "POINT ARITHMETIC (Ultra)",
+      "name": "scalar_mul (k*P)",
+      "ns": 17415.75
+    },
+    {
+      "section": "POINT ARITHMETIC (Ultra)",
+      "name": "scalar_mul_with_plan",
+      "ns": 17833.2
+    },
+    {
+      "section": "POINT ARITHMETIC (Ultra)",
+      "name": "dual_mul (a*G + b*P)",
+      "ns": 20936.6
+    },
+    {
+      "section": "POINT ARITHMETIC (Ultra)",
+      "name": "point_add (affine+affine)",
+      "ns": 871.7
+    },
+    {
+      "section": "POINT ARITHMETIC (Ultra)",
+      "name": "point_add (J+A mixed)",
+      "ns": 138.84
+    },
+    {
+      "section": "POINT ARITHMETIC (Ultra)",
+      "name": "point_dbl",
+      "ns": 80.23
+    },
+    {
+      "section": "POINT ARITHMETIC (Ultra)",
+      "name": "normalize (J->affine)",
+      "ns": 2.62
+    },
+    {
+      "section": "POINT ARITHMETIC (Ultra)",
+      "name": "batch_normalize /pt (N=64)",
+      "ns": 124.75
+    },
+    {
+      "section": "POINT ARITHMETIC (Ultra)",
+      "name": "next_inplace (+=G)",
+      "ns": 128.97
+    },
+    {
+      "section": "POINT ARITHMETIC (Ultra)",
+      "name": "KPlan::from_scalar(w=4)",
+      "ns": 1170.16
+    },
+    {
+      "section": "POINT SERIALIZATION (Ultra)",
+      "name": "to_compressed (33B)",
+      "ns": 7.33
+    },
+    {
+      "section": "POINT SERIALIZATION (Ultra)",
+      "name": "to_uncompressed (65B)",
+      "ns": 11.48
+    },
+    {
+      "section": "POINT SERIALIZATION (Ultra)",
+      "name": "x_only_bytes (32B)",
+      "ns": 3.42
+    },
+    {
+      "section": "POINT SERIALIZATION (Ultra)",
+      "name": "x_bytes_and_parity",
+      "ns": 4.65
+    },
+    {
+      "section": "POINT SERIALIZATION (Ultra)",
+      "name": "has_even_y",
+      "ns": 1.96
+    },
+    {
+      "section": "POINT SERIALIZATION (Ultra)",
+      "name": "batch_to_compressed /pt (N=64)",
+      "ns": 146.1
+    },
+    {
+      "section": "POINT SERIALIZATION (Ultra)",
+      "name": "batch_x_only_bytes /pt (N=64)",
+      "ns": 108.89
+    },
+    {
+      "section": "[diagnostic] ECDSA -- Ultra FAST",
+      "name": "ecdsa_sign",
+      "ns": 7420.5
+    },
+    {
+      "section": "[diagnostic] ECDSA -- Ultra FAST",
+      "name": "ecdsa_sign_verified",
+      "ns": 36801.61
+    },
+    {
+      "section": "[diagnostic] ECDSA -- Ultra FAST",
+      "name": "ecdsa_verify",
+      "ns": 20338.7
+    },
+    {
+      "section": "[diagnostic] SCHNORR / BIP-340 -- Ultra FAST",
+      "name": "schnorr_keypair_create",
+      "ns": 4873.23
+    },
+    {
+      "section": "[diagnostic] SCHNORR / BIP-340 -- Ultra FAST",
+      "name": "schnorr_sign",
+      "ns": 5849.54
+    },
+    {
+      "section": "[diagnostic] SCHNORR / BIP-340 -- Ultra FAST",
+      "name": "schnorr_sign_verified",
+      "ns": 30305.61
+    },
+    {
+      "section": "[diagnostic] SCHNORR / BIP-340 -- Ultra FAST",
+      "name": "schnorr_verify (cached xonly)",
+      "ns": 23453.01
+    },
+    {
+      "section": "[diagnostic] SCHNORR / BIP-340 -- Ultra FAST",
+      "name": "schnorr_verify (raw bytes)",
+      "ns": 27258.89
+    },
+    {
+      "section": "MICRO-DIAGNOSTICS (sub-ops)",
+      "name": "Scalar::from_bytes (32B->scalar)",
+      "ns": 2.66
+    },
+    {
+      "section": "MICRO-DIAGNOSTICS (sub-ops)",
+      "name": "Scalar::inverse (safegcd)",
+      "ns": 858.11
+    },
+    {
+      "section": "MICRO-DIAGNOSTICS (sub-ops)",
+      "name": "Scalar::mul",
+      "ns": 20.15
+    },
+    {
+      "section": "MICRO-DIAGNOSTICS (sub-ops)",
+      "name": "Scalar::negate",
+      "ns": 2.4
+    },
+    {
+      "section": "MICRO-DIAGNOSTICS (sub-ops)",
+      "name": "glv_decompose",
+      "ns": 87.44
+    },
+    {
+      "section": "MICRO-DIAGNOSTICS (sub-ops)",
+      "name": "Point::dbl (jac52_double)",
+      "ns": 68.07
+    },
+    {
+      "section": "MICRO-DIAGNOSTICS (sub-ops)",
+      "name": "Point::add (J+A mixed)",
+      "ns": 139.65
+    },
+    {
+      "section": "MICRO-DIAGNOSTICS (sub-ops)",
+      "name": "dual_scalar_mul_gen_point",
+      "ns": 21237.65
+    },
+    {
+      "section": "MICRO-DIAGNOSTICS (sub-ops)",
+      "name": "FE52::from_4x64_limbs",
+      "ns": 1.47
+    },
+    {
+      "section": "MICRO-DIAGNOSTICS (sub-ops)",
+      "name": "FE52::mul (52-bit)",
+      "ns": 15.26
+    },
+    {
+      "section": "MICRO-DIAGNOSTICS (sub-ops)",
+      "name": "FE52::sqr (52-bit)",
+      "ns": 11.15
+    },
+    {
+      "section": "MICRO-DIAGNOSTICS (sub-ops)",
+      "name": "FE52::inverse_safegcd",
+      "ns": 725.5
+    },
+    {
+      "section": "MICRO-DIAGNOSTICS (sub-ops)",
+      "name": "FE52::inverse (Fermat)",
+      "ns": 3421.39
+    },
+    {
+      "section": "MICRO-DIAGNOSTICS (sub-ops)",
+      "name": "FE52::add (52-bit)",
+      "ns": 0.55
+    },
+    {
+      "section": "MICRO-DIAGNOSTICS (sub-ops)",
+      "name": "FE52::negate (52-bit)",
+      "ns": 0.44
+    },
+    {
+      "section": "MICRO-DIAGNOSTICS (sub-ops)",
+      "name": "FE52::normalize",
+      "ns": 3.12
+    },
+    {
+      "section": "MICRO-DIAGNOSTICS (sub-ops)",
+      "name": "SHA256 (BIP0340/challenge)",
+      "ns": 98.07
+    },
+    {
+      "section": "MICRO-DIAGNOSTICS (sub-ops)",
+      "name": "tagged_hash (recompute tag)",
+      "ns": 208.55
+    },
+    {
+      "section": "MICRO-DIAGNOSTICS (sub-ops)",
+      "name": "cached_tagged_hash (midstate)",
+      "ns": 85.53
+    },
+    {
+      "section": "MICRO-DIAGNOSTICS (sub-ops)",
+      "name": "lift_x (4x64 sqrt)",
+      "ns": 5110.88
+    },
+    {
+      "section": "MICRO-DIAGNOSTICS (sub-ops)",
+      "name": "lift_x (FE52 sqrt)",
+      "ns": 3729.94
+    },
+    {
+      "section": "MICRO-DIAGNOSTICS (sub-ops)",
+      "name": "FE::parse_bytes_strict",
+      "ns": 3.73
+    },
+    {
+      "section": "[diagnostic] BATCH VERIFICATION (FAST)",
+      "name": "schnorr_batch_verify(N=4)",
+      "ns": 98404.34
+    },
+    {
+      "section": "[diagnostic] BATCH VERIFICATION (FAST)",
+      "name": "  -> per-sig amortized (N=4)",
+      "ns": 24601.09
+    },
+    {
+      "section": "[diagnostic] BATCH VERIFICATION (FAST)",
+      "name": "schnorr_batch_verify(N=16)",
+      "ns": 379324.42
+    },
+    {
+      "section": "[diagnostic] BATCH VERIFICATION (FAST)",
+      "name": "  -> per-sig amortized (N=16)",
+      "ns": 23707.78
+    },
+    {
+      "section": "[diagnostic] BATCH VERIFICATION (FAST)",
+      "name": "schnorr_batch_verify(N=64)",
+      "ns": 2237434.19
+    },
+    {
+      "section": "[diagnostic] BATCH VERIFICATION (FAST)",
+      "name": "  -> per-sig amortized (N=64)",
+      "ns": 34959.91
+    },
+    {
+      "section": "[diagnostic] BATCH VERIFICATION (FAST)",
+      "name": "ecdsa_batch_verify(N=4)",
+      "ns": 76529.85
+    },
+    {
+      "section": "[diagnostic] BATCH VERIFICATION (FAST)",
+      "name": "  -> per-sig amortized (N=4)",
+      "ns": 19132.46
+    },
+    {
+      "section": "[diagnostic] BATCH VERIFICATION (FAST)",
+      "name": "ecdsa_batch_verify(N=16)",
+      "ns": 319866.35
+    },
+    {
+      "section": "[diagnostic] BATCH VERIFICATION (FAST)",
+      "name": "  -> per-sig amortized (N=16)",
+      "ns": 19991.65
+    },
+    {
+      "section": "[diagnostic] BATCH VERIFICATION (FAST)",
+      "name": "ecdsa_batch_verify(N=64)",
+      "ns": 1327189.4
+    },
+    {
+      "section": "[diagnostic] BATCH VERIFICATION (FAST)",
+      "name": "  -> per-sig amortized (N=64)",
+      "ns": 20737.33
+    },
+    {
+      "section": "CT POINT ARITHMETIC (sub-ops)",
+      "name": "ct::scalar_inverse (SafeGCD)",
+      "ns": 1557.08
+    },
+    {
+      "section": "CT POINT ARITHMETIC (sub-ops)",
+      "name": "ct::generator_mul (k*G)",
+      "ns": 10854.89
+    },
+    {
+      "section": "CT POINT ARITHMETIC (sub-ops)",
+      "name": "ct::scalar_mul (k*P)",
+      "ns": 18982.52
+    },
+    {
+      "section": "CT POINT ARITHMETIC (sub-ops)",
+      "name": "ct::point_dbl",
+      "ns": 72.44
+    },
+    {
+      "section": "CT POINT ARITHMETIC (sub-ops)",
+      "name": "ct::point_add_complete (11M+6S)",
+      "ns": 199.0
+    },
+    {
+      "section": "CT POINT ARITHMETIC (sub-ops)",
+      "name": "ct::point_add_mixed_complete (7M+5S)",
+      "ns": 135.24
+    },
+    {
+      "section": "CT POINT ARITHMETIC (sub-ops)",
+      "name": "ct::point_add_mixed_unified (7M+5S)",
+      "ns": 131.53
+    },
+    {
+      "section": "CT SIGNING (Ultra CT)",
+      "name": "ct::ecdsa_sign",
+      "ns": 14107.83
+    },
+    {
+      "section": "CT SIGNING (Ultra CT)",
+      "name": "  CT overhead (ECDSA)",
+      "ratio": 1.9012
+    },
+    {
+      "section": "CT SIGNING (Ultra CT)",
+      "name": "ct::ecdsa_sign_verified",
+      "ns": 48466.23
+    },
+    {
+      "section": "CT SIGNING (Ultra CT)",
+      "name": "ct::schnorr_sign",
+      "ns": 12139.76
+    },
+    {
+      "section": "CT SIGNING (Ultra CT)",
+      "name": "  CT overhead (Schnorr)",
+      "ratio": 2.0753
+    },
+    {
+      "section": "CT SIGNING (Ultra CT)",
+      "name": "ct::schnorr_sign_verified",
+      "ns": 38387.04
+    },
+    {
+      "section": "CT SIGNING (Ultra CT)",
+      "name": "ct::schnorr_keypair_create",
+      "ns": 12004.63
+    },
+    {
+      "section": "CT SIGNING (Ultra CT)",
+      "name": "  CT overhead (keypair)",
+      "ratio": 2.4634
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "field_mul",
+      "ns": 20.07
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "field_sqr",
+      "ns": 18.46
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "field_inv_var",
+      "ns": 955.71
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "field_add",
+      "ns": 7.33
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "field_negate",
+      "ns": 12.74
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "field_normalize",
+      "ns": 8.32
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "field_from_bytes (set_b32)",
+      "ns": 14.69
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "scalar_mul",
+      "ns": 31.58
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "scalar_inverse (CT)",
+      "ns": 1581.5
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "scalar_inverse_var",
+      "ns": 960.33
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "scalar_add",
+      "ns": 10.33
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "scalar_negate",
+      "ns": 12.72
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "scalar_from_bytes (set_b32)",
+      "ns": 10.21
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "point_dbl (gej_double_var)",
+      "ns": 84.43
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "point_add (gej_add_ge_var)",
+      "ns": 145.56
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "ecmult (a*P + b*G, Strauss)",
+      "ns": 23679.84
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "ecmult_gen (k*G, comb)",
+      "ns": 10729.76
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "generator_mul (ec_pubkey_create)",
+      "ns": 12781.08
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "scalar_mul_P (k*P, tweak_mul)",
+      "ns": 21759.2
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "serialize_compressed (33B)",
+      "ns": 22.87
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "serialize_uncompressed (65B)",
+      "ns": 23.68
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "point_add (pubkey_combine)",
+      "ns": 1887.42
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "ecdsa_sign",
+      "ns": 17879.14
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "ecdsa_verify",
+      "ns": 24464.12
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "schnorr_keypair_create",
+      "ns": 12764.59
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "schnorr_sign (BIP-340)",
+      "ns": 13676.17
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "schnorr_verify (BIP-340)",
+      "ns": 25458.99
+    },
+    {
+      "section": "libsecp256k1 (bitcoin-core)",
+      "name": "schnorr_verify_raw (parse+verify)",
+      "ns": 28697.76
+    },
+    {
+      "section": "OpenSSL (ECDSA, secp256k1)",
+      "name": "generator_mul (EC_POINT_mul k*G)",
+      "ns": 222177.0
+    },
+    {
+      "section": "OpenSSL (ECDSA, secp256k1)",
+      "name": "ecdsa_sign (ECDSA_do_sign)",
+      "ns": 247575.53
+    },
+    {
+      "section": "OpenSSL (ECDSA, secp256k1)",
+      "name": "ecdsa_verify (ECDSA_do_verify)",
+      "ns": 226332.8
+    },
+    {
+      "section": "FIELD ARITHMETIC",
+      "name": "mul",
+      "ns": 10.5
+    },
+    {
+      "section": "FIELD ARITHMETIC",
+      "name": "sqr",
+      "ns": 9.84
+    },
+    {
+      "section": "FIELD ARITHMETIC",
+      "name": "inv",
+      "ns": 664.3
+    },
+    {
+      "section": "FIELD ARITHMETIC",
+      "name": "add",
+      "ns": 3.92
+    },
+    {
+      "section": "FIELD ARITHMETIC",
+      "name": "sub",
+      "ns": 4.19
+    },
+    {
+      "section": "FIELD ARITHMETIC",
+      "name": "negate",
+      "ns": 5.69
+    },
+    {
+      "section": "FIELD ARITHMETIC",
+      "name": "normalize (FE52)",
+      "ns": 3.12
+    },
+    {
+      "section": "FIELD ARITHMETIC",
+      "name": "from_bytes (32B)",
+      "ns": 2.75
+    },
+    {
+      "section": "FIELD ARITHMETIC",
+      "name": "FE52 add (hot path)",
+      "ns": 0.55
+    },
+    {
+      "section": "FIELD ARITHMETIC",
+      "name": "FE52 neg (hot path)",
+      "ns": 0.44
+    },
+    {
+      "section": "SCALAR ARITHMETIC",
+      "name": "mul",
+      "ns": 19.88
+    },
+    {
+      "section": "SCALAR ARITHMETIC",
+      "name": "inv (CT)",
+      "ns": 858.11
+    },
+    {
+      "section": "SCALAR ARITHMETIC",
+      "name": "inv (var-time)",
+      "ns": 858.11
+    },
+    {
+      "section": "SCALAR ARITHMETIC",
+      "name": "add",
+      "ns": 5.33
+    },
+    {
+      "section": "SCALAR ARITHMETIC",
+      "name": "negate",
+      "ns": 2.35
+    },
+    {
+      "section": "SCALAR ARITHMETIC",
+      "name": "from_bytes (32B)",
+      "ns": 2.45
+    },
+    {
+      "section": "POINT ARITHMETIC",
+      "name": "dbl (Jacobian)",
+      "ns": 80.23
+    },
+    {
+      "section": "POINT ARITHMETIC",
+      "name": "add (mixed J+A)",
+      "ns": 138.84
+    },
+    {
+      "section": "POINT ARITHMETIC",
+      "name": "ecmult (a*P+b*G)",
+      "ns": 20936.6
+    },
+    {
+      "section": "POINT ARITHMETIC",
+      "name": "ecmult_gen (k*G raw)",
+      "ns": 4756.52
+    },
+    {
+      "section": "POINT ARITHMETIC",
+      "name": "pubkey_create (API)",
+      "ns": 4756.52
+    },
+    {
+      "section": "POINT ARITHMETIC",
+      "name": "scalar_mul (k*P)",
+      "ns": 17415.75
+    },
+    {
+      "section": "POINT ARITHMETIC",
+      "name": "scalar_mul (KPlan)",
+      "ns": 17833.2
+    },
+    {
+      "section": "POINT ARITHMETIC",
+      "name": "point_add (combine)",
+      "ns": 871.7
+    },
+    {
+      "section": "SERIALIZATION",
+      "name": "compressed (33B)",
+      "ns": 7.33
+    },
+    {
+      "section": "SERIALIZATION",
+      "name": "uncompressed (65B)",
+      "ns": 11.48
+    },
+    {
+      "section": "[diagnostic] SIGNING (FAST vs libsecp CT)",
+      "name": "ECDSA Sign",
+      "ns": 7420.5
+    },
+    {
+      "section": "[diagnostic] SIGNING (FAST vs libsecp CT)",
+      "name": "Schnorr Sign",
+      "ns": 5849.54
+    },
+    {
+      "section": "[diagnostic] SIGNING (FAST vs libsecp CT)",
+      "name": "Schnorr Keypair",
+      "ns": 4873.23
+    },
+    {
+      "section": "VERIFICATION",
+      "name": "ECDSA Verify",
+      "ns": 20338.7
+    },
+    {
+      "section": "VERIFICATION",
+      "name": "Schnorr Verify (cached)",
+      "ns": 23453.01
+    },
+    {
+      "section": "VERIFICATION",
+      "name": "Schnorr Verify (raw)",
+      "ns": 27258.89
+    },
+    {
+      "section": "CT-vs-CT (fair signing)",
+      "name": "ECDSA Sign",
+      "ns": 14107.83
+    },
+    {
+      "section": "CT-vs-CT (fair signing)",
+      "name": "Schnorr Sign",
+      "ns": 12139.76
+    },
+    {
+      "section": "CT-vs-CT (fair signing)",
+      "name": "ECDSA Verify",
+      "ns": 20338.7
+    },
+    {
+      "section": "CT-vs-CT (fair signing)",
+      "name": "Schnorr Verify",
+      "ns": 27258.89
+    },
+    {
+      "section": "[diagnostic] FAST path (Ultra FAST vs OpenSSL)",
+      "name": "Generator * k",
+      "ratio": 46.71
+    },
+    {
+      "section": "[diagnostic] FAST path (Ultra FAST vs OpenSSL)",
+      "name": "ECDSA Sign",
+      "ratio": 33.3637
+    },
+    {
+      "section": "[diagnostic] FAST path (Ultra FAST vs OpenSSL)",
+      "name": "ECDSA Verify",
+      "ratio": 11.1282
+    },
+    {
+      "section": "CT path (Ultra CT vs OpenSSL)",
+      "name": "ECDSA Sign (CT vs CT)",
+      "ratio": 17.5488
+    },
+    {
+      "section": "CT path (Ultra CT vs OpenSSL)",
+      "name": "ECDSA Verify",
+      "ratio": 11.1282
+    }
+  ]
+}

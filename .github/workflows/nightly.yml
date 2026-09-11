@@ -1,0 +1,187 @@
+name: Extended Tests (Differential + dudect)
+
+on:
+  # Nightly run at 03:00 UTC. Without a schedule the workflow file name
+  # ("nightly") was misleading — both jobs only ran on manual dispatch.
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      differential_multiplier:
+        description: 'Differential test multiplier (default: 100 ≈ 1.3M checks)'
+        required: false
+        default: '100'
+      dudect_timeout:
+        description: 'dudect timeout in seconds (default: 1800 = 30 min)'
+        required: false
+        default: '1800'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Differential correctness (≥1M random cases) ──────────────────────────
+  differential:
+    name: Differential Correctness (extended)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends g++-14 ninja-build
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DSECP256K1_BUILD_TESTS=ON \
+            -DSECP256K1_BUILD_CROSS_TESTS=ON
+
+      - name: Build differential tests
+        run: |
+          cmake --build build --target test_differential_standalone -j"$(nproc)"
+          cmake --build build --target test_cross_libsecp256k1 -j"$(nproc)"
+
+      - name: Run extended self-consistency test
+        env:
+          DIFFERENTIAL_MULTIPLIER: ${{ github.event.inputs.differential_multiplier || '100' }}
+        run: |
+          mkdir -p differential-results
+          echo "Multiplier: ${DIFFERENTIAL_MULTIPLIER}" | tee differential-results/run_metadata.txt
+          echo "Commit: ${GITHUB_SHA}" | tee -a differential-results/run_metadata.txt
+          echo "Started: $(date -u +%FT%TZ)" | tee -a differential-results/run_metadata.txt
+          ./build/audit/test_differential_standalone "${DIFFERENTIAL_MULTIPLIER}" \
+              2>&1 | tee differential-results/self_consistency.log
+
+      - name: Run cross-library test (vs libsecp256k1 v0.6.0)
+        run: |
+          echo "Running cross-library differential test..."
+          ./build/audit/test_cross_libsecp256k1 2>&1 \
+              | tee differential-results/cross_libsecp256k1.log
+
+      - name: Upload differential results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: differential-results-${{ github.run_id }}
+          path: differential-results/
+          retention-days: 365
+
+  # ── dudect smoke (fast gate ≈ 60 s) ─────────────────────────────────────
+  # Smoke runs unconditionally — it is a fast (~60 s) sanity gate that the
+  # dudect harness still builds and produces a verdict. The previous
+  # `if: fromJSON(inputs.dudect_timeout) < 600` condition was effectively dead
+  # because the default input is 1800, so the smoke never ran by default.
+  # If the user dispatches with a long timeout they want the full dudect,
+  # but they always also want the smoke gate to confirm the harness still
+  # works.
+  # Note: trigger is workflow_dispatch only — pull_request condition was dead
+  # code (never reachable). Use workflow_call: from ci.yml for PR gate.
+  dudect-smoke:
+    name: dudect Smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends g++-14 ninja-build
+
+      - name: Configure (smoke mode)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DSECP256K1_BUILD_TESTS=ON \
+            -DDUDECT_SMOKE=ON
+
+      - name: Build dudect (smoke)
+        run: cmake --build build --target test_ct_sidechannel_standalone -j"$(nproc)"
+
+      - name: Run dudect smoke
+        run: |
+          timeout 60 ./build/cpu/test_ct_sidechannel_standalone 2>&1 | tee dudect_smoke.log || EXIT=$?
+          if [ "${EXIT:-0}" -ne 0 ] && [ "${EXIT:-0}" -ne 124 ]; then
+            echo "::error::dudect smoke detected timing leakage"
+            exit 1
+          fi
+          echo "::notice::dudect smoke passed"
+
+      - name: Upload dudect smoke log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dudect-smoke-${{ github.run_id }}
+          path: dudect_smoke.log
+          retention-days: 30
+
+  # ── dudect full statistical run (30 min) ─────────────────────────────────
+  dudect-full:
+    name: dudect Full Statistical Analysis
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends g++-14 ninja-build
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DSECP256K1_BUILD_TESTS=ON
+
+      - name: Build dudect (full mode, no DUDECT_SMOKE)
+        run: cmake --build build --target test_ct_sidechannel_standalone -j"$(nproc)"
+
+      - name: Run dudect full statistical analysis
+        run: |
+          TIMEOUT="${{ github.event.inputs.dudect_timeout || '1800' }}"
+          echo "Running dudect for up to ${TIMEOUT}s..."
+          EXIT=0
+          timeout "${TIMEOUT}" ./build/cpu/test_ct_sidechannel_standalone 2>&1 | tee dudect_full.log || EXIT=$?
+          if [ "${EXIT}" -eq 124 ]; then
+            echo "::notice::dudect reached time limit (${TIMEOUT}s) — expected for nightly run"
+          elif [ "${EXIT}" -ne 0 ]; then
+            echo "::error::dudect detected timing leakage (t > threshold)"
+            exit 1
+          else
+            echo "::notice::dudect completed within time limit — all operations CT"
+          fi
+
+      - name: Upload dudect results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dudect-full-results
+          path: dudect_full.log
+          retention-days: 90

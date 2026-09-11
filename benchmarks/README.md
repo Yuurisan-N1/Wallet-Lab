@@ -1,0 +1,236 @@
+# UltrafastSecp256k1 Benchmarks
+
+Performance benchmarks across different platforms and configurations, from low-level ECC primitives to end-to-end wallet and protocol flows.
+
+## 📊 Benchmark Results
+
+### Directory Structure
+
+```
+benchmarks/
++-- cpu/
+|   +-- x86-64/
+|   |   +-- windows/     # Windows x64 results
+|   |   +-- linux/       # Linux x64 results
+|   +-- riscv64/
+|   |   +-- linux/       # RISC-V RV64GC (Milk-V Mars, etc.)
+|   +-- arm64/
+|   |   +-- linux/       # ARM64 Linux (RPi, etc.)
+|   |   +-- macos/       # Apple Silicon (M1/M2/M3)
+|   +-- esp32/
+|       +-- embedded/    # ESP32 (limited, core only)
++-- gpu/
+|   +-- cuda/
+|   |   +-- rtx-40xx/    # RTX 4090, 4080, etc.
+|   |   +-- rtx-30xx/    # RTX 3090, 3080, etc.
+|   |   +-- rtx-20xx/    # RTX 2080 Ti, etc.
+|   |   +-- datacenter/  # A100, H100, V100
+|   +-- opencl/          # NVIDIA, AMD, Intel, etc.
++-- comparison/          # Cross-platform comparisons
+```
+
+## 🚀 Running Benchmarks
+
+The main benchmark entry point is `bench_unified`, which measures:
+
+- field, scalar, and point arithmetic
+- ECDSA and Schnorr sign/verify
+- constant-time CPU paths
+- batch verification
+- Ethereum operations
+- zero-knowledge primitives
+- real-world flows such as ECDH, Taproot tweaking, BIP-32 derivation, seed-to-address generation, and Silent Payments
+
+### CPU Benchmarks
+
+```bash
+# Build with benchmarks
+cmake -B build -DSECP256K1_BUILD_BENCH=ON
+cmake --build build -j
+
+# Run the unified CPU benchmark suite
+./build/cpu/bench_unified
+
+# Quick smoke / CI-style run
+./build/cpu/bench_unified --quick
+
+# Optional specialized micro-benchmarks
+./build/cpu/bench_ct
+./build/cpu/bench_field_52
+./build/cpu/bench_field_26
+./build/cpu/bench_kP
+
+# RISC-V comprehensive benchmark
+./build/libs/UltrafastSecp256k1/cpu/bench_unified
+
+# Save results
+./build/cpu/bench_unified > benchmarks/cpu/x86-64/linux/bench_unified_$(date +%Y%m%d).txt
+```
+
+### libbitcoin Direct Benchmarks
+
+These benchmark the canonical libbitcoin C++ integration surface: no C ABI, no
+libsecp256k1 shim, and no `ufsecp_lbtc` bridge.
+
+```bash
+cmake -S . -B out/libbitcoin-bench -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSECP256K1_BUILD_LIBBITCOIN=ON \
+  -DSECP256K1_BUILD_LIBBITCOIN_BENCH=ON \
+  -DSECP256K1_BUILD_LIBBITCOIN_EXAMPLES=ON
+cmake --build out/libbitcoin-bench --target bench_lbtc_direct_batch bench_lbtc_public_ops \
+  bench_lbtc_hash256_var example_lbtc_public_ops -j
+
+out/libbitcoin-bench/compat/libbitcoin_direct/bench_lbtc_direct_batch 1000000 5 50000 \
+  --json out/libbitcoin-bench/lbtc_direct_batch.json
+out/libbitcoin-bench/compat/libbitcoin_direct/bench_lbtc_public_ops 8192 3 80 512 80 512 \
+  --json out/libbitcoin-bench/lbtc_public_ops.json
+out/libbitcoin-bench/compat/libbitcoin_direct/bench_lbtc_hash256_var 262144 5 512 80 512 \
+  --json out/libbitcoin-bench/lbtc_hash256_var.json
+out/libbitcoin-bench/compat/libbitcoin_direct/example_lbtc_public_ops
+```
+
+For GPU evidence, add `-DSECP256K1_BUILD_LIBBITCOIN_GPU=ON` plus the backend flag
+(`-DSECP256K1_BUILD_CUDA=ON`, `-DSECP256K1_BUILD_OPENCL=ON`, or Metal on Apple).
+Only a production row whose internal hook is present and accepted by the backend
+is GPU performance evidence; CPU-only rows remain direct-integration evidence.
+
+### GPU Benchmarks (CUDA)
+
+```bash
+# Build with CUDA
+cmake -B build -DSECP256K1_BUILD_CUDA=ON -DSECP256K1_BUILD_BENCH=ON
+cmake --build build -j
+
+# Run GPU benchmarks
+./build/cuda/bench/cuda_benchmark
+
+# Save results
+./build/cuda/bench/cuda_benchmark > benchmarks/gpu/cuda/rtx-4090/batch_$(date +%Y%m%d).txt
+```
+
+## 📈 Benchmark Format
+
+Each benchmark file should include:
+
+```
+Platform: x86-64 / RISC-V / ARM64 / CUDA
+CPU/GPU: Specific model
+OS: Windows 11 / Linux 6.x / macOS 14
+Compiler: GCC 13.2 / Clang 18 / MSVC 2022
+Build: Release / -O3 / Assembly ON/OFF
+Date: YYYY-MM-DD
+
+=== Field Operations ===
+Addition:        X ns/op
+Multiplication:  X ns/op
+Squaring:        X ns/op
+Inversion:       X ns/op
+
+=== Point Operations ===
+Point Addition:      X us/op
+Point Doubling:      X us/op
+Point Multiply:      X us/op
+Batch Multiply (n):  X ms for n ops
+
+=== Throughput ===
+Operations/second:   X M ops/s
+
+=== Real-World Flows ===
+ECDH:              X us/op
+Taproot tweak:     X us/op
+BIP-32 derive:     X us/op
+Seed -> address:   X us/op
+Silent Payments:   X us/op
+```
+
+## 🎯 Submitting Benchmarks
+
+If you run benchmarks on your hardware, please submit them!
+
+1. Run the benchmark suite
+2. Save results to appropriate directory
+3. Include system information
+4. Submit via Pull Request
+
+**Template:**
+```bash
+# System info
+uname -a
+lscpu  # or cat /proc/cpuinfo
+gcc --version  # or clang --version
+
+# Run benchmarks
+./build/cpu/bench/benchmark_field > results.txt
+```
+
+## 📊 Current Results
+
+See individual platform directories for detailed results:
+- [x86-64 Windows](cpu/x86-64/windows/)
+- [x86-64 Linux](cpu/x86-64/linux/)
+- [**RISC-V Linux (Milk-V Mars)** OK](cpu/riscv64/linux/) - **Updated 2026-02-11**
+- [**ESP32-S3 Embedded** OK](cpu/esp32/embedded/) - **Updated 2026-02-13**
+- [ARM64 Linux](cpu/arm64/linux/)
+- [CUDA RTX 4090](gpu/cuda/rtx-40xx/)
+
+## 🏆 Platform Performance Comparison
+
+### ESP32-S3 (Xtensa LX7 @ 240 MHz)
+**Configuration:** Portable C++ (no assembly, no __int128)  
+**Date:** 2026-02-13 | **Tests:** 28/28 OK
+
+| Operation | Performance |
+|-----------|-------------|
+| Field Multiply | 7,458 ns |
+| Field Square | 7,592 ns |
+| Field Add | 636 ns |
+| Scalar x G | 2,483 us |
+
+### RISC-V (Milk-V Mars - StarFive JH7110 @ 1.5 GHz)
+**Configuration:** Assembly + RVV + Fast Modular Reduction  
+**Date:** 2026-02-11 | **Tests:** 29/29 OK
+
+| Operation | Performance |
+|-----------|-------------|
+| Field Multiply | 200 ns |
+| Field Square | 185 ns |
+| Point Scalar Mul | 665 us |
+| Generator Mul | 44 us |
+| Batch Inverse (1000) | 611 ns/element |
+
+### x86-64 (Typical Desktop/Server)
+| Operation | Performance (est.) |
+|-----------|-------------|
+| Field Multiply | 8-12 ns |
+| Point Scalar Mul | 60-80 us |
+| Generator Mul | 4-6 us |
+
+*Note: x86-64 performance varies by CPU model (Intel/AMD), clock speed (3-5 GHz typical), and assembly optimizations.*
+
+### Performance Insights
+
+- **ESP32-S3 vs x86-64:** ~230x difference in field multiply, primarily due to:
+  - Clock speed (240 MHz vs 3.5+ GHz)
+  - 32-bit portable arithmetic vs 64-bit with BMI2/ADX
+  - No assembly optimizations on Xtensa (yet)
+  
+- **ESP32-S3 Achievement:** Library runs correctly on resource-constrained MCU!
+  - All 28 tests pass
+  - Suitable for IoT authentication, hardware wallets
+  - ~2.5ms per signature verification
+
+- **RISC-V vs x86-64:** ~8-10x difference, primarily due to:
+  - Clock speed (1.5 GHz vs 3.5+ GHz)
+  - ISA maturity and compiler optimizations
+  - Memory subsystem performance
+  
+- **RISC-V Achievement:** Production-ready performance for embedded/IoT cryptographic applications
+
+- **Assembly Impact:** 2-3x speedup vs portable C++ on x86-64 and RISC-V platforms
+
+**Contribute your results to expand this comparison!**
+
+---
+
+For questions about benchmarking, open an issue or discussion on GitHub.

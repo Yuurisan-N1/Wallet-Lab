@@ -1,0 +1,316 @@
+[project]
+name = "UltrafastSecp256k1"
+language = "cpp"
+# Subdirectory name components to skip during file-tree scanning.
+# Wildcard suffix '*' matches any dir whose name starts with that prefix.
+exclude_subdir_names = [
+  "node_modules",
+  "__pycache__",
+  "CMakeFiles",
+  ".git",
+  "build",
+  "build_bench*",
+  "build_rel*",
+  "build_opencl*",
+  "build_ufsecp*",
+  "build-arm64*",
+  "build-cuda*",
+  "build-riscv*",
+  "Testing",
+  "target",
+  "dist",
+  ".pytest_cache",
+  "esp-idf",
+]
+
+[[source_dirs]]
+label = "cpu"
+path = "../src/cpu"
+extensions = ["*.cpp", "*.cc", "*.c", "*.hpp", "*.hh", "*.h", "*.ipp", "*.inl", "*.cu", "*.cuh", "*.cl", "*.metal", "*.mm", "*.txt", "*.cmake"]
+
+[[source_dirs]]
+label = "include"
+path = "../include"
+extensions = ["*.cpp", "*.cc", "*.c", "*.hpp", "*.hh", "*.h", "*.ipp", "*.inl", "*.cu", "*.cuh", "*.cl", "*.metal", "*.mm", "*.txt", "*.cmake"]
+
+[[source_dirs]]
+label = "audit"
+path = "../audit"
+optional = true
+extensions = ["*.cpp", "*.cc", "*.c", "*.hpp", "*.hh", "*.h", "*.py", "*.sh", "*.cmake", "*.txt", "CMakeLists.txt"]
+
+[[source_dirs]]
+label = "formal_verification"
+path = "../audit/formal"
+optional = true
+extensions = ["*.cry", "*.lean", "*.py", "*.saw", "*.v", "*.ml", "*.md"]
+language = "python"
+
+[[source_dirs]]
+label = "benchmarks"
+path = "../benchmarks"
+optional = true
+extensions = ["*.md", "*.txt", "*.json", "*.log"]
+
+[[source_dirs]]
+label = "cuda"
+path = "../src/cuda"
+optional = true
+extensions = ["*.cpp", "*.cc", "*.c", "*.hpp", "*.hh", "*.h", "*.ipp", "*.inl", "*.cu", "*.cuh", "*.cl", "*.metal", "*.mm", "*.txt", "*.cmake"]
+
+[[source_dirs]]
+label = "examples"
+path = "../examples"
+optional = true
+extensions = ["*.cpp", "*.cc", "*.c", "*.hpp", "*.hh", "*.h", "*.ipp", "*.inl", "*.cu", "*.cuh", "*.cl", "*.metal", "*.mm", "*.txt", "*.cmake"]
+
+[[source_dirs]]
+label = "gpu"
+path = "../src/gpu"
+optional = true
+extensions = ["*.cpp", "*.cc", "*.c", "*.hpp", "*.hh", "*.h", "*.ipp", "*.inl", "*.cu", "*.cuh", "*.cl", "*.metal", "*.mm", "*.txt", "*.cmake"]
+
+[[source_dirs]]
+label = "metal"
+path = "../src/metal"
+optional = true
+extensions = ["*.cpp", "*.cc", "*.c", "*.hpp", "*.hh", "*.h", "*.ipp", "*.inl", "*.cu", "*.cuh", "*.cl", "*.metal", "*.mm", "*.txt", "*.cmake"]
+
+[[source_dirs]]
+label = "opencl"
+path = "../src/opencl"
+optional = true
+extensions = ["*.cpp", "*.cc", "*.c", "*.hpp", "*.hh", "*.h", "*.ipp", "*.inl", "*.cu", "*.cuh", "*.cl", "*.metal", "*.mm", "*.txt", "*.cmake"]
+
+[[source_dirs]]
+label = "tests"
+path = "../tests"
+optional = true
+extensions = ["*.cpp", "*.cc", "*.c", "*.hpp", "*.hh", "*.h", "*.ipp", "*.inl", "*.cu", "*.cuh", "*.cl", "*.metal", "*.mm", "*.txt", "*.cmake"]
+
+[[source_dirs]]
+label = "docs"
+path = "../docs"
+optional = true
+extensions = ["*.md", "*.txt", "*.json", "*.yml", "*.yaml"]
+
+[[source_dirs]]
+label = "scripts"
+path = "../scripts"
+optional = true
+extensions = ["*.py", "*.sh", "*.bash", "*.ps1", "*.cmake", "*.json", "*.toml", "*.md"]
+language = "python"
+
+[[source_dirs]]
+label = "ci"
+path = "../ci"
+optional = true
+extensions = ["*.py", "*.sh", "*.bash", "*.ps1", "*.cmake", "*.json", "*.toml", "*.md", "*.yml", "*.yaml"]
+language = "python"
+
+[[source_dirs]]
+label = "tools"
+path = "../tools"
+optional = true
+extensions = ["*.py", "*.sh", "*.bash", "*.ps1", "*.cmake", "*.toml", "*.json", "*.md"]
+language = "python"
+
+[[source_dirs]]
+label = "cmake"
+path = "../cmake"
+optional = true
+extensions = ["*.cmake", "CMakeLists.txt", "*.txt"]
+
+[[source_dirs]]
+label = "src_build_config"
+path = "../src"
+optional = true
+extensions = ["CMakeLists.txt"]
+
+[[source_dirs]]
+label = "cpu_ltc"
+path = "../src/cpu/src/ltc"
+optional = true
+extensions = ["*.cpp", "*.cc", "*.c", "*.hpp", "*.hh", "*.h"]
+
+[[source_dirs]]
+label = "cpu_ltc_include"
+path = "../src/cpu/include/secp256k1/ltc"
+optional = true
+extensions = ["*.cpp", "*.cc", "*.c", "*.hpp", "*.hh", "*.h"]
+
+[[source_dirs]]
+label = "compat"
+path = "../compat"
+optional = true
+extensions = ["*.cpp", "*.cc", "*.c", "*.hpp", "*.hh", "*.h", "*.md", "*.txt", "*.cmake", "CMakeLists.txt"]
+
+[[source_dirs]]
+label = "bindings"
+path = "../bindings"
+optional = true
+extensions = ["*.toml", "*.dart", "*.js", "*.ts", "*.tsx", "*.json", "*.md", "*.swift", "*.java", "*.kt", "*.go", "*.py", "*.rb", "*.php", "*.c", "*.h"]
+
+[[source_dirs]]
+label = "bindings_rust"
+path = "../bindings/rust"
+optional = true
+extensions = ["*.rs", "*.toml"]
+language = "rust"
+
+[[source_dirs]]
+label = "github"
+path = "../.github"
+optional = true
+extensions = ["*.yml", "*.yaml", "*.md", "*.json"]
+
+[[source_dirs]]
+label = "repo_root_meta"
+path = ".."
+optional = true
+extensions = ["README.md", "CHANGELOG.md", "SECURITY.md", "THREAT_MODEL.md", "ROADMAP.md", "AUDIT_COVERAGE.md", "AUDIT_GUIDE.md", "AUDIT_REPORT.md", "WHY_ULTRAFASTSECP256K1.md", "AGENTS.md", "CLAUDE.md", "BUILD_GUIDE.md", "WORK_DOCUMENT.md", "codecov.yml", "*.yml", "*.yaml", "CMakeLists.txt", "CMakePresets.json", "CMakeUserPresets.json"]
+recursive = false
+
+[[category_rules]]
+source_dir = "docs"
+match = "suffix"
+pattern = ".md"
+category = "docs"
+
+[[category_rules]]
+source_dir = "scripts"
+match = "suffix"
+pattern = ".py"
+category = "tooling"
+
+[[category_rules]]
+source_dir = "scripts"
+match = "suffix"
+pattern = ".sh"
+category = "tooling"
+
+[[category_rules]]
+source_dir = "ci"
+match = "suffix"
+pattern = ".py"
+category = "ci"
+
+[[category_rules]]
+source_dir = "ci"
+match = "suffix"
+pattern = ".sh"
+category = "ci"
+
+[[category_rules]]
+source_dir = "tools"
+match = "suffix"
+pattern = ".py"
+category = "tooling"
+
+[[category_rules]]
+source_dir = "tools"
+match = "contains"
+pattern = "source_graph"
+category = "graph_tooling"
+
+[[category_rules]]
+source_dir = "cmake"
+match = "suffix"
+pattern = ".cmake"
+category = "build_config"
+
+[[category_rules]]
+source_dir = "compat"
+match = "contains"
+pattern = "libsecp256k1_shim"
+category = "compat_shim"
+
+[[category_rules]]
+source_dir = "compat"
+match = "suffix"
+pattern = ".md"
+category = "docs"
+
+[[category_rules]]
+source_dir = "bindings"
+match = "suffix"
+pattern = ".rs"
+category = "bindings"
+
+[[category_rules]]
+source_dir = "bindings_rust"
+match = "suffix"
+pattern = ".rs"
+category = "bindings"
+
+[[category_rules]]
+source_dir = "bindings"
+match = "suffix"
+pattern = ".dart"
+category = "bindings"
+
+[[category_rules]]
+source_dir = "bindings"
+match = "suffix"
+pattern = ".go"
+category = "bindings"
+
+[[category_rules]]
+source_dir = "bindings"
+match = "suffix"
+pattern = ".java"
+category = "bindings"
+
+[[category_rules]]
+source_dir = "github"
+match = "prefix"
+pattern = "workflows/"
+category = "ci"
+
+[[category_rules]]
+source_dir = "repo_root_meta"
+match = "prefix"
+pattern = "AUDIT_"
+category = "audit_docs"
+
+[[category_rules]]
+source_dir = "repo_root_meta"
+match = "suffix"
+pattern = ".md"
+category = "docs"
+
+[[category_rules]]
+source_dir = "repo_root_meta"
+match = "prefix"
+pattern = "CMake"
+category = "build_config"
+
+[[category_rules]]
+source_dir = "formal_verification"
+match = "suffix"
+pattern = ".cry"
+category = "formal_spec"
+
+[[category_rules]]
+source_dir = "formal_verification"
+match = "suffix"
+pattern = ".lean"
+category = "formal_proof"
+
+[[category_rules]]
+source_dir = "formal_verification"
+match = "suffix"
+pattern = ".py"
+category = "formal_proof"
+
+[[category_rules]]
+source_dir = "audit"
+match = "suffix"
+pattern = ".py"
+category = "tooling"
+
+[[category_rules]]
+source_dir = "audit"
+match = "prefix"
+pattern = "CMake"
+category = "build_config"

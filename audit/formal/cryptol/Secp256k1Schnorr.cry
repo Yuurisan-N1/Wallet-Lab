@@ -1,0 +1,200 @@
+// ============================================================================
+// Secp256k1Schnorr.cry — Cryptol formal specification: BIP-340 Schnorr
+// ============================================================================
+//
+// Formally specifies BIP-340 Schnorr signatures over secp256k1.
+//
+// BIP-340 reference: https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki
+//
+// Key properties formalized:
+//   1. Verification correctness: sign(msg, sk) accepts under verify
+//   2. Nonce binding: R = k*G with tagged hash nonce derivation
+//   3. Key-only x-coordinate: pubkey is x-only (32 bytes, always even Y)
+//   4. Tagged hash: all hash calls use BIP-340 domain-separated tags
+//   5. Even-Y normalization: private key negated if public key Y is odd
+//
+// NOTE: sign/verify go through SHA-256 (declared as an abstract primitive here)
+// and 256-bit scalar multiplication, so the full sign-then-verify properties are
+// SAW :prove targets rather than randomized :check targets. The structural
+// properties (even-Y normalization, idempotence) are checkable directly.
+// ============================================================================
+
+module Secp256k1Schnorr where
+
+import Secp256k1Field
+import Secp256k1Point
+
+// ---------------------------------------------------------------------------
+// Scalar arithmetic mod N (group order). Same full-width discipline as
+// Secp256k1Field: Cryptol's (+),(*) on [256] truncate mod 2^256, so operands
+// are zero-extended before reduction mod N.
+// ---------------------------------------------------------------------------
+
+scalar_mod_add : [256] -> [256] -> [256]
+scalar_mod_add a b = drop`{1} ((ext a + ext b) % ext N)
+  where ext x = (zero : [1]) # x      // [257]
+
+scalar_mod_mul : [256] -> [256] -> [256]
+scalar_mod_mul a b = drop`{256} ((ext a * ext b) % ext N)
+  where ext x = (zero : [256]) # x    // [512]
+
+// Maybe (record encoding: a tag bit + a payload).
+type Maybe a = { valid : Bit, value : a }
+
+mk_just : {a} a -> Maybe a
+mk_just x = { valid = True, value = x }
+
+mk_nothing : {a} (Zero a) => Maybe a
+mk_nothing = { valid = False, value = zero }
+
+// ---------------------------------------------------------------------------
+// SHA-256 (abstract — supplied by the Cryptol prelude or SAW).
+// Modeled as an uninterpreted function for type-checking and SAW proofs; the
+// concrete implementation is linked in SAW equivalence proofs.
+// ---------------------------------------------------------------------------
+
+primitive SHA256 : {n} (fin n) => [n][8] -> [32][8]
+
+// Convenience: SHA-256 of an [n*8]-wide bitvector, byte-aligned
+sha256_bytes : {n} (fin n) => [n*8] -> [256]
+sha256_bytes x = join (SHA256 (split x : [n][8]))
+
+// ---------------------------------------------------------------------------
+// BIP-340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg)
+// ---------------------------------------------------------------------------
+
+TAG_BIP0340_NONCE : [256]
+TAG_BIP0340_NONCE = sha256_bytes`{13} (join "BIP0340/nonce" : [13*8])
+
+TAG_BIP0340_CHALLENGE : [256]
+TAG_BIP0340_CHALLENGE = sha256_bytes`{17} (join "BIP0340/challenge" : [17*8])
+
+TAG_BIP0340_AUX : [256]
+TAG_BIP0340_AUX = sha256_bytes`{11} (join "BIP0340/aux" : [11*8])
+
+// Polymorphic over the message width m (a multiple of 8 bits). The two 256-bit
+// tag-hash prefixes contribute 512 bits = 64 bytes, so the SHA input is 64 + m/8 bytes.
+tagged_hash : {m} (fin m, m % 8 == 0) => [256] -> [m] -> [256]
+tagged_hash tag_hash msg = sha256_bytes`{64 + m / 8} (tag_hash # tag_hash # msg)
+
+// ---------------------------------------------------------------------------
+// BIP-340 signature types
+// ---------------------------------------------------------------------------
+
+type SchnorrPubkey = [256]                       // x-only: 32 bytes
+type SchnorrSig    = { rx : [256], s : [256] }   // R.x || s (64 bytes)
+
+// ---------------------------------------------------------------------------
+// Nonce derivation: t = d XOR H_aux(a); rand = H_nonce(t || P.x || m); k = rand mod N
+// ---------------------------------------------------------------------------
+
+schnorr_nonce : [256] -> [256] -> [256] -> SchnorrPubkey -> [256]
+schnorr_nonce d a m px = rand % N
+  where
+    t    = d ^ (tagged_hash TAG_BIP0340_AUX a)
+    rand = tagged_hash TAG_BIP0340_NONCE (t # px # m)
+
+// ---------------------------------------------------------------------------
+// Even-Y normalization
+// ---------------------------------------------------------------------------
+
+// Y is even iff its least-significant bit is 0.
+y_is_even : FieldElement -> Bit
+y_is_even y = ~(y ! 0)
+
+normalise_key : [256] -> [256]
+normalise_key d =
+    if ~Pt.infinity /\ y_is_even Pt.y then d else N - d
+  where Pt = privkey_to_pubkey d
+
+normalise_nonce : [256] -> AffinePoint -> [256]
+normalise_nonce k R =
+    if ~R.infinity /\ y_is_even R.y then k else N - k
+
+// ---------------------------------------------------------------------------
+// BIP-340 sign (reference, with provided aux_rand)
+// ---------------------------------------------------------------------------
+
+schnorr_sign : [256] -> [256] -> [256] -> Maybe SchnorrSig
+schnorr_sign msg sk aux_rand =
+    if sk == 0 \/ sk >= N then mk_nothing
+     | Pt.infinity        then mk_nothing
+     | k0 == 0            then mk_nothing
+     | R.infinity         then mk_nothing
+    else mk_just { rx = rx, s = s }
+  where
+    d   = normalise_key sk                        // even-Y private key
+    Pt  = privkey_to_pubkey d
+    k0  = schnorr_nonce d aux_rand msg Pt.x        // nonce
+    R   = scalar_mul k0 generator
+    k   = normalise_nonce k0 R                     // even-Y nonce
+    rx  = R.x
+    e   = (tagged_hash TAG_BIP0340_CHALLENGE (rx # Pt.x # msg)) % N
+    s   = scalar_mod_add k (scalar_mod_mul e d)    // s = k + e*d mod N
+
+// ---------------------------------------------------------------------------
+// BIP-340 verify (reference)
+// ---------------------------------------------------------------------------
+
+schnorr_verify : [256] -> SchnorrSig -> SchnorrPubkey -> Bit
+schnorr_verify msg sig pk_x =
+    // 1. Range checks and lift x to an even-Y curve point
+    sig.s < N /\ sig.rx < P /\ pk_x < P /\
+    on_curve Qaff /\
+    // 3. R = s*G - e*P is finite, even-Y, and its x matches sig.rx
+    ~R.infinity /\
+    y_is_even R.y /\
+    R.x == sig.rx
+  where
+    p_y_candidate = field_sqrt (field_add (field_mul_ref (field_mul_ref pk_x pk_x) pk_x) B)
+    p_y  = if y_is_even p_y_candidate then p_y_candidate else P - p_y_candidate
+    Qaff = { x = pk_x, y = p_y, infinity = False }
+    // 2. e = H_challenge(rx || pk_x || msg) mod N
+    e    = (tagged_hash TAG_BIP0340_CHALLENGE (sig.rx # pk_x # msg)) % N
+    R1   = scalar_mul sig.s generator
+    R2   = scalar_mul e Qaff
+    R    = point_add R1 (point_neg R2)
+
+// ---------------------------------------------------------------------------
+// Properties
+// ---------------------------------------------------------------------------
+
+// Correctness: sign then verify. (SAW :prove target — uses SHA + scalar_mul.)
+property schnorr_sign_then_verify (msg : [256]) (sk : [256]) (aux : [256]) =
+    (sk >= 1 /\ sk < N) ==>
+    result.valid ==>
+    schnorr_verify msg result.value pk_x
+  where
+    result = schnorr_sign msg sk aux
+    pk_x   = (privkey_to_pubkey (normalise_key sk)).x
+
+// s in [0, N-1]
+property schnorr_sign_s_range (msg : [256]) (sk : [256]) (aux : [256]) =
+    result.valid ==> result.value.s < N
+  where result = schnorr_sign msg sk aux
+
+// rx in [0, P-1]
+property schnorr_sign_rx_range (msg : [256]) (sk : [256]) (aux : [256]) =
+    result.valid ==> result.value.rx < P
+  where result = schnorr_sign msg sk aux
+
+// Even-Y pubkey: the normalised key always produces an even-Y public key.
+// (Structural — no SHA — :check-able directly.)
+property normalised_key_has_even_y (sk : [256]) =
+    (sk >= 1 /\ sk < N) ==>
+    (Pt.infinity \/ y_is_even Pt.y)
+  where Pt = privkey_to_pubkey (normalise_key sk)
+
+// Double normalisation is idempotent. (Structural — :check-able.)
+property normalise_key_idempotent (sk : [256]) =
+    (sk >= 1 /\ sk < N) ==>
+    normalise_key (normalise_key sk) == normalise_key sk
+
+// Zero message: sign still works. (SAW :prove target.)
+property schnorr_zero_msg (sk : [256]) (aux : [256]) =
+    (sk >= 1 /\ sk < N) ==>
+    result.valid ==>
+    schnorr_verify 0 result.value pk_x
+  where
+    result = schnorr_sign 0 sk aux
+    pk_x   = (privkey_to_pubkey (normalise_key sk)).x

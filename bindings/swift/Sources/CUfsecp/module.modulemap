@@ -1,0 +1,5 @@
+module CUfsecp [system] {
+    header "ufsecp.h"
+    link "ufsecp"
+    export *
+}

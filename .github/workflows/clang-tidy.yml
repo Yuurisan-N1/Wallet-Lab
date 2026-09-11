@@ -1,0 +1,140 @@
+name: Clang-Tidy
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  clang-tidy:
+    name: Static Analysis (clang-tidy)
+    runs-on: ubuntu-24.04
+    permissions:
+      security-events: write  # upload SARIF to Security tab
+
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clang-17 clang-tidy-17 lld-17 ninja-build ccache
+
+      - name: Cache ccache
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ~/.cache/ccache
+          key: ccache-tidy-${{ hashFiles('src/cpu/src/**', 'src/cpu/include/**', 'include/**') }}
+          restore-keys: |
+            ccache-tidy-
+
+      - name: Configure ccache
+        run: |
+          ccache --set-config=max_size=200M
+          ccache --set-config=compression=true
+          ccache -z
+
+      - name: Configure (compile_commands.json)
+        run: |
+          cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang-17 \
+            -DCMAKE_CXX_COMPILER=clang++-17 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DSECP256K1_MARCH=x86-64-v3 \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DSECP256K1_BUILD_TESTS=OFF \
+            -DSECP256K1_BUILD_BENCH=OFF \
+            -DSECP256K1_BUILD_EXAMPLES=OFF
+
+      - name: Build (needed for generated headers)
+        run: cmake --build build -j$(nproc)
+
+      - name: Run clang-tidy
+        run: |
+          : > clang-tidy-output.txt
+          # Only analyse C++ source files that CMake actually compiles
+          # Filter out .S assembly files (clang-tidy cannot process them)
+          jq -r '.[].file' build/compile_commands.json \
+            | grep -E '\.(cpp|cc|cxx)$' \
+            | grep -E '/(src/cpu/src|src/cpu/include|include/ufsecp|include/secp256k1|src/gpu/src|src/gpu/include|src/opencl|src/metal)/' \
+            | sort -u \
+            | xargs -P "$(nproc)" -n 4 \
+              clang-tidy-17 -p build --warnings-as-errors='' --quiet 2>&1 \
+            | tee clang-tidy-output.txt
+          # Fail if clang-tidy found any diagnostics
+          if grep -qE '^.+:[0-9]+:[0-9]+: (warning|error):' clang-tidy-output.txt; then
+            echo "::warning::clang-tidy found issues (non-blocking for now)"
+            # To make blocking later, uncomment: exit 1
+          fi
+
+      - name: Convert clang-tidy output to SARIF
+        if: always()
+        run: |
+          test -f clang-tidy-output.txt || : > clang-tidy-output.txt
+          python3 -c "
+          import json, re, sys
+
+          results = []
+          with open('clang-tidy-output.txt') as f:
+              for line in f:
+                  m = re.match(r'^(.+):(\d+):(\d+): (warning|error): (.+) \[(.+)\]$', line.strip())
+                  if m:
+                      filepath, lineno, col, level, msg, rule = m.groups()
+                      results.append({
+                          'ruleId': rule,
+                          'level': level,
+                          'message': {'text': msg},
+                          'locations': [{
+                              'physicalLocation': {
+                                  'artifactLocation': {'uri': filepath},
+                                  'region': {
+                                      'startLine': int(lineno),
+                                      'startColumn': int(col)
+                                  }
+                              }
+                          }]
+                      })
+
+          sarif = {
+              '\$schema': 'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json',
+              'version': '2.1.0',
+              'runs': [{
+                  'tool': {'driver': {'name': 'clang-tidy', 'version': '17'}},
+                  'results': results
+              }]
+          }
+          with open('clang-tidy-results.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          print(f'Converted {len(results)} clang-tidy findings to SARIF')
+          "
+
+      - name: Upload SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        with:
+          sarif_file: clang-tidy-results.sarif
+          category: clang-tidy
+        continue-on-error: true
+
+      - name: Upload clang-tidy report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: clang-tidy-report
+          path: |
+            clang-tidy-output.txt
+            clang-tidy-results.sarif
+          retention-days: 30

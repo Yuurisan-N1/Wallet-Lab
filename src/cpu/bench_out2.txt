@@ -1,0 +1,9 @@
+UltrafastSecp256k1 x86_64 Benchmark
+-----------------------------------
+Field Mul:      18.0 ns
+Field Sqr:      14.1 ns
+Field Add:      0.0 ns
+Point Add(Mix): 197.1 ns
+Point Add(Full):217.7 ns
+Point Double:   89.7 ns
+Scalar Mul:     5.7 us

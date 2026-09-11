@@ -1,0 +1,69 @@
+{
+  "_meta": {
+    "date": "2026-05-19",
+    "harness": "bench_bitcoin (Bitcoin Core native benchmark binary)",
+    "machine": "Intel Core i5-14400F, x86-64",
+    "compiler": "GCC 14.2.0",
+    "cpu_governor": "performance (sudo cpupower frequency-set -g performance)",
+    "turbo": "disabled (intel_pstate/no_turbo=1, verified via cpupower)",
+    "taskset": "taskset -c 0",
+    "nice": -20,
+    "build_type": "Release, no LTO (CMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF)",
+    "note": "Three binary comparison: bundled libsecp / ultra stripped (FROST/ZK/ECIES/BIP352/Adaptor/Wallet OFF) / ultra full (all ON). Confirms: stripping has zero ConnectBlock impact; regression is in core algorithms (GLV+FE52+Strauss), not optional modules."
+  },
+  "bundled_nolto": {
+    "unit": "ns",
+    "ConnectBlockAllEcdsa": 248274407,
+    "ConnectBlockAllSchnorr": 249164883,
+    "ConnectBlockMixed": 248497826,
+    "SignSchnorrWithMerkleRoot": 109537,
+    "SignSchnorrWithNullMerkleRoot": 110360,
+    "SignTransactionECDSA": 165087,
+    "SignTransactionSchnorr": 132883,
+    "VerifyScriptP2TR_KeyPath": 44250,
+    "VerifyScriptP2TR_ScriptPath": 79576,
+    "VerifyScriptP2WPKH": 44134
+  },
+  "ultra_stripped_nolto": {
+    "unit": "ns",
+    "note": "bitcoin-core profile: FROST/ZK/ECIES/BIP352/Adaptor/Wallet OFF; Pippenger/MuSig2/BIP324 ON",
+    "ConnectBlockAllEcdsa": 274525069,
+    "ConnectBlockAllSchnorr": 257087280,
+    "ConnectBlockMixed": 272039257,
+    "SignSchnorrWithMerkleRoot": 94943,
+    "SignSchnorrWithNullMerkleRoot": 95005,
+    "SignTransactionECDSA": 159368,
+    "SignTransactionSchnorr": 135926,
+    "VerifyScriptP2TR_KeyPath": 46869,
+    "VerifyScriptP2TR_ScriptPath": 77830,
+    "VerifyScriptP2WPKH": 50633
+  },
+  "ultra_full_nolto": {
+    "unit": "ns",
+    "note": "All modules ON — confirms stripped≈full for ConnectBlock (0.3-0.5% noise)",
+    "ConnectBlockAllEcdsa": 278863872,
+    "ConnectBlockAllSchnorr": 257872413,
+    "ConnectBlockMixed": 273335144,
+    "SignSchnorrWithMerkleRoot": 95470,
+    "SignTransactionECDSA": 173229,
+    "VerifyScriptP2TR_KeyPath": 46958,
+    "VerifyScriptP2TR_ScriptPath": 78080,
+    "VerifyScriptP2WPKH": 50753
+  },
+  "ratios_stripped_vs_bundled": {
+    "ConnectBlockAllEcdsa": -0.106,
+    "ConnectBlockAllSchnorr": -0.032,
+    "ConnectBlockMixed": -0.095,
+    "SignSchnorrWithMerkleRoot": 0.134,
+    "SignTransactionECDSA": 0.035,
+    "VerifyScriptP2TR_ScriptPath": 0.022,
+    "VerifyScriptP2WPKH": -0.147
+  },
+  "conclusions": [
+    "ConnectBlock regression ~3-11% no-LTO — caused by I-cache pressure (1.2MB .text vs 400KB bundled), not algorithm correctness",
+    "Module stripping (stripped vs full) has ZERO ConnectBlock impact (0.3-0.5% noise)",
+    "CT Schnorr signing: +13% faster (ultra_stripped vs bundled)",
+    "LTO eliminates ConnectBlock regression entirely: see BITCOIN_CORE_BENCH_RESULTS.json results_lto (ratio 1.009-1.015)",
+    "Production builds must use -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON"
+  ]
+}

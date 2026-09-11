@@ -1,0 +1,1446 @@
+cmake_minimum_required(VERSION 3.18)
+
+# Allow standalone builds (when not included as a subdirectory)
+if(NOT CMAKE_PROJECT_NAME OR CMAKE_PROJECT_NAME STREQUAL "Project")
+    project(UltrafastSecp256k1 LANGUAGES CXX C ASM)
+    set(CMAKE_CXX_STANDARD 20)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    include(CTest)
+endif()
+
+set(SECP256K1_LIB_NAME fastsecp256k1)
+
+# =============================================================================
+# Core sources — always compiled (field arithmetic, CT layer, crypto primitives)
+# =============================================================================
+set(SECP256K1_SOURCES
+    # Field arithmetic (Tier 1: portable C++)
+    src/field.cpp
+    src/field_52.cpp       # 5x52 lazy-reduction field (hybrid scheme)
+    src/field_26.cpp       # 10x26 lazy-reduction field (32-bit platforms)
+    src/scalar.cpp
+    src/point.cpp
+    src/precompute.cpp
+    src/field_asm.cpp      # Tier 2: BMI2 intrinsics (runtime detection)
+    src/glv.cpp            # GLV endomorphism optimization
+    src/selftest.cpp       # Self-test with known arithmetic vectors
+    # Constant-Time (CT) layer — always compiled, no flags
+    src/ct_field.cpp       # CT field arithmetic (side-channel resistant)
+    src/ct_scalar.cpp      # CT scalar arithmetic
+    src/ct_point.cpp       # CT point ops (complete addition, CT scalar_mul)
+    src/ct_sign.cpp        # CT signing (ECDSA + Schnorr) using ct::generator_mul
+    # Core crypto protocols
+    src/ecdsa.cpp          # ECDSA sign/verify + RFC 6979
+    src/schnorr.cpp        # Schnorr BIP-340 sign/verify
+    src/multiscalar.cpp    # Multi-scalar multiplication (Strauss/Shamir)
+    src/ecdh.cpp           # ECDH key exchange
+    src/recovery.cpp       # ECDSA public key recovery
+    # Bitcoin consensus layer (always needed for any Bitcoin-family backend)
+    src/taproot.cpp        # Taproot (BIP-341/342) key tweaking + tapscript sighash
+    src/bip143.cpp         # BIP-143 SegWit v0 sighash
+    src/bip144.cpp         # BIP-144 witness transaction serialization
+    src/segwit.cpp         # BIP-141 segregated witness program ops
+    src/hash_accel.cpp     # SHA-256 (SHA-NI) + RIPEMD-160 + Hash160
+)
+
+# =============================================================================
+# Optional feature modules
+# =============================================================================
+# Each flag controls a feature group. All default ON to preserve existing
+# behaviour for full builds. Use named presets (CMakePresets.json) to select
+# coin-specific profiles that strip unused modules and reduce I-cache pressure.
+#
+# I-cache impact without LTO (x86-64, measured):
+#   Full build: ~1.3 MB .text  →  bitcoin-core profile: ~400 KB .text
+#   Stripping FROST+ZK+ECIES+BIP352+Adaptor+Wallet+Pippenger recovers the
+#   ~3% ConnectBlock verify regression seen in no-LTO deployments.
+
+# MuSig2 (BIP-327) — needed for Bitcoin/LTC/DOGE taproot key aggregation
+option(SECP256K1_BUILD_MUSIG2
+    "MuSig2 multi-signatures (BIP-327)" ON)
+if(SECP256K1_BUILD_MUSIG2)
+    list(APPEND SECP256K1_SOURCES src/musig2.cpp)
+    message(STATUS "Secp256k1: MuSig2 module: ON")
+else()
+    message(STATUS "Secp256k1: MuSig2 module: OFF")
+endif()
+
+# FROST threshold signatures (t-of-n multisig, not needed for core backends)
+option(SECP256K1_BUILD_FROST
+    "FROST threshold signatures (t-of-n)" ON)
+if(SECP256K1_BUILD_FROST)
+    list(APPEND SECP256K1_SOURCES src/frost.cpp)
+    add_compile_definitions(SECP256K1_HAS_FROST=1)
+    message(STATUS "Secp256k1: FROST module: ON")
+else()
+    message(STATUS "Secp256k1: FROST module: OFF")
+endif()
+
+# ZK proofs — Bulletproofs, Pedersen commitments, DLEQ proofs
+option(SECP256K1_BUILD_ZK
+    "ZK proofs (Bulletproofs, Pedersen commitments, DLEQ)" ON)
+if(SECP256K1_BUILD_ZK)
+    list(APPEND SECP256K1_SOURCES
+        src/pedersen.cpp
+        src/zk.cpp
+    )
+    add_compile_definitions(SECP256K1_HAS_ZK=1)
+    message(STATUS "Secp256k1: ZK module: ON (Bulletproofs, Pedersen, DLEQ)")
+else()
+    message(STATUS "Secp256k1: ZK module: OFF")
+endif()
+
+# ECIES authenticated encryption (AES-256-CTR + HMAC-SHA256)
+option(SECP256K1_BUILD_ECIES
+    "ECIES authenticated encryption (AES-256-CTR + HMAC-SHA256)" ON)
+if(SECP256K1_BUILD_ECIES)
+    list(APPEND SECP256K1_SOURCES src/ecies.cpp)
+    add_compile_definitions(SECP256K1_HAS_ECIES=1)
+    message(STATUS "Secp256k1: ECIES module: ON")
+else()
+    message(STATUS "Secp256k1: ECIES module: OFF")
+endif()
+
+# BIP-352 Silent Payments (scan + create output)
+option(SECP256K1_BUILD_BIP352
+    "BIP-352 Silent Payments (scan key ECDH + output derivation)" ON)
+if(SECP256K1_BUILD_BIP352)
+    list(APPEND SECP256K1_SOURCES src/address.cpp)
+    add_compile_definitions(SECP256K1_HAS_BIP352=1)
+    message(STATUS "Secp256k1: BIP-352 Silent Payments module: ON")
+else()
+    message(STATUS "Secp256k1: BIP-352 Silent Payments module: OFF")
+endif()
+
+# LTC-SP — Litecoin Silent Payments (chain-independent port of BIP-352)
+# Uses "LTCSP/SharedSecret" + "LTCSP/Inputs" tags (prevents BTC↔LTC replay).
+# Requires BIP-352 module for bech32_encode/bech32_decode shared infrastructure.
+option(SECP256K1_BUILD_LTC_SP
+    "Litecoin Silent Payments (LTC-SP, ltcsp1... paycodes, ltc1p... outputs)" ON)
+if(SECP256K1_BUILD_LTC_SP)
+    if(NOT SECP256K1_BUILD_BIP352)
+        message(FATAL_ERROR "SECP256K1_BUILD_LTC_SP=ON requires SECP256K1_BUILD_BIP352=ON")
+    endif()
+    list(APPEND SECP256K1_SOURCES src/ltc/ltc_sp.cpp)
+    add_compile_definitions(SECP256K1_HAS_LTC_SP=1)
+    message(STATUS "Secp256k1: LTC-SP module: ON (ltcsp1... paycodes, LTCSP/ tagged hashes)")
+else()
+    message(STATUS "Secp256k1: LTC-SP module: OFF")
+endif()
+
+# Adaptor signatures (Schnorr + ECDSA point-locked signatures)
+option(SECP256K1_BUILD_ADAPTOR
+    "Adaptor signatures (Schnorr + ECDSA)" ON)
+if(SECP256K1_BUILD_ADAPTOR)
+    list(APPEND SECP256K1_SOURCES src/adaptor.cpp)
+    add_compile_definitions(SECP256K1_HAS_ADAPTOR=1)
+    message(STATUS "Secp256k1: Adaptor signatures module: ON")
+else()
+    message(STATUS "Secp256k1: Adaptor signatures module: OFF")
+endif()
+
+# HD wallet stack: BIP-32/39, coin-type HD, message signing, wallet facade
+option(SECP256K1_BUILD_WALLET
+    "HD wallet stack (BIP-32/39, coin types, Bitcoin message signing)" ON)
+if(SECP256K1_BUILD_WALLET)
+    list(APPEND SECP256K1_SOURCES
+        src/sp_scanner.cpp     # SilentPaymentScanner (isolated TU for LTO efficiency)
+    src/bip32.cpp          # BIP-32 HD key derivation
+        src/bip39.cpp          # BIP-39 mnemonic seed phrases
+        src/unicode_nfkd.cpp   # UTF-8 NFKD normalization (BIP-39 spec)
+        src/coin_address.cpp   # Unified per-coin address generation
+        src/coin_hd.cpp        # BIP-44 coin-type HD derivation
+        src/message_signing.cpp # Bitcoin message signing (BIP-137)
+        src/wallet.cpp         # Unified multi-chain wallet API facade
+    )
+    add_compile_definitions(SECP256K1_HAS_WALLET=1)
+    message(STATUS "Secp256k1: Wallet module: ON (BIP-32/39, coin types, message signing)")
+else()
+    message(STATUS "Secp256k1: Wallet module: OFF")
+endif()
+
+# Pippenger MSM + Lim-Lee comb generator mul + affine batch addition
+# Large algorithms (~300 KB .text) not needed on verify-only or core-backend paths
+option(SECP256K1_BUILD_PIPPENGER
+    "Pippenger MSM + comb generator mul + batch affine (large MSM algorithms)" ON)
+if(SECP256K1_BUILD_PIPPENGER)
+    list(APPEND SECP256K1_SOURCES
+        src/pippenger.cpp        # Pippenger bucket method MSM (n > 128)
+        src/ecmult_gen_comb.cpp  # Lim-Lee comb method for fast k*G
+        src/batch_add_affine.cpp # Affine batch addition for sequential ECC search
+        src/batch_verify.cpp     # Batch ECDSA/Schnorr verify — calls msm() at N>=96
+    )
+    message(STATUS "Secp256k1: Pippenger/MSM module: ON")
+else()
+    message(STATUS "Secp256k1: Pippenger/MSM module: OFF")
+endif()
+
+# Optional inline assembly (Tier 3: Maximum performance, x64/RISC-V)
+option(SECP256K1_USE_ASM "Enable inline assembly optimizations (x64/RISC-V, 2-5x speedup)" ON)
+
+# Fast modular reduction (platform-independent)
+option(SECP256K1_USE_FAST_REDUCTION "Use fast modular reduction (RISC-V asm, x64 BMI2)" ON)
+
+# RISC-V specific options (only relevant when building on RISC-V)
+option(SECP256K1_RISCV_USE_VECTOR "Enable RISC-V Vector Extension (RVV) if available" ON)
+option(SECP256K1_RISCV_USE_PREFETCH "Enable prefetch hints for cache optimization" ON)
+
+# LTO/PGO options
+option(SECP256K1_USE_LTO "Enable Link Time Optimization (LTO) for C++ code" ON)
+option(SECP256K1_USE_PGO_GEN "Enable Profile-Guided Optimization - Generate profile" OFF)
+option(SECP256K1_USE_PGO_USE "Enable Profile-Guided Optimization - Use profile" OFF)
+set(SECP256K1_PGO_PROFILE_DIR "${CMAKE_BINARY_DIR}/pgo_profiles" CACHE PATH "Directory for PGO profiles")
+
+# Resolve target arch when cpu/ is built standalone (e.g. android/CMakeLists.txt)
+# and parent project did not predefine _SECP_TARGET_ARCH.
+if(NOT DEFINED _SECP_TARGET_ARCH OR _SECP_TARGET_ARCH STREQUAL "")
+    if(ANDROID AND DEFINED ANDROID_ABI AND NOT ANDROID_ABI STREQUAL "")
+        set(_SECP_TARGET_ARCH "${ANDROID_ABI}")
+    else()
+        set(_SECP_TARGET_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
+    endif()
+endif()
+message(STATUS "Secp256k1: Effective target arch: ${_SECP_TARGET_ARCH}")
+
+if(SECP256K1_USE_ASM)
+    if(_SECP_TARGET_ARCH MATCHES "x86_64|AMD64|X64" AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+        # x64 Assembly (Windows/Linux/macOS)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+            # GAS syntax for Clang/GCC (Windows MinGW, Linux, macOS)
+            enable_language(ASM)
+            message(STATUS "Secp256k1: Inline assembly enabled (x64 GAS) - Expected 3-5x speedup on field operations")
+            list(APPEND SECP256K1_SOURCES
+                src/field_asm_x64_gas.S
+            )
+
+            # GAS assembler flags
+            set(ASM_FLAGS "-x assembler-with-cpp -mbmi2 -madx -fno-lto")
+            set_source_files_properties(src/field_asm_x64_gas.S PROPERTIES
+                COMPILE_FLAGS "${ASM_FLAGS}")
+            set(SECP256K1_HAS_ASM TRUE CACHE INTERNAL "Assembly support enabled")
+            message(STATUS "Secp256k1: 5x52 using C __int128 (x64, inlines better than external ASM)")
+
+            # Enable fast reduction on x64 (uses BMI2/ADX)
+            if(SECP256K1_USE_FAST_REDUCTION)
+                add_compile_definitions(SECP256K1_USE_FAST_REDUCTION=1)
+                message(STATUS "Secp256k1: Fast modular reduction enabled (x64 BMI2/ADX)")
+            endif()
+        elseif(MSVC)
+            # MASM syntax for MSVC
+            enable_language(ASM_MASM)
+            message(STATUS "Secp256k1: Inline assembly enabled (x64 MASM) - Expected 3-5x speedup on field operations")
+            list(APPEND SECP256K1_SOURCES src/field_asm_x64.asm)
+            set_source_files_properties(src/field_asm_x64.asm PROPERTIES COMPILE_FLAGS "/c /Zi")
+            set(SECP256K1_HAS_ASM TRUE CACHE INTERNAL "Assembly support enabled")
+
+            if(SECP256K1_USE_FAST_REDUCTION)
+                add_compile_definitions(SECP256K1_USE_FAST_REDUCTION=1)
+                message(STATUS "Secp256k1: Fast modular reduction enabled (x64 BMI2/ADX)")
+            endif()
+        else()
+            message(WARNING "Secp256k1: Unsupported compiler ${CMAKE_CXX_COMPILER_ID} for x64 assembly")
+            set(SECP256K1_HAS_ASM FALSE)
+        endif()
+    elseif(UNIX AND _SECP_TARGET_ARCH MATCHES "riscv64|RISCV64")
+        # RISC-V 64-bit Assembly Support
+        enable_language(ASM)
+
+        # Check for Vector Extension support
+        if(SECP256K1_RISCV_USE_VECTOR)
+            # Try to detect if CPU supports RVV
+            # Check both /proc/cpuinfo (Linux) and manually enable if user requested
+            execute_process(
+                COMMAND cat /proc/cpuinfo
+                OUTPUT_VARIABLE RISCV_CPUINFO
+                ERROR_QUIET
+            )
+
+            # Look for 'v' in ISA extensions (format: "isa : rv64imafdcv...")
+            if(RISCV_CPUINFO MATCHES "isa[^:]*:[^v]*v")
+                set(RISCV_HAS_VECTOR TRUE)
+            else()
+                set(RISCV_HAS_VECTOR FALSE)
+            endif()
+
+            # Also try compile test as fallback
+            if(NOT RISCV_HAS_VECTOR)
+                include(CheckCXXSourceCompiles)
+                set(CMAKE_REQUIRED_FLAGS "-march=rv64gcv")
+                check_cxx_source_compiles("
+                    #include <riscv_vector.h>
+                    int main() {
+                        vint64m1_t v = __riscv_vmv_v_x_i64m1(0, 4);
+                        return 0;
+                    }" RISCV_COMPILER_SUPPORTS_VECTOR)
+                if(RISCV_COMPILER_SUPPORTS_VECTOR)
+                    set(RISCV_HAS_VECTOR TRUE)
+                endif()
+            endif()
+
+            if(RISCV_HAS_VECTOR)
+                set(RISCV_MARCH_FLAG "rv64gcv_zba_zbb")
+                set(RISCV_FEATURES "+Vector")
+                add_compile_definitions(SECP256K1_HAS_RISCV_VECTOR=1)
+                add_compile_definitions(SECP256K1_RISCV_USE_VECTOR=1)
+                message(STATUS "Secp256k1: RISC-V Vector Extension (RVV) detected and enabled")
+            else()
+                set(RISCV_MARCH_FLAG "rv64gc_zba_zbb")
+                message(STATUS "Secp256k1: RISC-V Vector Extension not detected, using scalar only")
+            endif()
+        else()
+            set(RISCV_MARCH_FLAG "rv64gc_zba_zbb")
+        endif()
+        
+        # Fast reduction option
+        if(SECP256K1_USE_FAST_REDUCTION)
+            add_compile_definitions(SECP256K1_USE_FAST_REDUCTION=1)
+            message(STATUS "Secp256k1: Fast modular reduction enabled")
+        endif()
+        
+        # Prefetch hints option
+        if(SECP256K1_RISCV_USE_PREFETCH)
+            add_compile_definitions(SECP256K1_RISCV_USE_PREFETCH=1)
+            message(STATUS "Secp256k1: Prefetch hints enabled")
+        endif()
+        
+        message(STATUS "Secp256k1: Inline assembly enabled (RISC-V 64-bit ${RISCV_FEATURES}) - Expected 2-3x speedup")
+
+        # ── Microarchitecture-aware scheduling flags (no code-bloat) ───────────
+        # Measured on MilkV Mars (SpacemiT X60, in-order dual-issue, 2026-05-08):
+        #   ECDSA Verify:  202 µs → 194 µs (1.04× win vs libsecp, was parity)
+        #   ecmult:         195 µs → 184 µs (1.05× win)
+        #   ecrecover:      235 µs → 227 µs (0.99× parity, was 0.96×)
+        #   3-run variance < 0.13% — gain is stable, not noise.
+        # `-funroll-loops`/`-fpeel-loops` REGRESS the macro path (i-cache bloat
+        # of ~6%); kept off. Only scheduling/cleanup flags retained.
+        # CT-safety: these flags reorder instructions but introduce no
+        # data-dependent branches — verified via CAAS audit_ct module.
+        add_compile_options(
+            -fmodulo-sched
+            -fmodulo-sched-allow-regmoves
+            -fpredictive-commoning
+            -fipa-pta
+        )
+
+        list(APPEND SECP256K1_SOURCES
+            src/field_asm_riscv64.S
+            src/field_asm_riscv64.cpp
+        )
+        
+        # RISC-V assembler flags with detected march
+        set_source_files_properties(src/field_asm_riscv64.S PROPERTIES 
+            COMPILE_FLAGS "-x assembler-with-cpp -march=${RISCV_MARCH_FLAG} -fno-lto")
+
+        add_compile_definitions(SECP256K1_HAS_RISCV_ASM=1)
+
+        # 5x52 FE52 assembly: external function calls add 13-register save/restore
+        # overhead per call (~26 extra memory ops). On in-order cores (U74, etc.) this
+        # negates scheduling benefits. C++ __int128 inline path is 26-33% faster for
+        # field ops because the compiler eliminates call overhead and can cross-inline.
+        # Enable SECP256K1_USE_RISCV_FE52_ASM=ON only for OoO cores where the explicit
+        # register scheduling matters more than inlining.
+        option(SECP256K1_USE_RISCV_FE52_ASM "Use hand-written RISC-V assembly for 5x52 field multiply/square (slower on in-order cores like U74)" OFF)
+        if(SECP256K1_USE_RISCV_FE52_ASM)
+            list(APPEND SECP256K1_SOURCES src/field_asm52_riscv64.S)
+            set_source_files_properties(src/field_asm52_riscv64.S PROPERTIES
+                COMPILE_FLAGS "-x assembler-with-cpp -march=${RISCV_MARCH_FLAG} -fno-lto")
+            add_compile_definitions(SECP256K1_HAS_RISCV_FE52_ASM=1)
+            message(STATUS "Secp256k1: 5x52 MUL/MULHU assembly ENABLED (RISC-V) -- external function calls")
+        else()
+            message(STATUS "Secp256k1: 5x52 field uses C++ __int128 INLINE (faster on in-order RISC-V)")
+        endif()
+
+        set(SECP256K1_HAS_ASM TRUE CACHE INTERNAL "Assembly support enabled")
+    elseif(_SECP_TARGET_ARCH MATCHES "aarch64|ARM64|arm64")
+        # ARM64 (AArch64) Assembly Support
+        # Uses MUL/UMULH inline assembly for field arithmetic
+        # Available on: Android NDK, Linux aarch64, macOS Apple Silicon
+        message(STATUS "Secp256k1: ARM64 inline assembly enabled (MUL/UMULH) - Expected 2-4x speedup on field operations")
+        
+        list(APPEND SECP256K1_SOURCES
+            src/field_asm_arm64.cpp
+        )
+        
+        add_compile_definitions(SECP256K1_HAS_ARM64_ASM=1)
+        set(SECP256K1_HAS_ASM TRUE CACHE INTERNAL "Assembly support enabled")
+        
+        if(SECP256K1_USE_FAST_REDUCTION)
+            add_compile_definitions(SECP256K1_USE_FAST_REDUCTION=1)
+            message(STATUS "Secp256k1: Fast modular reduction enabled (ARM64 secp256k1-specific)")
+        endif()
+    else()
+        message(WARNING "Secp256k1: Inline assembly requested but not available for ${_SECP_TARGET_ARCH} on ${CMAKE_SYSTEM_NAME}")
+        message(WARNING "  Assembly is enabled only on: x86_64, RISC-V 64-bit, ARM64 (aarch64). Falling back.")
+        set(SECP256K1_HAS_ASM FALSE)
+    endif()
+else()
+    set(SECP256K1_HAS_ASM FALSE)
+    add_compile_definitions(SECP256K1_NO_ASM=1)
+endif()
+
+# BIP-324 module (conditional: -DSECP256K1_BUILD_BIP324=ON/OFF)
+option(SECP256K1_BUILD_BIP324 "Enable BIP-324 v2 encrypted P2P transport (ChaCha20-Poly1305, ElligatorSwift, HKDF)" ON)
+if(SECP256K1_BUILD_BIP324)
+    list(APPEND SECP256K1_SOURCES
+        src/chacha20_poly1305.cpp  # ChaCha20-Poly1305 AEAD (RFC 8439)
+        src/hkdf.cpp               # HKDF-SHA256 + HMAC-SHA256 (RFC 5869)
+        src/ellswift.cpp           # ElligatorSwift encoding (BIP-324)
+        src/bip324.cpp             # BIP-324 session management
+    )
+    add_compile_definitions(SECP256K1_BIP324=1)
+    message(STATUS "Secp256k1: BIP-324 module: ON (ChaCha20-Poly1305, ElligatorSwift, HKDF, v2 transport)")
+else()
+    message(STATUS "Secp256k1: BIP-324 module: OFF")
+endif()
+
+# Ethereum module sources (conditional: -DSECP256K1_BUILD_ETHEREUM=ON/OFF)
+if(SECP256K1_BUILD_ETHEREUM)
+    list(APPEND SECP256K1_SOURCES
+        src/keccak256.cpp     # Keccak-256 hash (Ethereum-compatible, 0x01 padding)
+        src/ethereum.cpp      # Ethereum EIP-55 checksummed addresses
+        src/eth_signing.cpp   # EIP-191, EIP-155, ecrecover
+    )
+    message(STATUS "Secp256k1: Ethereum module: ON (Keccak-256, EIP-55, EIP-191/155, ecrecover)")
+else()
+    message(STATUS "Secp256k1: Ethereum module: OFF (Bitcoin-only build)")
+endif()
+
+# =============================================================================
+# Shim integration (libsecp256k1 API compatibility, no separate build target)
+# =============================================================================
+# SECP256K1_BUILD_SHIM=ON: include the libsecp256k1-compatible shim directly
+# inside fastsecp256k1. The shim is part of the engine — not a separate library.
+# This matches the libsecp256k1 model (secp256k1.c includes everything) and
+# eliminates the ~3% shim→core boundary overhead without requiring LTO.
+#
+# Default OFF (standalone builds use compat/libsecp256k1_shim/ separately).
+# Bitcoin Core integration sets this ON via cmake/secp256k1.cmake.
+option(SECP256K1_BUILD_SHIM
+  "Include libsecp256k1-compatible shim inside fastsecp256k1 (engine-integrated)"
+  OFF)
+
+if(SECP256K1_BUILD_SHIM)
+    set(_SHIM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../compat/libsecp256k1_shim")
+    if(EXISTS "${_SHIM_ROOT}/src/shim_ecdsa.cpp")
+        list(APPEND SECP256K1_SOURCES
+            ${_SHIM_ROOT}/src/shim_context.cpp
+            ${_SHIM_ROOT}/src/shim_ecdsa.cpp
+            ${_SHIM_ROOT}/src/shim_schnorr.cpp
+            ${_SHIM_ROOT}/src/shim_pubkey.cpp
+            ${_SHIM_ROOT}/src/shim_extrakeys.cpp
+            ${_SHIM_ROOT}/src/shim_recovery.cpp
+            ${_SHIM_ROOT}/src/shim_seckey.cpp
+            ${_SHIM_ROOT}/src/shim_ecdh.cpp
+            ${_SHIM_ROOT}/src/shim_tagged_hash.cpp
+            ${_SHIM_ROOT}/src/shim_ellswift.cpp
+        )
+        # Module-gated shim wrappers: only compile the shim ABI for modules that
+        # are actually built. Otherwise the unity TU references stripped symbols
+        # (secp256k1::msm, secp256k1::musig2_*) and the no-LTO link fails because
+        # there is no dead-code-elimination across the single translation unit.
+        if(SECP256K1_BUILD_PIPPENGER)
+            list(APPEND SECP256K1_SOURCES
+                ${_SHIM_ROOT}/src/shim_batch_verify.cpp)  # needs batch_verify.cpp -> msm()
+        endif()
+        if(SECP256K1_BUILD_MUSIG2)
+            list(APPEND SECP256K1_SOURCES
+                ${_SHIM_ROOT}/src/shim_musig.cpp)         # needs musig2.cpp
+        endif()
+        message(STATUS "Secp256k1: Shim integrated into engine (libsecp256k1 parity mode)")
+    else()
+        message(WARNING "SECP256K1_BUILD_SHIM=ON but shim source not found at ${_SHIM_ROOT}")
+    endif()
+endif()
+
+# Static precomputed table for Bitcoin Core backend mode (no file I/O, no startup overhead)
+# Window size is configurable: 8 (default, 1 MB) or 10 (3.4 MB, 19% fewer scalar-mul iterations).
+# Generate tables with: python3 tools/gen_precompute_w<N>.py src/cpu/src/precompute_static_w<N>.cpp
+set(SECP256K1_STATIC_WINDOW_BITS "8" CACHE STRING
+    "Precomputed generator table window size for CORE_BACKEND_MODE (8 or 10)")
+if(SECP256K1_CORE_BACKEND_MODE)
+    set(_STATIC_TABLE "${CMAKE_CURRENT_SOURCE_DIR}/src/precompute_static_w${SECP256K1_STATIC_WINDOW_BITS}.cpp")
+    if(EXISTS "${_STATIC_TABLE}")
+        list(APPEND SECP256K1_SOURCES "${_STATIC_TABLE}")
+        # Pass the window size as a compile definition so precompute.cpp
+        # selects the matching namespace (STATIC_W_NS macro).
+        add_compile_definitions(SECP256K1_STATIC_WINDOW_BITS=${SECP256K1_STATIC_WINDOW_BITS})
+        message(STATUS "Secp256k1: Using compiled-in w=${SECP256K1_STATIC_WINDOW_BITS} precomputed table (no file I/O)")
+    else()
+        message(WARNING "SECP256K1_CORE_BACKEND_MODE=ON but precompute_static_w${SECP256K1_STATIC_WINDOW_BITS}.cpp not found")
+    endif()
+endif()
+
+# =============================================================================
+# Generate feature availability header (secp256k1_features.h)
+# =============================================================================
+# Downstream code can #include "secp256k1/secp256k1_features.h" and use
+# #if SECP256K1_HAS_FROST / #if SECP256K1_HAS_ZK etc. to guard optional APIs.
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/secp256k1/secp256k1_features.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/include/secp256k1/secp256k1_features.h"
+    @ONLY
+)
+
+if(NOT TARGET ${SECP256K1_LIB_NAME})
+    # =========================================================================
+    # SECP256K1_BUILD_AS_OBJECT — compile as CMake OBJECT library
+    # =========================================================================
+    # When ON, fastsecp256k1 is an OBJECT library instead of a STATIC library.
+    # Effect: no .a file is created. All object files are included directly in
+    # the parent target's link step — as if the sources were part of that
+    # project. Combined with SECP256K1_UNITY_BUILD=ON, this is the tightest
+    # possible integration: one translation unit, no library boundary at all.
+    #
+    # Use cases:
+    #   - Embedding Ultra directly in another C++ project without install step
+    #   - Maximum LTO effectiveness (no inter-library IR boundary)
+    #   - Zero-overhead integration: same result as writing the crypto code
+    #     directly in the parent project
+    #
+    # Measured impact (bitcoin-core-dev, GCC 14, no LTO):
+    #   STATIC:         -8% ConnectBlock ECDSA vs libsecp
+    #   OBJECT:         same as STATIC (separate .o files, no cross-TU inlining)
+    #   OBJECT+UNITY:   -2.5% ECDSA, parity Schnorr, signing +6% — best no-LTO
+    #   STATIC+LTO:     +1.2% ConnectBlock, +10-35% signing   — best absolute
+    #
+    # See docs/BUILD_INTEGRATION_GUIDE.md for the full mode comparison.
+    option(SECP256K1_BUILD_AS_OBJECT
+        "Build fastsecp256k1 as OBJECT library (no .a — objects go directly into parent link step)"
+        OFF)
+
+    if(SECP256K1_BUILD_AS_OBJECT)
+        add_library(${SECP256K1_LIB_NAME} OBJECT ${SECP256K1_SOURCES})
+        message(STATUS "Secp256k1: OBJECT mode — no .a, objects included directly in parent link")
+    else()
+        add_library(${SECP256K1_LIB_NAME} STATIC ${SECP256K1_SOURCES})
+    endif()
+    add_library(secp256k1::fast ALIAS ${SECP256K1_LIB_NAME})
+    # Stable, fully-qualified alias matching the installed export name:
+    # install(EXPORT secp256k1-fast-targets NAMESPACE secp256k1::) exports
+    # `fastsecp256k1` as `secp256k1::fastsecp256k1`, so build-tree and installed
+    # consumers (e.g. the libbitcoin direct integration) link the same name.
+    add_library(secp256k1::fastsecp256k1 ALIAS ${SECP256K1_LIB_NAME})
+
+    # Expose generated features header to build-tree consumers.
+    # $<BUILD_INTERFACE:> prevents the binary-dir path from leaking into
+    # install exports (satisfies CMP0099 / CMake INTERFACE_INCLUDE_DIRECTORIES policy).
+    target_include_directories(${SECP256K1_LIB_NAME} PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    )
+
+    if(SECP256K1_BUILD_SHIM AND EXISTS "${_SHIM_ROOT}/include")
+        # Shim sources (compiled into fastsecp256k1) need secp256k1.h at build time.
+        # PRIVATE: consumers get secp256k1.h via secp256k1_shim's own PUBLIC include,
+        # not through the INTERFACE of fastsecp256k1 (which would violate CMP0099 by
+        # exposing a source-tree path in INTERFACE_INCLUDE_DIRECTORIES).
+        get_filename_component(_SHIM_INCLUDE_DIR "${_SHIM_ROOT}/include" REALPATH)
+        target_include_directories(${SECP256K1_LIB_NAME} PRIVATE
+            "${_SHIM_INCLUDE_DIR}"
+        )
+    endif()
+
+    # Required for linking into shared libraries (e.g. ufsecp_shared)
+    set_target_properties(${SECP256K1_LIB_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+    # ========================================================================
+    # Unity Build (single-TU compilation — matches libsecp256k1 approach)
+    # ========================================================================
+    # libsecp256k1 compiles its entire core as one translation unit via
+    # secp256k1.c which #include-s all impl files. This gives the compiler
+    # full visibility to inline field/scalar/point operations into verify
+    # functions, eliminating the ~3% shim boundary overhead without LTO.
+    #
+    # SECP256K1_UNITY_BUILD=ON: enables CMake UNITY_BUILD which concatenates
+    # all source files into a single TU — equivalent to libsecp's approach.
+    # Default OFF to preserve incremental build speed in development.
+    # Enable for production/release: -DSECP256K1_UNITY_BUILD=ON
+    option(SECP256K1_UNITY_BUILD "Compile core as single TU (matches libsecp256k1 model)" OFF)
+    if(SECP256K1_UNITY_BUILD)
+        set_target_properties(${SECP256K1_LIB_NAME} PROPERTIES
+            UNITY_BUILD ON
+            UNITY_BUILD_BATCH_SIZE 0   # 0 = all files in one TU
+        )
+        message(STATUS "Secp256k1: Unity build ON — single-TU compilation (libsecp256k1 parity mode)")
+    endif()
+
+    # ========================================================================
+    # LTO (Link Time Optimization) Support
+    # ========================================================================
+    # Note: Assembly files (.S) must use -fno-lto, but C++ benefits from LTO
+    # We skip CheckIPOSupported because it doesn't use our -fuse-ld=lld flag
+    message(STATUS "Secp256k1: LTO check - SECP256K1_USE_LTO=${SECP256K1_USE_LTO}, Compiler=${CMAKE_CXX_COMPILER_ID}")
+
+    if(SECP256K1_USE_LTO)
+        if(SECP256K1_BUILD_CUDA)
+            # CUDA device-link objects carry nvcc LTO bytecode (e.g. v12.0)
+            # which is incompatible with the host compiler's LTO version
+            # (e.g. GCC v14.0).  INTERFACE -flto propagation would poison
+            # every downstream target that transitively links CUDA libs.
+            # Compile the library with fat LTO objects (usable without LTO
+            # at link time) but do NOT propagate -flto to consumers.
+            if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+                target_compile_options(${SECP256K1_LIB_NAME} PRIVATE
+                    $<$<COMPILE_LANGUAGE:CXX>:-flto=thin>)
+                message(STATUS "Secp256k1: LTO compile-only (ThinLTO, CUDA build -- no INTERFACE propagation)")
+            elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+                target_compile_options(${SECP256K1_LIB_NAME} PRIVATE
+                    $<$<COMPILE_LANGUAGE:CXX>:-flto -ffat-lto-objects>)
+                message(STATUS "Secp256k1: LTO compile-only (GCC fat objects, CUDA build -- no INTERFACE propagation)")
+            endif()
+        elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+            # Clang ThinLTO -- only for C++ sources, NOT assembly (.S).
+            # Use a generator expression to exclude ASM files, because
+            # CMake may invoke the system assembler (GCC cc1) which does
+            # not understand -flto=thin and fails with an error.
+            target_compile_options(${SECP256K1_LIB_NAME} PRIVATE
+                $<$<COMPILE_LANGUAGE:CXX>:-flto=thin>)
+
+            # Do not force lld on Apple/Android/Emscripten toolchains.
+            # - macOS/iOS clang may reject -fuse-ld=lld when ld64 is used.
+            # - Android NDK clang may already select lld and can reject explicit override.
+            # - Emscripten uses wasm-ld (bundled); -fuse-ld=lld picks system lld
+            #   which is absent, causing WASM link failures.
+            if(APPLE OR ANDROID OR EMSCRIPTEN)
+                target_link_options(${SECP256K1_LIB_NAME} INTERFACE -flto=thin)
+                message(STATUS "Secp256k1: OK LTO ENABLED (ThinLTO with Clang + platform default linker, INTERFACE propagated)")
+            else()
+                target_link_options(${SECP256K1_LIB_NAME} INTERFACE -flto=thin -fuse-ld=lld)
+                message(STATUS "Secp256k1: OK LTO ENABLED (ThinLTO with Clang + lld, INTERFACE propagated)")
+            endif()
+        elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+            target_compile_options(${SECP256K1_LIB_NAME} PRIVATE
+                $<$<COMPILE_LANGUAGE:CXX>:-flto -ffat-lto-objects>)
+            target_link_options(${SECP256K1_LIB_NAME} INTERFACE -flto)
+            message(STATUS "Secp256k1: OK LTO ENABLED (GCC LTO fat objects, INTERFACE propagated)")
+        else()
+            message(STATUS "Secp256k1: LTO not available for compiler ${CMAKE_CXX_COMPILER_ID}")
+        endif()
+    else()
+        message(STATUS "Secp256k1: LTO disabled (use -DSECP256K1_USE_LTO=ON to enable)")
+    endif()
+
+    # ========================================================================
+    # PGO (Profile-Guided Optimization) Support
+    # ========================================================================
+    # Usage:
+    #   1. Build with -DSECP256K1_USE_PGO_GEN=ON
+    #   2. Run representative workload (benchmark)
+    #   3. Rebuild with -DSECP256K1_USE_PGO_USE=ON
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        if(SECP256K1_USE_PGO_GEN)
+            message(STATUS "Secp256k1: PGO instrumentation enabled (generating profiles)")
+            if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+                target_compile_options(${SECP256K1_LIB_NAME} PRIVATE
+                    -fprofile-generate=${SECP256K1_PGO_PROFILE_DIR}
+                )
+                target_link_options(${SECP256K1_LIB_NAME} INTERFACE
+                    -fprofile-generate=${SECP256K1_PGO_PROFILE_DIR}
+                )
+            else()  # GCC
+                target_compile_options(${SECP256K1_LIB_NAME} PRIVATE
+                    -fprofile-generate -fprofile-dir=${SECP256K1_PGO_PROFILE_DIR}
+                )
+                target_link_options(${SECP256K1_LIB_NAME} INTERFACE
+                    -fprofile-generate
+                )
+            endif()
+        elseif(SECP256K1_USE_PGO_USE)
+            message(STATUS "Secp256k1: PGO optimization enabled (using profiles from ${SECP256K1_PGO_PROFILE_DIR})")
+            if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+                # Clang needs merged profile
+                set(PGO_PROFILE_FILE "${SECP256K1_PGO_PROFILE_DIR}/default.profdata")
+                if(EXISTS "${PGO_PROFILE_FILE}")
+                    target_compile_options(${SECP256K1_LIB_NAME} PRIVATE
+                        -fprofile-use=${PGO_PROFILE_FILE}
+                    )
+                else()
+                    message(WARNING "Secp256k1: PGO profile not found at ${PGO_PROFILE_FILE}")
+                    message(WARNING "  Run: llvm-profdata merge -o ${PGO_PROFILE_FILE} ${SECP256K1_PGO_PROFILE_DIR}/*.profraw")
+                endif()
+            else()  # GCC
+                target_compile_options(${SECP256K1_LIB_NAME} PRIVATE
+                    -fprofile-use -fprofile-dir=${SECP256K1_PGO_PROFILE_DIR}
+                    -fprofile-correction  # Handle missing data gracefully
+                )
+            endif()
+        endif()
+    elseif(MSVC)
+        if(SECP256K1_USE_PGO_GEN)
+            message(STATUS "Secp256k1: MSVC PGO instrumentation enabled")
+            target_compile_options(${SECP256K1_LIB_NAME} PRIVATE /GL)
+            target_link_options(${SECP256K1_LIB_NAME} PRIVATE /LTCG /GENPROFILE:PGD=${SECP256K1_PGO_PROFILE_DIR}/secp256k1.pgd)
+        elseif(SECP256K1_USE_PGO_USE)
+            set(PGO_PGD_FILE "${SECP256K1_PGO_PROFILE_DIR}/secp256k1.pgd")
+            if(EXISTS "${PGO_PGD_FILE}")
+                message(STATUS "Secp256k1: MSVC PGO optimization enabled (using ${PGO_PGD_FILE})")
+                target_compile_options(${SECP256K1_LIB_NAME} PRIVATE /GL)
+                target_link_options(${SECP256K1_LIB_NAME} PRIVATE /LTCG /USEPROFILE:PGD=${PGO_PGD_FILE})
+            else()
+                message(WARNING "Secp256k1: PGO profile not found at ${PGO_PGD_FILE}")
+            endif()
+        endif()
+    endif()
+
+    target_include_directories(${SECP256K1_LIB_NAME}
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../include>
+        $<BUILD_INTERFACE:${CMAKE_BINARY_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}  # For rdtsc.h and intrinsics.h
+)
+
+target_compile_features(${SECP256K1_LIB_NAME} PRIVATE cxx_std_20)
+
+# Set SOVERSION for shared library builds
+set_target_properties(${SECP256K1_LIB_NAME} PROPERTIES
+    VERSION   ${PROJECT_VERSION}
+    SOVERSION ${PROJECT_VERSION_MAJOR}
+)
+
+# Install target
+if(SECP256K1_INSTALL)
+    include(GNUInstallDirs)
+    install(TARGETS ${SECP256K1_LIB_NAME}
+        EXPORT secp256k1-fast-targets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+    install(EXPORT secp256k1-fast-targets
+        FILE secp256k1-fast-targets.cmake
+        NAMESPACE secp256k1::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/secp256k1-fast
+    )
+endif()
+target_compile_definitions(${SECP256K1_LIB_NAME}
+    PRIVATE
+        $<$<CONFIG:Release>:NDEBUG>    # Internal only — must not leak to consumers
+    PUBLIC
+        $<$<CXX_COMPILER_ID:MSVC>:SECP256K1_NO_INT128=1>  # MSVC has no __int128
+)
+
+# Platform CSPRNG libraries (ECIES + BIP-39) + CoreFoundation for NFKD on macOS
+if(WIN32)
+    target_link_libraries(${SECP256K1_LIB_NAME} PUBLIC bcrypt)
+elseif(APPLE)
+    find_library(SECURITY_FRAMEWORK Security REQUIRED)
+    find_library(COREFOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
+    target_link_libraries(${SECP256K1_LIB_NAME} PUBLIC ${SECURITY_FRAMEWORK}
+                                                        ${COREFOUNDATION_FRAMEWORK})
+endif()
+
+# Optional OpenMP support — OFF by default to preserve zero-dependency builds.
+# Enable with: cmake -DSECP256K1_ENABLE_OPENMP=ON
+# When ON, batch_scalar_mul_fixed_k parallelises chunk loop across OMP threads.
+option(SECP256K1_ENABLE_OPENMP "Enable OpenMP for batch parallel operations" OFF)
+if(SECP256K1_ENABLE_OPENMP
+   AND NOT DEFINED SECP256K1_PLATFORM_ESP32
+   AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+    # Prefer static OpenMP when doing static builds (cross-compile for Android etc.)
+    if(CMAKE_EXE_LINKER_FLAGS MATCHES "-static" OR BUILD_SHARED_LIBS STREQUAL "OFF")
+        set(OpenMP_gomp_LIBRARY "" CACHE STRING "" FORCE)
+        find_library(_GOMP_STATIC libgomp.a PATHS
+            /usr/lib/gcc-cross/${CMAKE_C_COMPILER_TARGET}/13
+            /usr/lib/gcc/${CMAKE_C_COMPILER_TARGET}/13
+            NO_DEFAULT_PATH)
+        if(_GOMP_STATIC)
+            set(OpenMP_gomp_LIBRARY "${_GOMP_STATIC}" CACHE STRING "" FORCE)
+        endif()
+    endif()
+    find_package(OpenMP REQUIRED)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(${SECP256K1_LIB_NAME} PUBLIC OpenMP::OpenMP_CXX)
+        message(STATUS "Secp256k1: OpenMP enabled (${OpenMP_CXX_VERSION})")
+    endif()
+else()
+    message(STATUS "Secp256k1: OpenMP disabled (pass -DSECP256K1_ENABLE_OPENMP=ON to enable)")
+endif()
+
+# Optional inline assembly support (x64 only)
+if(SECP256K1_HAS_ASM)
+    target_compile_definitions(${SECP256K1_LIB_NAME} 
+        PUBLIC SECP256K1_HAS_ASM=1
+        PRIVATE USE_INLINE_ASSEMBLY
+    )
+    message(STATUS "  -> field_mul: ~8ns (vs 27ns intrinsics, 40ns portable)")
+    message(STATUS "  -> field_square: ~7ns (vs 21ns intrinsics, 35ns portable)")
+    message(STATUS "  -> Expected K*Q: ~18-24 us (vs 66 us current)")
+endif()
+
+# Enable fast modular reduction on x86_64 (even without ASM, uses BMI2 intrinsics)
+if(SECP256K1_USE_FAST_REDUCTION AND _SECP_TARGET_ARCH MATCHES "x86_64|AMD64|X64")
+    target_compile_definitions(${SECP256K1_LIB_NAME} PUBLIC SECP256K1_USE_FAST_REDUCTION=1)
+    if(NOT SECP256K1_HAS_ASM)
+        message(STATUS "Secp256k1: Fast modular reduction enabled (x64 BMI2 intrinsics)")
+    endif()
+endif()
+
+# ============================================================================
+# Compiler Optimizations: Clang/GCC Primary (MSVC deprecated)
+# ============================================================================
+# Target: Maximum performance with Clang 17+ or GCC 11+
+# Platform: Windows (MinGW/LLVM-MinGW), Linux, macOS
+# Note: MSVC support removed - use Clang-cl if needed on Windows
+
+# Platform-specific architecture flags
+if(_SECP_TARGET_ARCH MATCHES "riscv64|RISCV64")
+    # RISC-V CPU tuning: -mcpu tells the compiler exact pipeline model for
+    # instruction scheduling. On SiFive U74 (in-order dual-issue), this alone
+    # gives 28-34% speedup on field/point operations by enabling U74-specific
+    # scheduling heuristics (MUL latency hiding, carry chain interleaving).
+    # Set SECP256K1_RISCV_MCPU to override (e.g. "sifive-p550" for OoO cores).
+    set(SECP256K1_RISCV_MCPU "" CACHE STRING "RISC-V -mcpu target (e.g. sifive-u74, sifive-p550). Auto-detected if empty.")
+
+    if(SECP256K1_RISCV_MCPU)
+        set(RISCV_MCPU "${SECP256K1_RISCV_MCPU}")
+    else()
+        # Auto-detect from /proc/cpuinfo: "uarch : sifive,u74-mc"
+        execute_process(
+            COMMAND grep -oP "uarch\\s*:\\s*sifive,\\K[^\\s]+" /proc/cpuinfo
+            OUTPUT_VARIABLE RISCV_UARCH_RAW
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if(RISCV_UARCH_RAW MATCHES "u74")
+            set(RISCV_MCPU "sifive-u74")
+        elseif(RISCV_UARCH_RAW MATCHES "u54")
+            set(RISCV_MCPU "sifive-u54")
+        elseif(RISCV_UARCH_RAW MATCHES "p550")
+            set(RISCV_MCPU "sifive-p550")
+        elseif(RISCV_UARCH_RAW MATCHES "p670")
+            set(RISCV_MCPU "sifive-p670")
+        else()
+            set(RISCV_MCPU "")
+        endif()
+    endif()
+
+    if(RISCV_MCPU)
+        # -mcpu implies -march + -mtune for the exact core.
+        # However, Clang's sifive-u74 model may NOT include Zba/Zbb by default
+        # even though JH7110 (Milk-V Mars) silicon has them. We need both:
+        #   -mcpu for pipeline scheduling + -march for enabling the right ISA extensions.
+        # Clang accepts both flags: -mcpu controls scheduling, -march controls ISA.
+        set(ARCH_FLAGS "-mcpu=${RISCV_MCPU} -march=rv64gc_zba_zbb")
+        message(STATUS "Secp256k1: RISC-V tuned for -mcpu=${RISCV_MCPU} + Zba/Zbb (pipeline-specific scheduling)")
+    else()
+        set(ARCH_FLAGS "-march=rv64gc_zba_zbb")
+        message(STATUS "Secp256k1: RISC-V generic -march=rv64gc_zba_zbb (no CPU-specific tuning)")
+    endif()
+elseif(_SECP_TARGET_ARCH MATCHES "aarch64|ARM64|arm64")
+    if(ANDROID)
+        # Android NDK: target Cortex-A76 specifically for optimal scheduling
+        # -mcpu=cortex-a76 implies armv8.2-a + crypto + lse + rdm + fp16
+        # This tells Clang the exact pipeline (3c MUL, 4c UMULH, 1/cycle)
+        # so it can interleave MUL/UMULH in __int128 field multiplications.
+        set(ARCH_FLAGS "-mcpu=cortex-a76")
+        message(STATUS "Secp256k1: Android ARM64 target (Cortex-A76 tuned + crypto + NEON)")
+    elseif(APPLE)
+        # Apple Silicon: AppleClang uses -mcpu implicitly, not -march
+        set(ARCH_FLAGS "")
+    else()
+        set(ARCH_FLAGS "-march=armv8-a+crypto")
+    endif()
+elseif(_SECP_TARGET_ARCH MATCHES "armv7|armeabi")
+    # Android ARMv7 (32-bit) -- no __int128, uses NO_INT128 fallback
+    set(ARCH_FLAGS "-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=softfp")
+    add_compile_definitions(SECP256K1_NO_INT128=1)
+    message(STATUS "Secp256k1: Android ARMv7 target (32-bit, no __int128)")
+elseif(_SECP_TARGET_ARCH MATCHES "x86_64|AMD64|X64")
+    if(ANDROID)
+        # Android x86_64 emulator -- no -march=native for cross-compile
+        set(ARCH_FLAGS "-march=x86-64 -msse4.2")
+        message(STATUS "Secp256k1: Android x86_64 target (emulator)")
+    elseif(APPLE AND CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" AND NOT CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|X64")
+        # macOS cross-compilation (ARM64 host -> single-arch x86_64 target)
+        set(ARCH_FLAGS "-march=x86-64-v3")
+        message(STATUS "Secp256k1: macOS cross-compile x86_64 target (AVX2+BMI2+FMA)")
+    elseif(SECP256K1_MARCH)
+        # Explicit arch level override from parent (e.g. CI: x86-64-v2)
+        set(ARCH_FLAGS "-march=${SECP256K1_MARCH}")
+    else()
+        set(ARCH_FLAGS "-march=native")
+    endif()
+elseif(_SECP_TARGET_ARCH MATCHES "i686|x86")
+    if(ANDROID)
+        set(ARCH_FLAGS "-march=i686 -msse3")
+        add_compile_definitions(SECP256K1_NO_INT128=1)
+        message(STATUS "Secp256k1: Android x86 target (32-bit emulator, no __int128)")
+    else()
+        set(ARCH_FLAGS "")
+    endif()
+else()
+    set(ARCH_FLAGS "")
+endif()
+
+# Detect sanitizer builds: when CMAKE_CXX_FLAGS contains -fsanitize=..., the
+# sanitizer infrastructure sets specific optimization levels (-O1) and frame
+# pointer flags (-fno-omit-frame-pointer) that MUST NOT be overridden.
+# Overriding them causes incorrect sanitizer behavior (ClusterFuzzLite, OSS-Fuzz).
+set(SECP256K1_SANITIZER_BUILD FALSE)
+if(CMAKE_CXX_FLAGS MATCHES "fsanitize=" OR CMAKE_C_FLAGS MATCHES "fsanitize=")
+    set(SECP256K1_SANITIZER_BUILD TRUE)
+    message(STATUS "Secp256k1: Sanitizer flags detected -- skipping aggressive optimization overrides")
+endif()
+
+# GCC/Clang optimization flags (skip on MSVC -- it uses /O2 /GL from top-level)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+if(SECP256K1_SANITIZER_BUILD)
+    # Sanitizer build: only add safe flags that don't conflict with sanitizer requirements.
+    # Optimization level and frame pointer policy are controlled by CMAKE_CXX_FLAGS.
+    target_compile_options(${SECP256K1_LIB_NAME} PRIVATE
+        "SHELL:${ARCH_FLAGS}"    # Platform-specific architecture
+        -fno-math-errno          # Don't set errno for math functions
+        -fno-trapping-math       # No FP exceptions
+        -ftree-vectorize         # Auto-vectorization
+    )
+else()
+    # Production build: maximum performance
+    # Base flags (always applied for optimized builds)
+    target_compile_options(${SECP256K1_LIB_NAME} PRIVATE
+        -O3                      # Maximum optimization
+        "SHELL:${ARCH_FLAGS}"    # Platform-specific architecture (SHELL: splits by whitespace)
+        # REMOVED: -ffast-math, -ffinite-math-only, -fno-signed-zeros (break point arithmetic!)
+        -fno-math-errno          # Don't set errno for math functions
+        -fno-trapping-math       # No FP exceptions
+        -funroll-loops           # Aggressive loop unrolling
+        -finline-functions       # Inline everything possible
+        $<$<PLATFORM_ID:Linux>:-fno-plt>  # No PLT (ELF/Linux only; skipped on macOS/Windows)
+        -ftree-vectorize         # Auto-vectorization (AVX2/SSE/NEON)
+        # Note: LTO is controlled separately by SECP256K1_USE_LTO option
+        # Do NOT add -fno-lto here -- it would override the LTO setting
+    )
+    # Speed-first flags: disable safety features for maximum throughput.
+    # Only applied when explicitly opted-in via -DSECP256K1_SPEED_FIRST=ON.
+    if(SECP256K1_SPEED_FIRST)
+        target_compile_options(${SECP256K1_LIB_NAME} PRIVATE
+            -fomit-frame-pointer     # Remove frame pointers for speed
+            -fno-stack-protector     # Disable stack canaries (no security)
+        )
+    endif()
+endif()
+# Propagate ARCH_FLAGS to consumers so their TU's also compile with -mcpu
+# (important for header-only / inline code and for ThinLTO codegen at link time)
+if(ARCH_FLAGS)
+    target_compile_options(${SECP256K1_LIB_NAME} INTERFACE "SHELL:${ARCH_FLAGS}")
+    # CRITICAL for ThinLTO: final code generation happens at link time.
+    # Without -mcpu in link options, the linker uses generic scheduling.
+    target_link_options(${SECP256K1_LIB_NAME} INTERFACE "SHELL:${ARCH_FLAGS}")
+endif()
+endif()
+
+# GCC-specific aggressive optimizations (not supported by Clang)
+# Skip under sanitizer builds -- these interact poorly with instrumentation.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND NOT SECP256K1_SANITIZER_BUILD)
+    target_compile_options(${SECP256K1_LIB_NAME} PRIVATE
+        -fipa-pta                # Aggressive inter-procedural pointer analysis
+        -fgcse-sm                # Store motion after GCSE
+        -fgcse-las               # Load-after-store elimination
+        -ftree-loop-im           # Loop invariant motion
+        -ftree-loop-ivcanon      # Induction variable canonicalization
+        -fivopts                 # Induction variable optimizations
+        -fvariable-expansion-in-unroller  # Variable expansion in unroller
+        -fpredictive-commoning   # Predictive commoning optimization
+        -fopt-info-vec-optimized # Report vectorization successes
+    )
+endif()
+
+# Special flags for field_asm.cpp (maximize BMI2/MULX utilization on x86)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+# -fno-rtti conflicts with -fsanitize=vptr (used by UBSan/ClusterFuzzLite).
+# Detect sanitizer presence and skip -fno-rtti when needed.
+set(_FIELD_ASM_NORTTI "-fno-rtti")
+if(CMAKE_CXX_FLAGS MATCHES "fsanitize=.*vptr" OR CMAKE_CXX_FLAGS MATCHES "fsanitize=undefined")
+    set(_FIELD_ASM_NORTTI "")
+endif()
+# Sanitizer builds: skip -O3 override, keep arch + safe flags.
+# -fno-exceptions is safe (field_asm has no exception code paths).
+if(SECP256K1_SANITIZER_BUILD)
+    if(_SECP_TARGET_ARCH MATCHES "x86_64|AMD64|X64")
+        set_source_files_properties(src/field_asm.cpp PROPERTIES
+            COMPILE_FLAGS "${ARCH_FLAGS} -mbmi2 -madx -mpopcnt -fno-exceptions ${_FIELD_ASM_NORTTI}"
+        )
+    else()
+        set_source_files_properties(src/field_asm.cpp PROPERTIES
+            COMPILE_FLAGS "${ARCH_FLAGS} -fno-exceptions ${_FIELD_ASM_NORTTI}"
+        )
+    endif()
+else()
+    if(_SECP_TARGET_ARCH MATCHES "x86_64|AMD64|X64")
+        set_source_files_properties(src/field_asm.cpp PROPERTIES 
+            COMPILE_FLAGS "-O3 ${ARCH_FLAGS} -mbmi2 -madx -mpopcnt -funroll-loops -ftree-vectorize -fno-exceptions ${_FIELD_ASM_NORTTI}"
+        )
+    else()
+        # ARM64/other: no BMI2/ADX, just standard optimization
+        set_source_files_properties(src/field_asm.cpp PROPERTIES 
+            COMPILE_FLAGS "-O3 ${ARCH_FLAGS} -funroll-loops -ftree-vectorize -fno-exceptions ${_FIELD_ASM_NORTTI}"
+        )
+    endif()
+endif()
+endif()
+
+# Aggressive optimization for critical hotspot files (GCC/Clang only)
+# Skip per-file -O3 under sanitizer builds to preserve sanitizer optimization level.
+if(NOT SECP256K1_SANITIZER_BUILD)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        set_source_files_properties(src/field.cpp PROPERTIES 
+            COMPILE_FLAGS "-O3 ${ARCH_FLAGS} -funroll-loops -ftree-vectorize -fipa-pta -fpredictive-commoning"
+        )
+        set_source_files_properties(src/point.cpp PROPERTIES 
+            COMPILE_FLAGS "-O3 ${ARCH_FLAGS} -funroll-loops -ftree-vectorize -fno-exceptions -fno-rtti -fipa-pta -fpredictive-commoning"
+        )
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        # Clang: no GCC-specific flags.
+        # point.cpp: -fno-exceptions/-fno-rtti removes exception tables and
+        # RTTI metadata, reducing code size.  field.cpp keeps exceptions
+        # (utility functions use throw for validation errors).
+        set_source_files_properties(src/field.cpp PROPERTIES 
+            COMPILE_FLAGS "-O3 ${ARCH_FLAGS} -funroll-loops -ftree-vectorize"
+        )
+        set_source_files_properties(src/point.cpp PROPERTIES 
+            COMPILE_FLAGS "-O3 ${ARCH_FLAGS} -funroll-loops -ftree-vectorize -fno-exceptions -fno-rtti"
+        )
+    endif()
+endif()
+# MSVC: uses /O2 /GL from top-level, no per-file overrides needed
+
+# Static linking for MinGW (portable executables without DLL dependencies)
+    if(MINGW)
+        target_link_options(${SECP256K1_LIB_NAME} INTERFACE
+            -static-libgcc
+            -static-libstdc++
+            -static
+        )
+    endif()
+endif()
+
+# =============================================================================
+# Benchmarks (only build if testing is enabled)
+# =============================================================================
+#
+# bench_unified   -- THE standard: full apple-to-apple vs libsecp256k1
+#                    (field, scalar, point, ECDSA, Schnorr, CT, batch)
+# bench_ct        -- CT layer overhead: fast:: vs ct:: comparison
+# bench_field_52  -- FE52 (5x52) vs FE64 (4x64) regression test
+# bench_field_26  -- FE26 (10x26) vs FE64 (4x64) -- 32-bit platform target
+#
+# All use benchmark_harness.hpp (RDTSC/chrono, IQR, thread pinning).
+# =============================================================================
+if(SECP256K1_BUILD_BENCH)
+    # CT (Constant-Time) layer benchmark -- fast:: vs ct:: overhead comparison
+    add_executable(bench_ct bench/bench_ct.cpp)
+    target_link_libraries(bench_ct PRIVATE ${SECP256K1_LIB_NAME})
+
+    # DLC oracle adaptor-signature benchmark (N outcomes, sign + verify + settle)
+    add_executable(bench_dlc bench/bench_dlc.cpp)
+    target_link_libraries(bench_dlc PRIVATE ${SECP256K1_LIB_NAME})
+
+    # Focused hot-path microbenchmarks for before/after optimization work
+    add_executable(bench_hotpaths bench/bench_hotpaths.cpp)
+    target_link_libraries(bench_hotpaths PRIVATE ${SECP256K1_LIB_NAME} ufsecp_shared)
+    # PERF-007: when the shim is present, include the MuSig shim bench section.
+    # The shim's secp256k1.h also pulls in secp256k1/ecdsa.hpp, so both the
+    # shim include dir and the CPU include dir must be on the search path.
+    if(SECP256K1_BUILD_SHIM)
+        target_include_directories(bench_hotpaths PRIVATE
+            ${CMAKE_SOURCE_DIR}/compat/libsecp256k1_shim/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_definitions(bench_hotpaths PRIVATE BENCH_HAS_MUSIG_SHIM=1)
+    endif()
+
+    # Field 5x52 vs 4x64 comparison (requires __uint128_t; skip on MSVC)
+    if(NOT (MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang"))
+        add_executable(bench_field_52 bench/bench_field_52.cpp)
+        target_link_libraries(bench_field_52 PRIVATE ${SECP256K1_LIB_NAME})
+    endif()
+
+    # Field 10x26 vs 4x64 comparison (32-bit / ESP32 target)
+    add_executable(bench_field_26 bench/bench_field_26.cpp)
+    target_link_libraries(bench_field_26 PRIVATE ${SECP256K1_LIB_NAME})
+
+    # k*P benchmark: scalar_mul vs scalar_mul_with_plan (BIP-352 bottleneck)
+    add_executable(bench_kP tests/bench_kP.cpp)
+    target_link_libraries(bench_kP PRIVATE ${SECP256K1_LIB_NAME})
+
+    # BIP-352 Silent Payments CPU pipeline benchmark (single-thread vs 16-thread)
+    add_executable(bench_bip352_cpu bench/bench_bip352_cpu.cpp)
+    target_link_libraries(bench_bip352_cpu PRIVATE ${SECP256K1_LIB_NAME})
+    if(UNIX)
+        target_link_libraries(bench_bip352_cpu PRIVATE pthread)
+    endif()
+
+    # BIP-324 benchmark (ChaCha20-Poly1305, HKDF, ElligatorSwift, session)
+    if(SECP256K1_BUILD_BIP324)
+        add_executable(bench_bip324 bench/bench_bip324.cpp)
+        target_link_libraries(bench_bip324 PRIVATE ${SECP256K1_LIB_NAME})
+
+        add_executable(bench_bip324_transport bench/bench_bip324_transport.cpp)
+        target_link_libraries(bench_bip324_transport PRIVATE ${SECP256K1_LIB_NAME})
+        if(UNIX)
+            target_link_libraries(bench_bip324_transport PRIVATE pthread)
+        endif()
+    endif()
+
+    # Unified Apple-to-Apple Benchmark (cross-platform, single binary)
+    # Requires libsecp256k1 source for side-by-side comparison
+    # CI can override: -DLIBSECP_SRC_DIR=/path/to/secp256k1/src
+    if(NOT DEFINED LIBSECP_SRC_DIR)
+        set(LIBSECP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../_research_repos/secp256k1/src")
+    endif()
+    # Normalize to forward-slashes (Windows backslash \a, \b etc. = CMake escape chars)
+    file(TO_CMAKE_PATH "${LIBSECP_SRC_DIR}" LIBSECP_SRC_DIR)
+    # Derive include root from src dir (one level up)
+    get_filename_component(_LIBSECP_ROOT "${LIBSECP_SRC_DIR}" DIRECTORY)
+    if(EXISTS "${LIBSECP_SRC_DIR}/secp256k1.c")
+        set(_BENCH_UNIFIED_LIBSECP_SOURCES
+            bench/libsecp_provider.c
+            ${LIBSECP_SRC_DIR}/precomputed_ecmult.c
+            ${LIBSECP_SRC_DIR}/precomputed_ecmult_gen.c
+        )
+        add_executable(bench_unified
+            bench/bench_unified.cpp
+            ${_BENCH_UNIFIED_LIBSECP_SOURCES}
+        )
+        target_include_directories(bench_unified PRIVATE
+            ${_LIBSECP_ROOT}/include
+            ${LIBSECP_SRC_DIR}
+        )
+        target_link_libraries(bench_unified PRIVATE ${SECP256K1_LIB_NAME})
+
+        # Quick Ultra-vs-libsecp comparison (~25s vs bench_unified ~5min).
+        # Runs only sign/verify for both libraries and prints a ratio table.
+        add_executable(bench_vs_libsecp
+            bench/bench_vs_libsecp.cpp
+            ${_BENCH_UNIFIED_LIBSECP_SOURCES}
+        )
+        target_include_directories(bench_vs_libsecp PRIVATE
+            ${_LIBSECP_ROOT}/include
+            ${LIBSECP_SRC_DIR}
+        )
+        target_link_libraries(bench_vs_libsecp PRIVATE ${SECP256K1_LIB_NAME})
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+            set_source_files_properties(${_BENCH_UNIFIED_LIBSECP_SOURCES} PROPERTIES
+                COMPILE_FLAGS "-Wno-error -Wno-conversion -Wno-sign-conversion -Wno-unused-function"
+            )
+        endif()
+
+        # The libsecp provider intentionally compiles upstream bitcoin-core
+        # internals in-tree for benchmark parity. Those upstream sources emit
+        # warnings under our stricter local flags, so keep them non-fatal even
+        # when CI enables a repo-wide -Werror build.
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+            set_source_files_properties(${_BENCH_UNIFIED_LIBSECP_SOURCES} PROPERTIES
+                COMPILE_FLAGS "-Wno-error -Wno-conversion -Wno-sign-conversion -Wno-unused-function"
+            )
+        endif()
+
+        # Optional: OpenSSL integration for multi-library comparison.
+        # Disable during cross-compilation to avoid accidentally binding host OpenSSL.
+        if(CMAKE_CROSSCOMPILING)
+            message(STATUS "bench_unified: cross-compiling -- OpenSSL comparison disabled")
+        else()
+            find_package(OpenSSL QUIET)
+            if(OpenSSL_FOUND)
+                target_compile_definitions(bench_unified PRIVATE BENCH_HAS_OPENSSL)
+                target_link_libraries(bench_unified PRIVATE OpenSSL::Crypto)
+                message(STATUS "bench_unified: OpenSSL ${OPENSSL_VERSION} enabled for comparison")
+            else()
+                message(STATUS "bench_unified: OpenSSL not found -- OpenSSL comparison disabled")
+            endif()
+        endif()
+    else()
+        message(STATUS "bench_unified: skipped (libsecp256k1 source not found at ${LIBSECP_SRC_DIR})")
+    endif()
+endif()
+
+# Tests -- unified test runner
+# Single binary runs library selftest + all test modules.
+# Usage: run_selftest [smoke|ci|stress] [seed_hex]
+if(BUILD_TESTING)
+    add_executable(run_selftest
+        tests/run_selftest.cpp
+        tests/test_large_scalar_multiplication.cpp
+        tests/test_mul.cpp
+        tests/test_arithmetic_correctness.cpp
+        tests/test_ct.cpp
+        tests/test_ct_equivalence.cpp
+        tests/test_ecdsa_schnorr.cpp
+        tests/test_multiscalar_batch.cpp
+        tests/test_bip32.cpp
+        tests/test_bip32_vectors.cpp
+        tests/test_bip39.cpp
+        tests/test_musig2.cpp
+        tests/test_ecdh_recovery_taproot.cpp
+        tests/test_edge_cases.cpp
+        tests/test_v4_features.cpp
+        tests/test_coins.cpp
+        tests/test_batch_add_affine.cpp
+        tests/test_hash_accel.cpp
+        tests/test_exhaustive.cpp
+        tests/test_comprehensive.cpp
+        tests/test_bip340_vectors.cpp
+        tests/test_rfc6979_vectors.cpp
+        tests/test_ecc_properties.cpp
+        tests/test_ecies.cpp
+        tests/test_sha.cpp
+        tests/test_perf_schnorr_correctness.cpp
+    )
+    target_link_libraries(run_selftest PRIVATE ${SECP256K1_LIB_NAME})
+
+    # CT scalar_mul uses large stack (precomputed table + complete addition locals)
+    if(MSVC OR (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND WIN32))
+        target_link_options(run_selftest PRIVATE "LINKER:/STACK:8388608")
+    endif()
+
+    add_test(NAME selftest COMMAND run_selftest)
+
+    # Standalone affine batch add test (independent of full test runner)
+    add_executable(test_batch_add_affine_standalone
+        tests/test_batch_add_affine.cpp
+    )
+    target_link_libraries(test_batch_add_affine_standalone PRIVATE ${SECP256K1_LIB_NAME})
+    target_compile_definitions(test_batch_add_affine_standalone PRIVATE STANDALONE_TEST)
+    add_test(NAME batch_add_affine COMMAND test_batch_add_affine_standalone)
+
+    # Standalone hash accel test
+    add_executable(test_hash_accel_standalone
+        tests/test_hash_accel.cpp
+    )
+    target_link_libraries(test_hash_accel_standalone PRIVATE ${SECP256K1_LIB_NAME})
+    target_compile_definitions(test_hash_accel_standalone PRIVATE STANDALONE_TEST)
+    add_test(NAME hash_accel COMMAND test_hash_accel_standalone)
+    # ADVISORY_SKIP_CODE 77 = SHA-NI not detectable on this host (AMD pre-Zen,
+    # MSan instrumentation that hides cpuid, etc.). The test still validates
+    # all 679 scalar/ARM-SHA paths — only the SHA-NI cross-check is skipped.
+    set_tests_properties(hash_accel PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Standalone 5x52 field test (requires __uint128_t; skip on MSVC)
+    if(NOT (MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang"))
+        add_executable(test_field_52_standalone
+            tests/test_field_52.cpp
+        )
+        target_link_libraries(test_field_52_standalone PRIVATE ${SECP256K1_LIB_NAME})
+        target_compile_definitions(test_field_52_standalone PRIVATE STANDALONE_TEST)
+        add_test(NAME field_52 COMMAND test_field_52_standalone)
+    endif()
+
+    # Standalone 10x26 field test
+    add_executable(test_field_26_standalone
+        tests/test_field_26.cpp
+    )
+    target_link_libraries(test_field_26_standalone PRIVATE ${SECP256K1_LIB_NAME})
+    target_compile_definitions(test_field_26_standalone PRIVATE STANDALONE_TEST)
+    add_test(NAME field_26 COMMAND test_field_26_standalone)
+
+    # Standalone exhaustive algebraic verification test
+    add_executable(test_exhaustive_standalone
+        tests/test_exhaustive.cpp
+    )
+    target_link_libraries(test_exhaustive_standalone PRIVATE ${SECP256K1_LIB_NAME})
+    target_compile_definitions(test_exhaustive_standalone PRIVATE STANDALONE_TEST)
+    if(MSVC OR (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND WIN32))
+        target_link_options(test_exhaustive_standalone PRIVATE "LINKER:/STACK:8388608")
+    endif()
+    add_test(NAME exhaustive COMMAND test_exhaustive_standalone)
+
+    # Standalone comprehensive test (500+ checks across all categories)
+    add_executable(test_comprehensive_standalone
+        tests/test_comprehensive.cpp
+    )
+    target_link_libraries(test_comprehensive_standalone PRIVATE ${SECP256K1_LIB_NAME})
+    target_compile_definitions(test_comprehensive_standalone PRIVATE STANDALONE_TEST)
+    if(MSVC OR (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND WIN32))
+        target_link_options(test_comprehensive_standalone PRIVATE "LINKER:/STACK:8388608")
+    endif()
+    add_test(NAME comprehensive COMMAND test_comprehensive_standalone)
+
+    # Standalone BIP-340 official test vectors
+    add_executable(test_bip340_vectors_standalone
+        tests/test_bip340_vectors.cpp
+    )
+    target_link_libraries(test_bip340_vectors_standalone PRIVATE ${SECP256K1_LIB_NAME})
+    target_compile_definitions(test_bip340_vectors_standalone PRIVATE STANDALONE_TEST)
+    add_test(NAME bip340_vectors COMMAND test_bip340_vectors_standalone)
+
+    # Standalone BIP-340 strict encoding tests (non-canonical rejection)
+    add_executable(test_bip340_strict_standalone
+        tests/test_bip340_strict.cpp
+    )
+    target_link_libraries(test_bip340_strict_standalone PRIVATE ${SECP256K1_LIB_NAME})
+    target_compile_definitions(test_bip340_strict_standalone PRIVATE STANDALONE_TEST)
+    add_test(NAME bip340_strict COMMAND test_bip340_strict_standalone)
+
+    # Standalone BIP-32 official test vectors (TV1-TV5)
+    add_executable(test_bip32_vectors_standalone
+        tests/test_bip32_vectors.cpp
+    )
+    target_link_libraries(test_bip32_vectors_standalone PRIVATE ${SECP256K1_LIB_NAME})
+    target_compile_definitions(test_bip32_vectors_standalone PRIVATE STANDALONE_TEST)
+    add_test(NAME bip32_vectors COMMAND test_bip32_vectors_standalone)
+
+    # Standalone BIP-39 mnemonic seed phrase tests
+    add_executable(test_bip39_standalone
+        tests/test_bip39.cpp
+    )
+    target_link_libraries(test_bip39_standalone PRIVATE ${SECP256K1_LIB_NAME})
+    target_compile_definitions(test_bip39_standalone PRIVATE STANDALONE_TEST)
+    add_test(NAME bip39 COMMAND test_bip39_standalone)
+
+    # Standalone RFC 6979 ECDSA test vectors
+    add_executable(test_rfc6979_vectors_standalone
+        tests/test_rfc6979_vectors.cpp
+    )
+    target_link_libraries(test_rfc6979_vectors_standalone PRIVATE ${SECP256K1_LIB_NAME})
+    target_compile_definitions(test_rfc6979_vectors_standalone PRIVATE STANDALONE_TEST)
+    add_test(NAME rfc6979_vectors COMMAND test_rfc6979_vectors_standalone)
+
+    # Standalone ECC property-based algebraic invariant tests
+    add_executable(test_ecc_properties_standalone
+        tests/test_ecc_properties.cpp
+    )
+    target_link_libraries(test_ecc_properties_standalone PRIVATE ${SECP256K1_LIB_NAME})
+    target_compile_definitions(test_ecc_properties_standalone PRIVATE STANDALONE_TEST)
+    if(MSVC OR (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND WIN32))
+        target_link_options(test_ecc_properties_standalone PRIVATE "LINKER:/STACK:8388608")
+    endif()
+    add_test(NAME ecc_properties COMMAND test_ecc_properties_standalone)
+
+    # Point edge-case tests (infinity, Z=0 guards, roundtrip encoding)
+    add_executable(test_point_edge_cases_standalone
+        tests/test_point_edge_cases.cpp
+    )
+    target_link_libraries(test_point_edge_cases_standalone PRIVATE ${SECP256K1_LIB_NAME})
+    target_compile_definitions(test_point_edge_cases_standalone PRIVATE STANDALONE_TEST)
+    if(MSVC OR (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND WIN32))
+        target_link_options(test_point_edge_cases_standalone PRIVATE "LINKER:/STACK:8388608")
+    endif()
+    add_test(NAME point_edge_cases COMMAND test_point_edge_cases_standalone)
+
+    # Edge case & coverage gap tests (scalar zero, infinity arithmetic, BIP-32 IL>=n, cache corruption)
+    add_executable(test_edge_cases_standalone
+        tests/test_edge_cases.cpp
+    )
+    target_link_libraries(test_edge_cases_standalone PRIVATE ${SECP256K1_LIB_NAME})
+    target_compile_definitions(test_edge_cases_standalone PRIVATE STANDALONE_TEST)
+    add_test(NAME edge_cases COMMAND test_edge_cases_standalone)
+
+    # -- Ethereum signing layer tests (conditional) ---------------------------
+    if(SECP256K1_BUILD_ETHEREUM)
+        # Add to run_selftest sources
+        target_sources(run_selftest PRIVATE tests/test_ethereum.cpp)
+
+        # Standalone Ethereum test
+        add_executable(test_ethereum_standalone
+            tests/test_ethereum.cpp
+        )
+        target_link_libraries(test_ethereum_standalone PRIVATE ${SECP256K1_LIB_NAME})
+        target_compile_definitions(test_ethereum_standalone PRIVATE STANDALONE_TEST)
+        add_test(NAME ethereum COMMAND test_ethereum_standalone)
+    endif()
+
+    # -- ZK Proof Layer tests (knowledge, DLEQ, Bulletproofs) --
+    target_sources(run_selftest PRIVATE tests/test_zk.cpp)
+    add_executable(test_zk_standalone tests/test_zk.cpp)
+    target_link_libraries(test_zk_standalone PRIVATE ${SECP256K1_LIB_NAME})
+    target_compile_definitions(test_zk_standalone PRIVATE STANDALONE_TEST)
+    add_test(NAME zk_proofs COMMAND test_zk_standalone)
+
+    # -- Unified Wallet API tests (always built, has internal Ethereum guards)
+    target_sources(run_selftest PRIVATE tests/test_wallet.cpp)
+    add_executable(test_wallet_standalone tests/test_wallet.cpp)
+    target_link_libraries(test_wallet_standalone PRIVATE ${SECP256K1_LIB_NAME})
+    target_compile_definitions(test_wallet_standalone PRIVATE STANDALONE_TEST)
+    add_test(NAME wallet COMMAND test_wallet_standalone)
+
+    # -- BIP-324 Transport tests (ChaCha20-Poly1305, ElligatorSwift, HKDF) --
+    if(SECP256K1_BUILD_BIP324)
+        target_sources(run_selftest PRIVATE tests/test_bip324.cpp)
+        add_executable(test_bip324_standalone tests/test_bip324.cpp)
+        target_link_libraries(test_bip324_standalone PRIVATE ${SECP256K1_LIB_NAME})
+        target_compile_definitions(test_bip324_standalone PRIVATE STANDALONE_TEST)
+        add_test(NAME bip324_transport COMMAND test_bip324_standalone)
+    endif()
+
+    # -- ECIES encrypt/decrypt standalone tests --
+    add_executable(test_ecies_standalone tests/test_ecies.cpp)
+    target_link_libraries(test_ecies_standalone PRIVATE ${SECP256K1_LIB_NAME})
+    target_compile_definitions(test_ecies_standalone PRIVATE STANDALONE_TEST)
+    add_test(NAME ecies COMMAND test_ecies_standalone)
+
+    # -- SHA-256 / SHA-512 NIST test vector standalone tests --
+    add_executable(test_sha_standalone tests/test_sha.cpp)
+    target_link_libraries(test_sha_standalone PRIVATE ${SECP256K1_LIB_NAME})
+    target_compile_definitions(test_sha_standalone PRIVATE STANDALONE_TEST)
+    add_test(NAME sha COMMAND test_sha_standalone)
+
+    # -- Schnorr hot-path correctness regression (PERF-001 / PERF-009) --
+    add_executable(test_perf_schnorr_correctness_standalone
+        tests/test_perf_schnorr_correctness.cpp
+    )
+    target_link_libraries(test_perf_schnorr_correctness_standalone PRIVATE ${SECP256K1_LIB_NAME})
+    target_compile_definitions(test_perf_schnorr_correctness_standalone PRIVATE STANDALONE_TEST)
+    add_test(NAME perf_schnorr_correctness COMMAND test_perf_schnorr_correctness_standalone)
+
+    # -- Cache directory API + no-config.ini regression --
+    # Verifies configure_fixed_base_auto() never creates a config.ini and that
+    # set_cache_directory() routes the fixed-base cache to a caller-supplied dir.
+    add_executable(test_cache_dir_api_standalone
+        tests/test_cache_dir_api.cpp
+    )
+    target_link_libraries(test_cache_dir_api_standalone PRIVATE ${SECP256K1_LIB_NAME})
+    target_compile_definitions(test_cache_dir_api_standalone PRIVATE STANDALONE_TEST)
+    add_test(NAME cache_dir_api COMMAND test_cache_dir_api_standalone)
+
+    # -- BIP-141/143/144 SegWit tests --
+    target_sources(run_selftest PRIVATE tests/test_bip141_143_144.cpp)
+    add_executable(test_bip141_143_144_standalone tests/test_bip141_143_144.cpp)
+    target_link_libraries(test_bip141_143_144_standalone PRIVATE ${SECP256K1_LIB_NAME})
+    target_compile_definitions(test_bip141_143_144_standalone PRIVATE STANDALONE_TEST)
+    add_test(NAME bip141_143_144 COMMAND test_bip141_143_144_standalone)
+
+    # -- BIP-342 Tapscript sighash tests --
+    target_sources(run_selftest PRIVATE tests/test_bip342.cpp)
+    add_executable(test_bip342_standalone tests/test_bip342.cpp)
+    target_link_libraries(test_bip342_standalone PRIVATE ${SECP256K1_LIB_NAME})
+    target_compile_definitions(test_bip342_standalone PRIVATE STANDALONE_TEST)
+    add_test(NAME bip342 COMMAND test_bip342_standalone)
+
+    # -- FFI C ABI coverage tests (Pedersen switch, ZK range, BIP-324) --
+    add_executable(test_ffi_coverage_standalone
+        tests/test_ffi_coverage.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/ufsecp_impl.cpp)
+    target_link_libraries(test_ffi_coverage_standalone PRIVATE ${SECP256K1_LIB_NAME})
+    target_include_directories(test_ffi_coverage_standalone PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include/ufsecp
+        ${CMAKE_BINARY_DIR}/include)
+    target_compile_definitions(test_ffi_coverage_standalone PRIVATE STANDALONE_TEST UFSECP_BUILDING)
+    add_test(NAME ffi_coverage COMMAND test_ffi_coverage_standalone)
+
+    # -- CTest labels for core library tests --------------------------------
+    # Label all core tests so they can be run as a group:
+    #   ctest --test-dir <build> -L core
+    set(CORE_TESTS
+        selftest batch_add_affine hash_accel
+        field_26 exhaustive comprehensive
+        bip340_vectors bip340_strict bip32_vectors
+        rfc6979_vectors ecc_properties point_edge_cases edge_cases
+    )
+    # field_52 only exists when __uint128_t is available (not plain MSVC)
+    if(NOT (MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang"))
+        list(APPEND CORE_TESTS field_52)
+    endif()
+    if(SECP256K1_BUILD_ETHEREUM)
+        list(APPEND CORE_TESTS ethereum)
+    endif()
+    list(APPEND CORE_TESTS wallet zk_proofs ecies sha bip141_143_144 bip342 ffi_coverage perf_schnorr_correctness)
+    set_tests_properties(${CORE_TESTS} PROPERTIES LABELS "core")
+
+    # -- Audit infrastructure lives in audit/ ------------------------------
+    # All audit-specific targets (unified_audit_runner, standalone CT/fuzz/
+    # differential/protocol tests) are defined in ../audit/CMakeLists.txt
+    # to keep the library source tree clean.
+
+endif()

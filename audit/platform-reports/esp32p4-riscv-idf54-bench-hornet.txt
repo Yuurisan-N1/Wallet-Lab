@@ -1,0 +1,223 @@
+Running integrity check... OK
+
+==========================================================================================
+  UltrafastSecp256k1 -- Bitcoin Consensus CPU Benchmark (Single Core)
+  Target:   Hornet Node (hornetnode.org)
+==========================================================================================
+
+  CPU:       ESP32-P4 (RISC-V, dual-core HP) @ 360 MHz
+  Cores:     2 (single-threaded benchmark)
+  Revision:  1.3
+  Free Heap: 479804 bytes
+  Compiler:  GCC 14.2.0
+  Arch:      RISC-V (32-bit, no __int128, no SIMD)
+  Library:   UltrafastSecp256k1 v3.22.0
+  Field:     10x26 (32-bit native)
+  Scalar:    10x26 limbs (uint32_t), Barrett reduction
+  Point mul: GLV endomorphism + wNAF (w=4)
+  Dual mul:  Shamir's trick (a*G + b*P)
+
+  Timer:    esp_timer (1 us resolution)
+  Method:   median of 3 runs, per-op warmup
+
++------------------------------------------+----------+----------+----------+
+| ECDSA (RFC 6979)                         |          |          |          |
++------------------------------------------+----------+----------+----------+
+| Operation                                |    ns/op |    us/op |  ops/sec |
++------------------------------------------+----------+----------+----------+
+| ecdsa_sign (deterministic nonce)         | 2588000.0 |  2588.00 |    386   |
+| ecdsa_verify (full)                      | 7527800.0 |  7527.80 |    133   |
++------------------------------------------+----------+----------+----------+
++------------------------------------------+----------+----------+----------+
+| Schnorr / BIP-340 (Taproot)              |          |          |          |
++------------------------------------------+----------+----------+----------+
+| Operation                                |    ns/op |    us/op |  ops/sec |
++------------------------------------------+----------+----------+----------+
+| schnorr_sign (pre-computed keypair)      | 2293200.0 |  2293.20 |    436   |
+| schnorr_sign (from raw privkey)          | 4555800.0 |  4555.80 |    220   |
+| schnorr_verify (x-only 32B pubkey)       | 8052000.0 |  8052.00 |    124   |
+| schnorr_verify (pre-parsed pubkey)       | 7453600.0 |  7453.60 |    134   |
++------------------------------------------+----------+----------+----------+
++------------------------------------------+----------+----------+----------+
+| Batch Verification (N=16)                |          |          |          |
++------------------------------------------+----------+----------+----------+
+| Operation                                |    ns/op |    us/op |  ops/sec |
++------------------------------------------+----------+----------+----------+
+| schnorr_batch_verify (per sig, N=16)     | 8053666.7 |  8053.67 |    124   |
+|   -> vs individual schnorr_verify        |    1.00x |          |          |
+| ecdsa_batch_verify (per sig, N=16)       | 7562604.2 |  7562.60 |    132   |
+|   -> vs individual ecdsa_verify          |    1.00x |          |          |
++------------------------------------------+----------+----------+----------+
++------------------------------------------+----------+----------+----------+
+| Key Generation                           |          |          |          |
++------------------------------------------+----------+----------+----------+
+| Operation                                |    ns/op |    us/op |  ops/sec |
++------------------------------------------+----------+----------+----------+
+| pubkey_create (k*G, GLV+wNAF)            | 2252800.0 |  2252.80 |    444   |
+| schnorr_keypair_create                   | 2259400.0 |  2259.40 |    443   |
++------------------------------------------+----------+----------+----------+
++------------------------------------------+----------+----------+----------+
+| Point Arithmetic (ECC core)              |          |          |          |
++------------------------------------------+----------+----------+----------+
+| Operation                                |    ns/op |    us/op |  ops/sec |
++------------------------------------------+----------+----------+----------+
+| k*P (arbitrary point, GLV+wNAF)          | 5255400.0 |  5255.40 |    190   |
+| a*G + b*P (Shamir dual mul)              | 7549800.0 |  7549.80 |    132   |
+| point_add (Jacobian mixed)               | 128805.0 |   128.81 |    7.8 k |
+| point_dbl (Jacobian)                     | 103670.0 |   103.67 |    9.6 k |
++------------------------------------------+----------+----------+----------+
++------------------------------------------+----------+----------+----------+
+| Field Arithmetic                         |          |          |          |
++------------------------------------------+----------+----------+----------+
+| Operation                                |    ns/op |    us/op |  ops/sec |
++------------------------------------------+----------+----------+----------+
+| field_mul                                |   2424.0 |     2.42 |  412.5 k |
+| field_sqr                                |   2220.0 |     2.22 |  450.5 k |
+| field_inv (Fermat, 256-bit exp)          |  73050.0 |    73.05 |   13.7 k |
+| field_add (mod p)                        |    318.0 |     0.32 |   3.14 M |
+| field_sub (mod p)                        |    436.0 |     0.44 |   2.29 M |
+| field_negate (mod p)                     |    212.0 |     0.21 |   4.72 M |
++------------------------------------------+----------+----------+----------+
++------------------------------------------+----------+----------+----------+
+| Scalar Arithmetic (mod n)                |          |          |          |
++------------------------------------------+----------+----------+----------+
+| Operation                                |    ns/op |    us/op |  ops/sec |
++------------------------------------------+----------+----------+----------+
+| scalar_mul (mod n)                       |   9840.0 |     9.84 |  101.6 k |
+| scalar_inv (mod n)                       |  73750.0 |    73.75 |   13.6 k |
+| scalar_add (mod n)                       |    332.0 |     0.33 |   3.01 M |
+| scalar_negate (mod n)                    |    306.0 |     0.31 |   3.27 M |
++------------------------------------------+----------+----------+----------+
++------------------------------------------+----------+----------+----------+
+| Serialization                            |          |          |          |
++------------------------------------------+----------+----------+----------+
+| Operation                                |    ns/op |    us/op |  ops/sec |
++------------------------------------------+----------+----------+----------+
+| pubkey_serialize (33B compressed)        |  82946.0 |    82.95 |   12.1 k |
+| ecdsa_sig_to_der (DER encode)            |   3946.0 |     3.95 |  253.4 k |
+| schnorr_sig_to_bytes (64B)               |   1122.0 |     1.12 |  891.3 k |
++------------------------------------------+----------+----------+----------+
++------------------------------------------+----------+----------+----------+
+| Constant-Time Signing (CT layer)         |          |          |          |
++------------------------------------------+----------+----------+----------+
+| Operation                                |    ns/op |    us/op |  ops/sec |
++------------------------------------------+----------+----------+----------+
+| ct::ecdsa_sign                           | 5675000.0 |  5675.00 |    176   |
+|   -> CT overhead vs fast::ecdsa_sign     |    2.19x |          |          |
+| ct::schnorr_sign                         | 2527600.0 |  2527.60 |    396   |
+|   -> CT overhead vs fast::schnorr_sign   |    1.10x |          |          |
++------------------------------------------+----------+----------+----------+
+
+==========================================================================================
+  libsecp256k1 (bitcoin-core) -- Same Harness, Same Hardware
+==========================================================================================
+
+
++----------------------------------------------+------------+
+| libsecp256k1 (bitcoin-core v0.7.2)           |      ns/op |
+| ECMULT_WINDOW=2, COMB 11x6                   |            |
++----------------------------------------------+------------+
+| generator_mul (ec_pubkey_create)             |  2127000.0 |
+| ecdsa_sign                                   |  2522800.0 |
+| ecdsa_verify                                 |  7455000.0 |
+| schnorr_keypair_create                       |  2127800.0 |
+| schnorr_sign (BIP-340)                       |  2211200.0 |
+| schnorr_verify (BIP-340)                     |  7469800.0 |
++----------------------------------------------+------------+
+
+==========================================================================================
+  APPLE-TO-APPLE: UltrafastSecp256k1 / libsecp256k1
+  (ratio > 1.0 = Ultra wins, < 1.0 = libsecp256k1 wins)
+==========================================================================================
+
++----------------------------------------------+------------+
+| FAST path (Ultra FAST vs libsecp)            |      ratio |
++----------------------------------------------+------------+
+| Generator * k                                |      0.94x |
+| ECDSA Sign                                   |      0.97x |
+| ECDSA Verify                                 |      0.99x |
+| Schnorr Keypair                              |      0.94x |
+| Schnorr Sign                                 |      0.96x |
+| Schnorr Verify                               |      0.93x |
++----------------------------------------------+------------+
+
++----------------------------------------------+------------+
+| CT-vs-CT (Ultra CT vs libsecp CT-equivalent) |      ratio |
++----------------------------------------------+------------+
+| ECDSA Sign (CT vs CT)                        |      0.44x |
+| ECDSA Verify                                 |      0.99x |
+| Schnorr Sign (CT vs CT)                      |      0.87x |
+| Schnorr Verify                               |      0.93x |
++----------------------------------------------+------------+
+
+==========================================================================================
+  THROUGHPUT SUMMARY (1 core)
+==========================================================================================
+
+  --- Bitcoin Consensus Critical Path ---
+  ECDSA sign (RFC 6979)                       2588.00 us  ->       386   op/s
+  ECDSA verify                                7527.80 us  ->       133   op/s
+  Schnorr sign (BIP-340, keypair)             2293.20 us  ->       436   op/s
+  Schnorr verify (x-only)                     8052.00 us  ->       124   op/s
+  Schnorr verify (cached pubkey)              7453.60 us  ->       134   op/s
+
+  --- Batch Verification (N=16) ---
+  ECDSA batch (per sig)                       7562.60 us  ->       132   op/s
+  Schnorr batch (per sig)                     8053.67 us  ->       124   op/s
+
+  --- Key / Point Operations ---
+  pubkey_create (k*G)                         2252.80 us  ->       444   op/s
+  scalar_mul (k*P)                            5255.40 us  ->       190   op/s
+  dual_mul (a*G+b*P, Shamir)                  7549.80 us  ->       132   op/s
+  point_add                                    128.81 us  ->       7.8 k op/s
+  point_dbl                                    103.67 us  ->       9.6 k op/s
+
+  --- Field / Scalar Primitives ---
+  field_mul                                      2.42 us  ->     412.5 k op/s
+  field_sqr                                      2.22 us  ->     450.5 k op/s
+  field_inv                                     73.05 us  ->      13.7 k op/s
+  field_add                                      0.32 us  ->      3.14 M op/s
+  scalar_mul                                     9.84 us  ->     101.6 k op/s
+  scalar_inv                                    73.75 us  ->      13.6 k op/s
+
+==========================================================================================
+  BITCOIN BLOCK VALIDATION ESTIMATES (1 core, ESP32-P4 (RISC-V, dual-core HP) @ 360 MHz)
+==========================================================================================
+
+  Pre-Taproot block (~3000 ECDSA verify):
+    Individual:    22583.4 ms
+    Batch (N=16): 22687.8 ms
+
+  Taproot block (~2000 Schnorr + ~1000 ECDSA):
+    Individual:    23631.8 ms
+    Batch (N=16): 23669.9 ms
+
+  Transaction throughput (1-input txs, 1 core):
+    ECDSA txs:         133 tx/sec
+    Schnorr txs:       124 tx/sec
+
+  Blocks/sec throughput (sig verify only, 1 core):
+    Pre-Taproot:    0.04 blocks/sec
+    Taproot:        0.04 blocks/sec
+
+==========================================================================================
+  NOTES
+==========================================================================================
+
+  - All measurements: single-threaded, single core
+  - Timer: esp_timer (1 us resolution)
+  - Each operation: warmup + median of 3 runs
+  - Pool: 16 independent key/msg/sig sets
+  - CT layer: constant-time signing (side-channel resistant)
+  - FAST layer: maximum throughput (no side-channel guarantees)
+  - Batch verify uses Strauss multi-scalar multiplication
+  - ECDSA verify = Shamir dual-mul (a*G + b*P) + field inversion
+  - Schnorr verify = tagged hash + lift_x + dual-mul
+  - GLV endomorphism: 2x speedup on scalar mul via lambda splitting
+  - libsecp256k1 comparison: same key, same hardware, same compiler
+
+==========================================================================================
+  ESP32-P4 (RISC-V, dual-core HP) @ 360 MHz | 1 core | GCC 14.2.0 | UltrafastSecp256k1 v3.22.0
+==========================================================================================
+
+BENCH_HORNET_COMPLETE

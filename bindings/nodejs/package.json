@@ -1,0 +1,56 @@
+{
+  "name": "ultrafast-secp256k1",
+  "version": "0.0.0-dev",
+  "description": "Node.js bindings for UltrafastSecp256k1 \u2014 high-performance secp256k1 ECDSA, Schnorr, FROST, MuSig2, BIP-352 with GPU acceleration (version overridden at release time by CI from git tag)",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "files": [
+    "lib/",
+    "binding.gyp",
+    "src/",
+    "README.md"
+  ],
+  "scripts": {
+    "install": "node-gyp rebuild",
+    "build": "node-gyp rebuild",
+    "test": "node test/test.js"
+  },
+  "dependencies": {
+    "ffi-napi": "^4.0.3",
+    "koffi": "^2.15.2",
+    "node-addon-api": "^8.5.0",
+    "node-gyp": "^12.2.0",
+    "ref-napi": "^3.0.3"
+  },
+  "keywords": [
+    "secp256k1",
+    "ecdsa",
+    "schnorr",
+    "bitcoin",
+    "ethereum",
+    "cryptography",
+    "elliptic-curve",
+    "bip-340",
+    "taproot",
+    "bip-352",
+    "frost",
+    "musig2",
+    "gpu",
+    "cuda",
+    "signing",
+    "verification",
+    "wallet",
+    "constant-time",
+    "threshold-signatures",
+    "silent-payments"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/shrec/UltrafastSecp256k1",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shrec/UltrafastSecp256k1.git"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

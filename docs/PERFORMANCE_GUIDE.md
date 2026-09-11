@@ -1,0 +1,398 @@
+# Performance Guide
+
+Practical tuning recommendations for UltrafastSecp256k1 across platforms.
+
+---
+
+## Table of Contents
+
+1. [Quick Summary](#quick-summary)
+2. [Compiler Selection](#compiler-selection)
+3. [Assembly Backend](#assembly-backend)
+4. [Build Type & Flags](#build-type--flags)
+5. [Batch Operations](#batch-operations)
+6. [GPU Acceleration](#gpu-acceleration)
+7. [Memory & Cache](#memory--cache)
+8. [Platform-Specific Tuning](#platform-specific-tuning)
+9. [Constant-Time Cost](#constant-time-cost)
+10. [Profiling Guide](#profiling-guide)
+
+---
+
+## Quick Summary
+
+| Tuning | Impact | Effort |
+|--------|--------|--------|
+| Use Clang 17+ (LTO) | 10-20% speedup | Low |
+| Enable ASM (`SECP256K1_USE_ASM=ON`) | 2-5x on field ops | Low |
+| Use batch inverse for bulk ops | 10-50x for N>100 | Medium |
+| GPU batch for >10K operations | 100-1000x throughput | High |
+| Precomputed tables (gen_mul) | 20x vs generic mul | Zero (default) |
+
+---
+
+## Compiler Selection
+
+### Recommended
+
+| Platform | Compiler | Notes |
+|----------|----------|-------|
+| Linux | Clang 17+ (with lld) | Best codegen for x86-64 + ARM64 |
+| macOS | Apple Clang 15+ | Native ARM64 codegen |
+| Windows | Clang-cl 17+ or MSVC 19.40+ | Clang preferred for vectorization |
+| Embedded | GCC 13+ | Best for RISC-V, ARM Cortex-M |
+
+### LTO (Link-Time Optimization)
+
+```bash
+cmake -S . -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON
+```
+
+LTO gives 10-20% speedup through cross-module inlining. The library's hot path
+functions (`field_mul`, `scalar_mul`, `point_add`) benefit significantly.
+
+**Warning**: Do NOT use LTO with CUDA targets. The release build explicitly
+disables IPO for `gpu_cuda_test` to avoid `nvcc -dlink` failures.
+
+---
+
+## Assembly Backend
+
+### x86-64 (BMI2/ADX)
+
+The assembly backend provides optimized `mulx`/`adcx`/`adox` sequences for field
+multiplication and squaring. This is the default on x86-64.
+
+```bash
+# Explicitly enable (usually auto-detected)
+-DSECP256K1_USE_ASM=ON
+```
+
+| Operation | C++ Generic | x86-64 ASM | Speedup |
+|-----------|------------|------------|---------|
+| Field Mul | 85 ns | 17 ns | 5.0x |
+| Field Square | 80 ns | 16 ns | 5.0x |
+| Field Inverse | 12 us | 5 us | 2.4x |
+
+### ARM64 (NEON)
+
+ARM64 uses `umulh`/`umaddl` instructions for field arithmetic.
+
+### RISC-V 64
+
+RISC-V uses custom `mulhu`/`mul` sequences. Enable with:
+
+```bash
+-DCMAKE_SYSTEM_PROCESSOR=riscv64 -DSECP256K1_USE_ASM=ON
+```
+
+---
+
+## Build Type & Flags
+
+### Production Build
+
+```bash
+cmake -S . -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSECP256K1_USE_ASM=ON \
+  -DSECP256K1_BUILD_BENCH=OFF \
+  -DSECP256K1_BUILD_TESTS=OFF \
+  -DSECP256K1_BUILD_EXAMPLES=OFF
+```
+
+### Speed-First Build (Unsafe Optimizations)
+
+```bash
+-DSECP256K1_SPEED_FIRST=ON
+```
+
+This enables aggressive optimizations including `-ffast-math` for non-crypto code
+paths. **Never use for cryptographic operations** -- only for search/batch workloads
+where IEEE 754 compliance is not required.
+
+---
+
+## Batch Operations
+
+### Batch Inverse (Montgomery's Trick)
+
+For `N` field inversions, batch inverse computes all `N` results with only one
+full inversion + `3(N-1)` multiplications:
+
+| N | Per-Element Cost | vs Individual |
+|---|-----------------|---------------|
+| 1 | 5,000 ns | 1.0x |
+| 10 | 500 ns | 10x |
+| 100 | 140 ns | 36x |
+| 1000 | 92 ns | 54x |
+| 8192 | 85 ns | 59x |
+
+**Usage**: All multi-point operations (batch verify, multi-scalar mul) use batch
+inverse automatically.
+
+### Multi-Scalar Multiplication
+
+For computing `sum(k_i * P_i)`:
+
+| Method | Time (10 points) | Time (100 points) |
+|--------|-----------------|-------------------|
+| Individual | 1,100 us | 11,000 us |
+| Multi-scalar (Straus) | 250 us | 1,800 us |
+| Multi-scalar (Pippenger) | -- | 900 us |
+
+Pippenger is automatically selected when `N >= 48` on the current optimized CPU path, with predecoded digits and bucket reuse to reduce scatter/aggregate overhead.
+
+---
+
+## GPU Acceleration
+
+### When to Use GPU
+
+GPU is beneficial for **embarrassingly parallel** workloads:
+
+| Workload | CPU (1 core) | GPU (RTX 5060 Ti) | Speedup |
+|----------|-------------|-------------------|---------|
+| 1 scalar mul | 25 us | 225 ns + launch overhead | Slower |
+| 1K scalar muls | 25 ms | 0.3 ms | 83x |
+| 1M scalar muls | 25 s | 0.25 s | 100x |
+| 4K ZK knowledge proofs | 99.7 ms | 1.08 ms | 92x |
+| 4K DLEQ proofs | 173.8 ms | 2.77 ms | 63x |
+
+**Rule of thumb**: GPU wins when batch size > 1,000 operations.
+
+### GPU Configuration
+
+```json
+{
+  "device_id": 0,
+  "threads_per_batch": 131072,
+  "batch_interval": 64,
+  "max_matches": 786432
+}
+```
+
+| Parameter | Recommended | Notes |
+|-----------|-------------|-------|
+| `threads_per_batch` | SM_count x 1024 | Fill all SMs |
+| `batch_interval` | 32-128 | Higher = more work per kernel |
+| `max_matches` | >= expected_matches x 2 | Pre-allocated result buffer |
+
+### GPU Backend Selection
+
+| Backend | Best For | Notes |
+|---------|----------|-------|
+| CUDA | NVIDIA GPUs | Fastest, most mature |
+| ROCm/HIP | AMD GPUs | API-compatible with CUDA |
+| OpenCL | Cross-vendor | Slightly slower than native |
+| Metal | Apple Silicon | macOS/iOS only |
+
+**Important**: GPU backends are **NOT constant-time**. Never process secret keys
+on GPU. See [docs/CT_VERIFICATION.md](CT_VERIFICATION.md).
+
+---
+
+## Memory & Cache
+
+### Hot Path Memory Model
+
+The library's hot path is **zero-allocation**:
+
+- No `malloc`/`new` in field/scalar/point operations
+- Pre-allocated scratch buffers via arena pattern
+- Thread-local scratch on CPU
+- Fixed-size POD types (no hidden copies)
+
+### Cache Optimization
+
+- **Generator mul precomputed table**: ~64 KB, fits in L1 cache on most CPUs
+- **Batch operations**: Sequential memory access pattern for cache friendliness
+- **GLV decomposition**: Splits 256-bit scalar mul into two 128-bit muls, reducing
+  table lookups by ~40%
+
+### GLV Window Width Tuning
+
+The GLV window width (`w`) controls the tradeoff between precomputation table size
+and the number of point additions during scalar multiplication (k*P):
+
+| Window | Table Entries | Adds per 128-bit half | Total Adds (approx) | Best For |
+|--------|--------------|----------------------|---------------------|----------|
+| w=4 | 4 | ~33 | ~66 | ESP32, WASM (tiny cache) |
+| w=5 | 8 | ~26 | ~52 | x86-64, ARM64, RISC-V (default) |
+| w=6 | 16 | ~21 | ~42 | Large L1 cache, diminishing returns |
+| w=7 | 32 | ~18 | ~36 | Rarely beneficial (table pressure) |
+
+**Platform defaults** (set in `src/cpu/include/secp256k1/point.hpp`):
+
+| Platform | Default | Rationale |
+|----------|---------|-----------|
+| x86-64 | w=5 | Large L1, fast mul -- balanced |
+| ARM64 | w=5 | Good cache, benefits from fewer adds |
+| RISC-V | w=5 | Closes gap with libsecp256k1 (w=4 was 0.98x, w=5 is 1.00x) |
+| ESP32 / WASM | w=4 | Small cache, table pressure outweighs add savings |
+
+**Override at build time** (CMake):
+```bash
+cmake -S . -B build -DSECP256K1_GLV_WINDOW_WIDTH=6
+```
+
+**Override at runtime** (per-call):
+```cpp
+auto plan = KPlan::from_scalar(k, 6);  // use w=6 for this call
+```
+
+**Measured k*P impact (w=4 vs w=5)**:
+
+| Platform | w=4 | w=5 | Change |
+|----------|-----|-----|--------|
+| RISC-V (SiFive U74) | 201.2 us | 197.7 us | -1.7% |
+| ARM64 (Cortex-A55) | 130.6 us | 129.5 us | -0.9% |
+| x86-64 (i5-14400F) | 16.7 us | 16.8 us | +0.9% |
+
+### ZK Proof Performance
+
+| Operation | Time | Throughput | Bottleneck |
+|-----------|------|------------|------------|
+| Pedersen Commit | 33 us | 30.3K op/s | Two scalar multiplications |
+| Knowledge Prove | 20 us | 49.3K op/s | CT nonce generation + scalar mul |
+| DLEQ Prove | 40 us | 25.0K op/s | Two CT scalar multiplications (both bases) |
+| Range Prove (64b) | 13.5 ms | 74 op/s | 128 scalar muls for vector commitments |
+| Range Verify (64b) | 2.6 ms | 380 op/s | 144-point MSM (Pippenger) |
+
+**Optimization tips:**
+- Range verification uses MSM (Pippenger) for 144 points -- batch multiple proofs with
+  `batch_range_verify()` for amortized verification cost.
+- Generator vectors are cached globally after first computation -- no repeated setup overhead.
+- Montgomery batch inversion in the verifier replaces 64 field inversions with 1 inversion
+  + 126 multiplications.
+
+### Stack Usage
+
+| Operation | Stack (approx) |
+|-----------|---------------|
+| Field mul | 128 bytes |
+| Scalar mul | 2 KB |
+| ECDSA sign | 4 KB |
+| FROST sign | 8 KB |
+| ZK Range prove | 12 KB |
+| ZK Range verify | 16 KB |
+| Multi-scalar (N=100) | 16 KB |
+
+Embedded targets (ESP32, STM32) should ensure sufficient stack allocation.
+The CMake build sets `/STACK:4194304` on Windows for test binaries.
+
+---
+
+## Platform-Specific Tuning
+
+### x86-64
+
+```bash
+# Maximum performance: Clang + LTO + native tuning
+cmake -S . -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+  -DSECP256K1_USE_ASM=ON
+```
+
+### ARM64 (Raspberry Pi 5, Apple Silicon)
+
+```bash
+# ARM64 auto-detects NEON; no special flags needed
+cmake -S . -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSECP256K1_USE_ASM=ON
+```
+
+### ESP32-S3
+
+```bash
+# Use ESP-IDF CMake integration
+idf.py set-target esp32s3
+idf.py build
+```
+
+Key constraint: 520 KB SRAM total. The library uses ~64 KB for precomputed tables.
+Disable unused protocol modules to save flash.
+
+### WASM (Emscripten)
+
+```bash
+emcmake cmake -S wasm -B build-wasm \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-wasm
+```
+
+WASM performance is typically 3-5x slower than native due to 64-bit integer
+emulation, but still competitive for client-side applications.
+
+---
+
+## Constant-Time Cost
+
+The `ct::` namespace provides timing-safe operations at a performance cost:
+
+| Operation | FAST path | CT path | Overhead |
+|-----------|-----------|---------|----------|
+| Scalar mul | 25 us | 150 us | 6.0x |
+| ECDSA sign | 30 us | 180 us | 6.0x |
+| Schnorr sign | 28 us | 170 us | 6.1x |
+| Field inverse | 5 us | 35 us | 7.0x |
+
+**When to use CT**: Always use `ct::` variants when processing private keys, nonces,
+or any secret-dependent data. The FAST path is only safe for public inputs.
+
+---
+
+## Profiling Guide
+
+### Quick Benchmark
+
+```bash
+cmake --build build --target bench_unified
+./build/cpu/bench_unified
+```
+
+### Targeted Profiling (Linux)
+
+```bash
+# perf stat for operation counts
+perf stat -e cycles,instructions,cache-misses ./build/cpu/bench_unified
+
+# perf record for flame graph
+perf record -g ./build/cpu/bench_unified
+perf script | stackcollapse-perf.pl | flamegraph.pl > flame.svg
+```
+
+### Targeted Profiling (Windows)
+
+```powershell
+# Use Visual Studio Profiler or Intel VTune
+# Build with debug info for symbol resolution
+cmake -S . -B build-profile -DCMAKE_BUILD_TYPE=RelWithDebInfo
+```
+
+### Key Metrics to Watch
+
+| Metric | Target | Red Flag |
+|--------|--------|----------|
+| Field mul | < 20 ns (x86-64 ASM) | > 50 ns |
+| Generator mul | < 6 us | > 15 us |
+| Scalar mul | < 30 us | > 80 us |
+| ECDSA sign | < 35 us | > 100 us |
+| ZK Knowledge prove | < 25 us | > 50 us |
+| ZK Range verify | < 3,000 us | > 6,000 us |
+| Cache miss rate | < 2% | > 10% |
+| Branch misprediction | < 1% | > 5% |
+
+---
+
+## See Also
+
+- [docs/BENCHMARKS.md](BENCHMARKS.md) -- Full benchmark results
+- [docs/BENCHMARK_METHODOLOGY.md](BENCHMARK_METHODOLOGY.md) -- How benchmarks are collected
+- [docs/CT_VERIFICATION.md](CT_VERIFICATION.md) -- Constant-time verification details
+- [PORTING.md](PORTING.md) -- Platform porting guide

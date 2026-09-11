@@ -1,0 +1,7 @@
+﻿# ESP-IDF Build Outputs
+build/
+sdkconfig.old
+dependencies.lock
+# CLion
+.idea/
+cmake-build-*/

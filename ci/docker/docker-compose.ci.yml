@@ -1,0 +1,140 @@
+# =============================================================================
+# docker-compose.ci.yml -- Local CI orchestration
+# =============================================================================
+# Usage:
+#   docker compose -f docker-compose.ci.yml run --rm pre-push   # Before git push
+#   docker compose -f docker-compose.ci.yml run --rm all         # Full CI suite
+#   docker compose -f docker-compose.ci.yml run --rm quick       # Quick smoke
+#   docker compose -f docker-compose.ci.yml run --rm audit       # Audit only
+#   docker compose -f docker-compose.ci.yml run --rm asan        # ASan only
+#
+# First run builds the image (~2 min), subsequent runs use cache.
+# ccache volume persists across runs for fast rebuilds.
+# =============================================================================
+
+services:
+  # -- Base CI image (shared by all targets) ----------------------------------
+  ci-base: &ci-base
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ci
+    volumes:
+      - .:/src
+      - ci-ccache:/ccache
+    working_dir: /src
+    environment:
+      - CCACHE_DIR=/ccache
+      - CCACHE_MAXSIZE=5G
+      - CCACHE_COMPRESS=1
+      - BENCH_MIN_RATIO=${BENCH_MIN_RATIO:-0.75}
+    tmpfs:
+      - /tmp:size=2G
+
+  # -- Targets (one per CI job group) -----------------------------------------
+  pre-push:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "pre-push"]
+
+  all:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "all"]
+
+  quick:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "quick"]
+
+  audit:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "audit"]
+
+  linux-gcc:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "linux-gcc"]
+
+  linux-clang:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "linux-clang"]
+
+  asan:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "sanitizers"]
+
+  tsan:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "tsan"]
+
+  msan:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "msan"]
+
+  valgrind:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "valgrind"]
+
+  wasm:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "wasm"]
+
+  arm64:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "arm64"]
+
+  coverage:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "coverage"]
+
+  clang-tidy:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "clang-tidy"]
+
+  cppcheck:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "cppcheck"]
+
+  ct-verif:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "ct-verif"]
+
+  bench-regression:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "bench-regression"]
+
+  gh-parity:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "gh-parity"]
+
+  strict-audit:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "strict-audit"]
+
+  strict-perf:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "strict-perf"]
+
+  no-surprise:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "no-surprise"]
+
+  dev-gate:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "dev-gate"]
+
+  main-gate:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "main-gate"]
+
+  branch-gate:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "branch-gate"]
+
+  x86-full:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "x86-full"]
+
+  warnings:
+    <<: *ci-base
+    command: ["./docker/run_ci.sh", "warnings"]
+
+volumes:
+  ci-ccache:
+    name: ufsecp-ci-ccache

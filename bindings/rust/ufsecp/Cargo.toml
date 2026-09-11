@@ -1,0 +1,16 @@
+[package]
+name = "ufsecp"
+version = "0.0.0-dev"
+edition = "2021"
+license = "MIT"
+description = "Safe Rust wrapper for UltrafastSecp256k1 (ufsecp C ABI)"
+repository = "https://github.com/shrec/UltrafastSecp256k1"
+
+[dependencies]
+ufsecp-sys = { path = "../ufsecp-sys", version = "0.0.0-dev" }
+
+[dev-dependencies]
+hex = "0.4"
+
+[features]
+default = []

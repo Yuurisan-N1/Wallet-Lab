@@ -1,0 +1,118 @@
+name: ClusterFuzzLite
+
+on:
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: 'Fuzz duration per target in seconds'
+        required: false
+        default: '600'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── PR fuzzing (short run, catch regressions) ────────────────────────────
+  pr-fuzzing:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      security-events: write  # for SARIF upload if crashes found
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, undefined]
+    name: "CFL PR (${{ matrix.sanitizer }})"
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Build fuzzers
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@52ecc61cb587ee99c26825a112a21abf19c7448c # v1
+        with:
+          language: c++
+          sanitizer: ${{ matrix.sanitizer }}
+
+      - name: Run fuzzers (120s per target)
+        id: run
+        uses: google/clusterfuzzlite/actions/run_fuzzers@52ecc61cb587ee99c26825a112a21abf19c7448c # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 120
+          mode: code-change
+          sanitizer: ${{ matrix.sanitizer }}
+
+  # ── Batch fuzzing (nightly, extended corpus exploration) ──────────────────
+  batch-fuzzing:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      security-events: write  # for SARIF upload if crashes found
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, undefined]
+    name: "CFL Batch (${{ matrix.sanitizer }})"
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Build fuzzers
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@52ecc61cb587ee99c26825a112a21abf19c7448c # v1
+        with:
+          language: c++
+          sanitizer: ${{ matrix.sanitizer }}
+
+      - name: Run fuzzers (extended)
+        id: run
+        uses: google/clusterfuzzlite/actions/run_fuzzers@52ecc61cb587ee99c26825a112a21abf19c7448c # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: ${{ github.event.inputs.fuzz_seconds || '600' }}
+          mode: batch
+          sanitizer: ${{ matrix.sanitizer }}
+
+  # ── Corpus pruning (weekly, keep corpus lean) ────────────────────────────
+  prune-corpus:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    permissions:
+      security-events: write  # for SARIF upload if crashes found
+    needs: batch-fuzzing
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Build fuzzers
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@52ecc61cb587ee99c26825a112a21abf19c7448c # v1
+        with:
+          language: c++
+          sanitizer: address
+
+      - name: Prune corpus
+        id: prune
+        uses: google/clusterfuzzlite/actions/run_fuzzers@52ecc61cb587ee99c26825a112a21abf19c7448c # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 60
+          mode: prune
+          sanitizer: address

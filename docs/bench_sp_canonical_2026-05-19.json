@@ -1,0 +1,79 @@
+{
+  "_meta": {
+    "date": "2026-05-19",
+    "machine": "Intel Core i5-14400F (6P+10E), 16 threads",
+    "compiler": "g++ 14.2.0 -O3 -march=native -flto",
+    "cpu_governor": "performance",
+    "turbo": "enabled",
+    "taskset": "taskset -c 0-15",
+    "methodology": "spend_pubkey precomputed in constructor for all three. max_key_index=0 (1 output/tx). SilentPaymentScanner in isolated TU (sp_scanner.cpp) for equal LTO treatment.",
+    "ecdh": "variable-time GLV for all three (input pubkeys are public on-chain)",
+    "btc_api": "SilentPaymentScanner::scan_tx()",
+    "ltc_api": "LtcSpScanner::scan_tx()",
+    "bch_api": "RpaScanner::scan_tx(tx, 0)",
+    "bch_overhead": "BCH ~25% slower: ecdsa_pubkey_parse per tx + double-SHA256+outpoint hash structure",
+    "note_correction": "All turbo-ON: BTC=424k==LTC-SP=428k (same algo). Earlier 327/364k were turbo-OFF. Batch gain ~13-14% all three."
+  },
+  "results_turbo_on": {
+    "btc_bip352": {
+      "threads_1": 61873,
+      "threads_4": 236529,
+      "threads_8": 289394,
+      "threads_16": 423930,
+      "scan_batch_threads_16": 484382
+    },
+    "bch_rpa": {
+      "threads_1": 34500,
+      "threads_4": 127360,
+      "threads_8": 165812,
+      "threads_16": 252971,
+      "scan_batch_threads_16": 285002,
+      "scan_batch_note": "ecdsa_pubkey_parse per input (lift_x) not batchable + double-SHA256+outpoint"
+    },
+    "ltc_sp": {
+      "threads_1": 61429,
+      "threads_4": 230158,
+      "threads_8": 292999,
+      "threads_16": 428082,
+      "scan_batch_threads_16": 484004
+    }
+  },
+  "results_turbo_off": {
+    "btc_bip352": {
+      "threads_1": 17288,
+      "threads_4": 68239,
+      "threads_8": 80344,
+      "threads_16": 109771
+    },
+    "bch_rpa": {
+      "threads_1": 13943,
+      "threads_4": 51058,
+      "threads_8": 62917,
+      "threads_16": 89925
+    },
+    "ltc_sp": {
+      "threads_1": 29137,
+      "threads_4": 110968,
+      "threads_8": 125967,
+      "threads_16": 172019
+    }
+  },
+  "gpu_rtx5060ti": {
+    "btc_cuda_glv_M_tx_s": 5.36,
+    "btc_cuda_lut_M_tx_s": 10.98,
+    "ltc_cuda_glv_M_tx_s": 5.36,
+    "ltc_opencl_glv_M_tx_s": 5.38
+  },
+  "ltcsp_w18_cache": {
+    "cache_file": "cache_w18.bin",
+    "cache_size_mb": 244,
+    "loaded": true,
+    "threads_1": 137740,
+    "threads_16": 471550,
+    "vs_w8": {
+      "threads_1_delta": "+10%",
+      "threads_16_delta": "~parity (-0.2%)",
+      "note": "w=18 244MB blows out L3 (12MB i5-14400F) for multi-thread. Optimal for single-thread wallets; w=8 (1MB, fits L3) wins at 16 threads."
+    }
+  }
+}

@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = [
+    "ufsecp",
+    "ufsecp-sys",
+    "ultrafast-secp256k1",
+    "ultrafast-secp256k1-sys",
+]

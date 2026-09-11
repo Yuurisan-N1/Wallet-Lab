@@ -1,0 +1,27 @@
+{
+  "name": "ufsecp",
+  "version": "0.0.0-dev",
+  "description": "Node.js bindings for UltrafastSecp256k1 — high-performance secp256k1 ECC (ufsecp C ABI v1)",
+  "main": "lib/ufsecp.js",
+  "files": ["lib/ufsecp.js", "prebuilds/", "README.md"],
+  "scripts": {
+    "test": "node test/test.js"
+  },
+  "dependencies": {
+    "ffi-napi": "^4.0.3",
+    "ref-napi": "^3.0.3"
+  },
+  "keywords": [
+    "secp256k1", "ecdsa", "schnorr", "bitcoin", "cryptography",
+    "elliptic-curve", "taproot", "bip32", "ecdh", "ufsecp"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shrec/UltrafastSecp256k1"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "homepage": "https://github.com/shrec/UltrafastSecp256k1"
+}

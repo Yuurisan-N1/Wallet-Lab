@@ -1,0 +1,512 @@
+// ============================================================================
+// bench_hotpaths.cpp -- Focused benchmarks for optimization candidates
+// ============================================================================
+
+#include "secp256k1/address.hpp"
+#include "secp256k1/batch_verify.hpp"
+#include "secp256k1/benchmark_harness.hpp"
+#include "secp256k1/ecdsa.hpp"
+#include "secp256k1/point.hpp"
+#include "secp256k1/scalar.hpp"
+#include "ufsecp/ufsecp.h"
+
+// MuSig + Schnorr shim benchmarks (PERF-007/SHIM-007/PERF-008)
+// BENCH_HAS_MUSIG_SHIM is set by CMakeLists when SECP256K1_BUILD_SHIM is ON.
+#ifdef BENCH_HAS_MUSIG_SHIM
+#  include "secp256k1.h"
+#  include "secp256k1_extrakeys.h"
+#  include "secp256k1_schnorrsig.h"
+#  include "secp256k1_musig.h"
+#endif
+
+#include <array>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+using namespace secp256k1;
+using namespace secp256k1::fast;
+
+// Intentionally uses the legacy variable-time secp256k1::ecdsa_sign /
+// schnorr_sign entry points (test vectors / benchmark harness). Suppress
+// the deprecation warning so -Werror builds succeed.
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+
+namespace {
+
+struct CliOptions {
+    int passes = 11;
+    bool quick = false;
+};
+
+CliOptions parse_cli(int argc, char** argv) {
+    CliOptions opts;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--quick") == 0) {
+            opts.quick = true;
+        } else if (std::strcmp(argv[i], "--passes") == 0 && i + 1 < argc) {
+            opts.passes = std::atoi(argv[++i]);
+            if (opts.passes < 3) {
+                opts.passes = 3;
+            }
+        }
+    }
+    return opts;
+}
+
+std::array<std::uint8_t, 32> make_hash(std::uint64_t seed) {
+    std::array<std::uint8_t, 32> out{};
+    for (std::size_t i = 0; i < 4; ++i) {
+        std::uint64_t word = seed + 0x9e3779b97f4a7c15ULL * (i + 1);
+        std::memcpy(out.data() + i * 8, &word, sizeof(word));
+    }
+    return out;
+}
+
+Scalar make_nonzero_scalar(std::uint64_t seed) {
+    Scalar scalar = Scalar::from_bytes(make_hash(seed));
+    if (scalar.is_zero()) {
+        scalar = Scalar::one();
+    }
+    return scalar;
+}
+
+void cpu_warmup() {
+    Point const generator = Point::generator();
+    Scalar scalar = make_nonzero_scalar(0xC0FFEE);
+    volatile std::uint8_t sink = 0;
+    for (int i = 0; i < 512; ++i) {
+        Point point = generator.scalar_mul(scalar);
+        auto compressed = point.to_compressed();
+        sink ^= compressed[1];
+        scalar += Scalar::one();
+    }
+    bench::DoNotOptimize(sink);
+}
+
+struct BatchBenchFixture {
+    std::vector<ECDSABatchEntry> valid_entries;
+    std::vector<ECDSABatchEntry> one_invalid_entries;
+};
+
+BatchBenchFixture make_batch_fixture(std::size_t count) {
+    BatchBenchFixture fixture;
+    fixture.valid_entries.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        Scalar const seckey = make_nonzero_scalar(0x1000 + i);
+        auto const msg = make_hash(0xABC000 + i);
+        ECDSASignature const sig = ecdsa_sign(msg, seckey);
+        fixture.valid_entries.push_back(ECDSABatchEntry{msg, Point::generator().scalar_mul(seckey), sig});
+    }
+    fixture.one_invalid_entries = fixture.valid_entries;
+    fixture.one_invalid_entries.back().msg_hash[0] ^= 0x01;
+    return fixture;
+}
+
+struct FrostBenchFixture {
+    ufsecp_ctx* ctx = nullptr;
+    std::vector<std::uint8_t> all_commits;
+    std::vector<std::uint8_t> received_shares;
+    std::array<std::uint8_t, UFSECP_FROST_KEYPKG_LEN> keypkg{};
+    std::uint32_t threshold = 5;
+    std::uint32_t num_participants = 8;
+    std::uint32_t participant_id = 1;
+};
+
+bool init_frost_fixture(FrostBenchFixture& fixture) {
+    if (ufsecp_ctx_create(&fixture.ctx) != UFSECP_OK) {
+        return false;
+    }
+
+    std::size_t const commit_record_len = 8 + static_cast<std::size_t>(fixture.threshold) * 33;
+    fixture.all_commits.resize(static_cast<std::size_t>(fixture.num_participants) * commit_record_len);
+    fixture.received_shares.resize(static_cast<std::size_t>(fixture.num_participants) * UFSECP_FROST_SHARE_LEN);
+
+    std::vector<std::uint8_t> commit_buf(commit_record_len);
+    std::vector<std::uint8_t> shares_buf(static_cast<std::size_t>(fixture.num_participants) * UFSECP_FROST_SHARE_LEN);
+
+    for (std::uint32_t sender = 1; sender <= fixture.num_participants; ++sender) {
+        std::array<std::uint8_t, 32> seed = make_hash(0xF200 + sender);
+        std::size_t commit_len = commit_buf.size();
+        std::size_t shares_len = shares_buf.size();
+        if (ufsecp_frost_keygen_begin(
+                fixture.ctx,
+                sender,
+                fixture.threshold,
+                fixture.num_participants,
+                seed.data(),
+                commit_buf.data(),
+                &commit_len,
+                shares_buf.data(),
+                &shares_len) != UFSECP_OK) {
+            return false;
+        }
+        if (commit_len != commit_record_len || shares_len != shares_buf.size()) {
+            return false;
+        }
+
+        std::memcpy(
+            fixture.all_commits.data() + static_cast<std::size_t>(sender - 1) * commit_record_len,
+            commit_buf.data(),
+            commit_record_len);
+        std::memcpy(
+            fixture.received_shares.data() + static_cast<std::size_t>(sender - 1) * UFSECP_FROST_SHARE_LEN,
+            shares_buf.data() + static_cast<std::size_t>(fixture.participant_id - 1) * UFSECP_FROST_SHARE_LEN,
+            UFSECP_FROST_SHARE_LEN);
+    }
+
+    return ufsecp_frost_keygen_finalize(
+               fixture.ctx,
+               fixture.participant_id,
+               fixture.all_commits.data(),
+               fixture.all_commits.size(),
+               fixture.received_shares.data(),
+               fixture.received_shares.size(),
+               fixture.threshold,
+               fixture.num_participants,
+               fixture.keypkg.data()) == UFSECP_OK;
+}
+
+void destroy_frost_fixture(FrostBenchFixture& fixture) {
+    ufsecp_ctx_destroy(fixture.ctx);
+    fixture.ctx = nullptr;
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    CliOptions const opts = parse_cli(argc, argv);
+    bench::pin_thread_and_elevate();
+    cpu_warmup();
+
+    bench::Harness harness(opts.quick ? 100 : 300,
+                           static_cast<std::size_t>(opts.quick ? 5 : opts.passes));
+
+    BatchBenchFixture const batch_fixture = make_batch_fixture(opts.quick ? 32U : 64U);
+
+    FrostBenchFixture frost_fixture;
+    if (!init_frost_fixture(frost_fixture)) {
+        std::fprintf(stderr, "failed to initialize FROST benchmark fixture\n");
+        destroy_frost_fixture(frost_fixture);
+        return 1;
+    }
+
+    Point const address_pubkey = Point::generator().scalar_mul(make_nonzero_scalar(0x4242));
+
+    std::printf("Hot Path Benchmarks\n");
+    std::printf("  Timer:  %s\n", bench::Timer::timer_name());
+    std::printf("  Passes: %zu\n", harness.passes);
+    std::printf("  Batch:  %zu ECDSA entries\n", batch_fixture.valid_entries.size());
+    std::printf("  FROST:  t=%u n=%u\n\n", frost_fixture.threshold, frost_fixture.num_participants);
+
+    double const batch_verify_ns = harness.run_and_print(
+        "ecdsa_batch_verify(valid)",
+        opts.quick ? 16 : 32,
+        [&]() {
+            bool const ok = ecdsa_batch_verify(batch_fixture.valid_entries.data(), batch_fixture.valid_entries.size());
+            bench::DoNotOptimize(ok);
+        });
+
+    double const batch_identify_ns = harness.run_and_print(
+        "ecdsa_batch_identify_invalid",
+        opts.quick ? 8 : 16,
+        [&]() {
+            auto invalid = ecdsa_batch_identify_invalid(
+                batch_fixture.one_invalid_entries.data(),
+                batch_fixture.one_invalid_entries.size());
+            bench::DoNotOptimize(invalid);
+        });
+
+    double const frost_finalize_ns = harness.run_and_print(
+        "ufsecp_frost_keygen_finalize",
+        opts.quick ? 20 : 40,
+        [&]() {
+            ufsecp_error_t const err = ufsecp_frost_keygen_finalize(
+                frost_fixture.ctx,
+                frost_fixture.participant_id,
+                frost_fixture.all_commits.data(),
+                frost_fixture.all_commits.size(),
+                frost_fixture.received_shares.data(),
+                frost_fixture.received_shares.size(),
+                frost_fixture.threshold,
+                frost_fixture.num_participants,
+                frost_fixture.keypkg.data());
+            bench::DoNotOptimize(err);
+        });
+
+    double const p2pkh_ns = harness.run_and_print(
+        "address_p2pkh",
+        opts.quick ? 128 : 256,
+        [&]() {
+            std::string address = address_p2pkh(address_pubkey, Network::Mainnet);
+            bench::DoNotOptimize(address);
+        });
+
+    double const p2wpkh_ns = harness.run_and_print(
+        "address_p2wpkh",
+        opts.quick ? 192 : 384,
+        [&]() {
+            std::string address = address_p2wpkh(address_pubkey, Network::Mainnet);
+            bench::DoNotOptimize(address);
+        });
+
+    std::printf("\nSummary\n");
+    std::printf("  batch_verify_ns=%.2f\n", batch_verify_ns);
+    std::printf("  batch_identify_invalid_ns=%.2f\n", batch_identify_ns);
+    std::printf("  frost_finalize_ns=%.2f\n", frost_finalize_ns);
+    std::printf("  address_p2pkh_ns=%.2f\n", p2pkh_ns);
+    std::printf("  address_p2wpkh_ns=%.2f\n", p2wpkh_ns);
+
+    destroy_frost_fixture(frost_fixture);
+
+#ifdef BENCH_HAS_MUSIG_SHIM
+    // ── MuSig shim benchmarks (PERF-007) ────────────────────────────────────
+    // Benchmarks secp256k1_musig_pubkey_agg to measure the cost of the
+    // serialize-in-loop pattern vs. direct opaque-struct parity extraction.
+    {
+        static const int N_SIGNERS = 100;
+        secp256k1_context* shim_ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
+        std::vector<secp256k1_pubkey> shim_pubkeys(N_SIGNERS);
+        std::vector<const secp256k1_pubkey*> shim_pk_ptrs(N_SIGNERS);
+        for (int i = 0; i < N_SIGNERS; ++i) {
+            uint8_t sk[32] = {};
+            sk[0] = static_cast<uint8_t>(i + 1);
+            sk[31] = static_cast<uint8_t>(i * 7 + 1);
+            if (!secp256k1_ec_pubkey_create(shim_ctx, &shim_pubkeys[i], sk)) abort();
+            shim_pk_ptrs[i] = &shim_pubkeys[i];
+        }
+
+        secp256k1_musig_keyagg_cache shim_cache;
+        secp256k1_xonly_pubkey shim_agg_pk;
+
+        double const musig_agg_ns = harness.run_and_print(
+            "musig_pubkey_agg (n=100 signers)",
+            opts.quick ? 50 : 200,
+            [&]() {
+                int ok = secp256k1_musig_pubkey_agg(
+                    shim_ctx, &shim_agg_pk, &shim_cache,
+                    shim_pk_ptrs.data(), N_SIGNERS);
+                bench::DoNotOptimize(ok);
+            });
+
+        std::printf("  musig_pubkey_agg_100_ns=%.2f\n", musig_agg_ns);
+
+        // ── SHIM-007: pubnonce_parse + nonce_agg (double decompress issue) ───
+        // Wire format for a pubnonce is two compressed secp256k1 points (66 bytes).
+        // We construct valid wire bytes from pairs of real EC pubkeys.
+        {
+            static const int N_NONCES = 100;
+            std::vector<std::array<uint8_t, 66>> nonce_wire(N_NONCES);
+            for (int i = 0; i < N_NONCES; ++i) {
+                // R1 = pubkey[i], R2 = pubkey[(i+1) % N_SIGNERS]
+                size_t const j = static_cast<size_t>(i % N_SIGNERS);
+                size_t const k = static_cast<size_t>((i + 1) % N_SIGNERS);
+                size_t len = 33;
+                secp256k1_ec_pubkey_serialize(shim_ctx, nonce_wire[static_cast<size_t>(i)].data(),
+                                             &len, &shim_pubkeys[j], SECP256K1_EC_COMPRESSED);
+                secp256k1_ec_pubkey_serialize(shim_ctx, nonce_wire[static_cast<size_t>(i)].data() + 33,
+                                             &len, &shim_pubkeys[k], SECP256K1_EC_COMPRESSED);
+            }
+
+            // Benchmark: parse N wire-format pubnonces
+            std::vector<secp256k1_musig_pubnonce> parsed_nonces(N_NONCES);
+            std::vector<const secp256k1_musig_pubnonce*> pn_ptrs(N_NONCES);
+            for (int i = 0; i < N_NONCES; ++i)
+                pn_ptrs[static_cast<size_t>(i)] = &parsed_nonces[static_cast<size_t>(i)];
+
+            double const pubnonce_parse_ns = harness.run_and_print(
+                "musig_pubnonce_parse x100",
+                opts.quick ? 10 : 50,
+                [&]() {
+                    for (int i = 0; i < N_NONCES; ++i) {
+                        int ok = secp256k1_musig_pubnonce_parse(
+                            shim_ctx, &parsed_nonces[static_cast<size_t>(i)],
+                            nonce_wire[static_cast<size_t>(i)].data());
+                        bench::DoNotOptimize(ok);
+                    }
+                });
+
+            // Pre-parse for nonce_agg bench
+            for (int i = 0; i < N_NONCES; ++i)
+                secp256k1_musig_pubnonce_parse(shim_ctx, &parsed_nonces[static_cast<size_t>(i)],
+                    nonce_wire[static_cast<size_t>(i)].data());
+
+            secp256k1_musig_aggnonce aggnonce;
+            double const nonce_agg_ns = harness.run_and_print(
+                "musig_nonce_agg (n=100)",
+                opts.quick ? 20 : 80,
+                [&]() {
+                    int ok = secp256k1_musig_nonce_agg(shim_ctx, &aggnonce,
+                                                        pn_ptrs.data(), N_NONCES);
+                    bench::DoNotOptimize(ok);
+                });
+
+            std::printf("  musig_pubnonce_parse_100_ns=%.2f\n", pubnonce_parse_ns);
+            std::printf("  musig_nonce_agg_100_ns=%.2f\n", nonce_agg_ns);
+        }
+
+        // ── PERF-008: Schnorr verify with unique pubkeys (GLV cache miss path) ─
+        // Verifies that the cache-miss fallthrough (dual_scalar_mul_gen_point,
+        // no cache write) handles unique-pubkey workloads correctly.
+        {
+            static const int N_VERIFY = 64;
+            std::vector<uint8_t> xpk_pool(N_VERIFY * 32);
+            std::vector<std::array<uint8_t, 64>> sig_pool(N_VERIFY);
+            std::vector<std::array<uint8_t, 32>> msg_pool(N_VERIFY);
+            secp256k1_keypair kp;
+            for (int i = 0; i < N_VERIFY; ++i) {
+                uint8_t sk[32] = {};
+                sk[0] = static_cast<uint8_t>(i + 1);
+                sk[31] = static_cast<uint8_t>(i * 11 + 3);
+                msg_pool[static_cast<size_t>(i)][0] = static_cast<uint8_t>(i);
+                if (secp256k1_keypair_create(shim_ctx, &kp, sk)) {
+                    secp256k1_xonly_pubkey xpk;
+                    secp256k1_keypair_xonly_pub(shim_ctx, &xpk, nullptr, &kp);
+                    secp256k1_xonly_pubkey_serialize(shim_ctx,
+                        xpk_pool.data() + static_cast<size_t>(i) * 32, &xpk);
+                    secp256k1_schnorrsig_sign32(shim_ctx,
+                        sig_pool[static_cast<size_t>(i)].data(),
+                        msg_pool[static_cast<size_t>(i)].data(), &kp, nullptr);
+                }
+            }
+
+            // Rotate through N unique pubkeys — all will be cache misses.
+            int verify_idx = 0;
+            double const schnorr_unique_ns = harness.run_and_print(
+                "schnorr_verify (unique pubkeys, cache miss)",
+                opts.quick ? 8 : 32,
+                [&]() {
+                    size_t const idx = static_cast<size_t>(verify_idx % N_VERIFY);
+                    secp256k1_xonly_pubkey xpk;
+                    secp256k1_xonly_pubkey_parse(shim_ctx, &xpk,
+                        xpk_pool.data() + idx * 32);
+                    int ok = secp256k1_schnorrsig_verify(shim_ctx,
+                        sig_pool[idx].data(), msg_pool[idx].data(), 32, &xpk);
+                    bench::DoNotOptimize(ok);
+                    ++verify_idx;
+                });
+
+            std::printf("  schnorr_verify_unique_pubkey_ns=%.2f\n", schnorr_unique_ns);
+        }
+
+        // ── §13: Bitcoin-Core-like full paths — pure-verify vs parse+verify ─────
+        // Honest COLD measurement of the script-validation hot path. METHODOLOGY:
+        //  * Pool size N=2048 unique keys exceeds Ultra's verify caches
+        //    (ShimSchnorrCache 64 / lift_x 1024 / GLV) AND L1/L2, so every verify
+        //    is a real cache miss — the ConnectBlock unique-key reality, NOT the
+        //    warm 64-key intra-block-reuse case (which flatters Ultra).
+        //  * The SAME rotating index `ei`/`si` is shared across the pure and the
+        //    parse+verify bench WITHOUT reset, so the two benches touch DISJOINT
+        //    key ranges (≤1704 touches < 2048) and the parse+verify run cannot be
+        //    warmed by the pure run. Both are first-touch cold.
+        //  * Pure-verify uses PRE-PARSED pubkey/sig; parse+verify does the parse
+        //    INSIDE the timed window. delta = parse+verify − pure = the parse cost
+        //    (pubkey decompression / xonly lift_x), the suspected ConnectBlock
+        //    deficit source. bench::DoNotOptimize consumes every result (no DCE).
+        {
+            static const int N = 2048;
+
+            // -- ECDSA P2WPKH-like: 33-byte compressed pubkey + 64-byte compact sig
+            std::vector<uint8_t> ec_pub(static_cast<size_t>(N) * 33);
+            std::vector<std::array<uint8_t, 64>> ec_sig(N);
+            std::vector<std::array<uint8_t, 32>> ec_msg(N);
+            std::vector<secp256k1_pubkey> ec_pk_parsed(N);
+            std::vector<secp256k1_ecdsa_signature> ec_sig_parsed(N);
+            for (int i = 0; i < N; ++i) {
+                uint8_t sk[32] = {};
+                sk[0] = static_cast<uint8_t>(i + 1);
+                sk[1] = static_cast<uint8_t>(i >> 8);
+                sk[31] = static_cast<uint8_t>(i * 7 + 1);
+                ec_msg[static_cast<size_t>(i)][0] = static_cast<uint8_t>(i);
+                ec_msg[static_cast<size_t>(i)][1] = static_cast<uint8_t>(i >> 8);
+                secp256k1_pubkey pk;
+                secp256k1_ec_pubkey_create(shim_ctx, &pk, sk);
+                size_t plen = 33;
+                secp256k1_ec_pubkey_serialize(shim_ctx, ec_pub.data() + static_cast<size_t>(i) * 33,
+                                              &plen, &pk, SECP256K1_EC_COMPRESSED);
+                secp256k1_ecdsa_signature sig;
+                secp256k1_ecdsa_sign(shim_ctx, &sig, ec_msg[static_cast<size_t>(i)].data(), sk, nullptr, nullptr);
+                secp256k1_ecdsa_signature_serialize_compact(shim_ctx, ec_sig[static_cast<size_t>(i)].data(), &sig);
+                ec_pk_parsed[static_cast<size_t>(i)] = pk;
+                ec_sig_parsed[static_cast<size_t>(i)] = sig;
+            }
+            int ei = 0;  // shared, NOT reset between the two benches (disjoint ranges)
+            double const ec_pure = harness.run_and_print(
+                "ecdsa_verify (pure, 2048 unique, pre-parsed)", opts.quick ? 8 : 32,
+                [&]() {
+                    size_t const idx = static_cast<size_t>(ei % N);
+                    int ok = secp256k1_ecdsa_verify(shim_ctx, &ec_sig_parsed[idx],
+                                                    ec_msg[idx].data(), &ec_pk_parsed[idx]);
+                    bench::DoNotOptimize(ok);
+                    ++ei;
+                });
+            double const ec_pv = harness.run_and_print(
+                "ecdsa parse+verify (P2WPKH-like, 2048 unique cold)", opts.quick ? 8 : 32,
+                [&]() {
+                    size_t const idx = static_cast<size_t>(ei % N);
+                    secp256k1_pubkey pk;
+                    secp256k1_ecdsa_signature sig;
+                    int ok = secp256k1_ec_pubkey_parse(shim_ctx, &pk, ec_pub.data() + idx * 33, 33)
+                          && secp256k1_ecdsa_signature_parse_compact(shim_ctx, &sig, ec_sig[idx].data())
+                          && secp256k1_ecdsa_verify(shim_ctx, &sig, ec_msg[idx].data(), &pk);
+                    bench::DoNotOptimize(ok);
+                    ++ei;
+                });
+            std::printf("  ecdsa_p2wpkh_pure_ns=%.2f  parse_verify_ns=%.2f  parse_delta_ns=%.2f\n",
+                        ec_pure, ec_pv, ec_pv - ec_pure);
+
+            // -- Schnorr P2TR key-path: 32-byte x-only pubkey + 64-byte sig --
+            std::vector<uint8_t> sx_pub(static_cast<size_t>(N) * 32);
+            std::vector<std::array<uint8_t, 64>> sx_sig(N);
+            std::vector<std::array<uint8_t, 32>> sx_msg(N);
+            std::vector<secp256k1_xonly_pubkey> sx_pk_parsed(N);
+            for (int i = 0; i < N; ++i) {
+                uint8_t sk[32] = {};
+                sk[0] = static_cast<uint8_t>(i * 3 + 2);
+                sk[1] = static_cast<uint8_t>(i >> 8);
+                sk[31] = static_cast<uint8_t>(i * 13 + 5);
+                sx_msg[static_cast<size_t>(i)][0] = static_cast<uint8_t>(i * 5);
+                sx_msg[static_cast<size_t>(i)][1] = static_cast<uint8_t>(i >> 8);
+                secp256k1_keypair kp;
+                if (secp256k1_keypair_create(shim_ctx, &kp, sk)) {
+                    secp256k1_xonly_pubkey xpk;
+                    secp256k1_keypair_xonly_pub(shim_ctx, &xpk, nullptr, &kp);
+                    secp256k1_xonly_pubkey_serialize(shim_ctx, sx_pub.data() + static_cast<size_t>(i) * 32, &xpk);
+                    secp256k1_schnorrsig_sign32(shim_ctx, sx_sig[static_cast<size_t>(i)].data(),
+                                                sx_msg[static_cast<size_t>(i)].data(), &kp, nullptr);
+                    sx_pk_parsed[static_cast<size_t>(i)] = xpk;
+                }
+            }
+            int si = 0;  // shared, NOT reset between the two benches (disjoint ranges)
+            double const sx_pure = harness.run_and_print(
+                "schnorr_verify (pure, 2048 unique, pre-parsed)", opts.quick ? 8 : 32,
+                [&]() {
+                    size_t const idx = static_cast<size_t>(si % N);
+                    int ok = secp256k1_schnorrsig_verify(shim_ctx, sx_sig[idx].data(),
+                                                         sx_msg[idx].data(), 32, &sx_pk_parsed[idx]);
+                    bench::DoNotOptimize(ok);
+                    ++si;
+                });
+            double const sx_pv = harness.run_and_print(
+                "schnorr xonly-parse+verify (P2TR key-path, 2048 unique cold)", opts.quick ? 8 : 32,
+                [&]() {
+                    size_t const idx = static_cast<size_t>(si % N);
+                    secp256k1_xonly_pubkey xpk;
+                    int ok = secp256k1_xonly_pubkey_parse(shim_ctx, &xpk, sx_pub.data() + idx * 32)
+                          && secp256k1_schnorrsig_verify(shim_ctx, sx_sig[idx].data(), sx_msg[idx].data(), 32, &xpk);
+                    bench::DoNotOptimize(ok);
+                    ++si;
+                });
+            std::printf("  schnorr_p2tr_pure_ns=%.2f  parse_verify_ns=%.2f  parse_delta_ns=%.2f\n",
+                        sx_pure, sx_pv, sx_pv - sx_pure);
+        }
+
+        secp256k1_context_destroy(shim_ctx);
+    }
+#endif
+
+    return 0;
+}

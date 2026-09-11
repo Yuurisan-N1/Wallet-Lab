@@ -1,0 +1,143 @@
+# ============================================================================
+# UltrafastSecp256k1 -- C API Shared Library
+# ============================================================================
+# Builds libultrafast_secp256k1.so / .dll / .dylib
+# Usage:
+#   cmake -S bindings/c_api -B bindings/c_api/build -DCMAKE_BUILD_TYPE=Release
+#   cmake --build bindings/c_api/build
+# ============================================================================
+
+cmake_minimum_required(VERSION 3.18)
+project(ultrafast_secp256k1_capi
+    VERSION 1.0.0
+    LANGUAGES CXX
+    DESCRIPTION "UltrafastSecp256k1 C API shared library")
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# -- Find the CPU library ---------------------------------------------------
+# The CPU library is built by the parent CMake project.
+# We locate its include dirs and link against it.
+
+# Paths relative to this CMakeLists.txt
+set(ULTRAFAST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+# Source backends moved under src/ in commit ecf17324
+set(CPU_INCLUDE_DIR "${ULTRAFAST_ROOT}/src/cpu/include")
+set(SHARED_INCLUDE_DIR "${ULTRAFAST_ROOT}/include")
+set(GPU_INCLUDE_DIR "${ULTRAFAST_ROOT}/src/gpu/include")
+
+# Check that includes exist
+if(NOT EXISTS "${CPU_INCLUDE_DIR}/UltrafastSecp256k1.hpp")
+    message(FATAL_ERROR "Cannot find UltrafastSecp256k1.hpp at ${CPU_INCLUDE_DIR}")
+endif()
+
+# -- Shared library target -------------------------------------------------
+
+add_library(ultrafast_secp256k1 SHARED
+    ultrafast_secp256k1.cpp
+)
+
+target_include_directories(ultrafast_secp256k1 PRIVATE
+    ${CPU_INCLUDE_DIR}
+    ${SHARED_INCLUDE_DIR}
+    ${SHARED_INCLUDE_DIR}/ufsecp
+    ${GPU_INCLUDE_DIR}
+)
+
+target_compile_definitions(ultrafast_secp256k1 PRIVATE
+    ULTRAFAST_SECP256K1_BUILDING
+)
+
+# Link against the CPU library (as static archive or object files)
+# When built as part of the parent project, the cpu target is available.
+# Otherwise, we need to find or build it.
+if(TARGET UltrafastSecp256k1_cpu)
+    target_link_libraries(ultrafast_secp256k1 PRIVATE UltrafastSecp256k1_cpu)
+elseif(TARGET secp256k1_cpu)
+    target_link_libraries(ultrafast_secp256k1 PRIVATE secp256k1_cpu)
+else()
+    # Standalone build: generate secp256k1_features.h (needed by gpu_backend.hpp)
+    configure_file(
+        "${ULTRAFAST_ROOT}/src/cpu/include/secp256k1/secp256k1_features.h.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/include/secp256k1/secp256k1_features.h"
+        @ONLY
+    )
+
+    # Standalone build: gather all CPU .cpp sources
+    file(GLOB CPU_SOURCES "${ULTRAFAST_ROOT}/src/cpu/src/*.cpp")
+
+    # MSVC (non clang-cl): no __uint128_t / __int128 support
+    if(MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        # field_52.cpp has a hard #error without __uint128_t
+        list(FILTER CPU_SOURCES EXCLUDE REGEX "field_52\\.cpp$")
+        # scalar.cpp uses __int128 in the 64-bit path; enable 32-bit fallback
+        target_compile_definitions(ultrafast_secp256k1 PRIVATE SECP256K1_NO_INT128)
+    endif()
+
+    target_sources(ultrafast_secp256k1 PRIVATE ${CPU_SOURCES})
+
+    # Expose generated headers (secp256k1_features.h) to the standalone build
+    target_include_directories(ultrafast_secp256k1 PRIVATE
+        ${CMAKE_CURRENT_BINARY_DIR}/generated/include
+    )
+
+    # src/cpu/src/ufsecp_gpu_impl.cpp references the GPU backend registry (backend_count,
+    # backend_ids, create_backend, is_available). In a CPU-only standalone build no
+    # GPU CMake target is present, so we must compile gpu_registry.cpp directly.
+    # Without any SECP256K1_HAVE_{CUDA,OPENCL,METAL} defines, the registry returns
+    # backend_count=0 and create_backend=nullptr — a safe CPU-only stub.
+    # gpu_backend_fallback.cpp provides schnorr_snark_witness_batch_cpu_fallback,
+    # called via the GpuBackend virtual dispatch in ufsecp_gpu_impl.cpp.
+    # Without it the .so has an undefined symbol that prevents loading.
+    target_sources(ultrafast_secp256k1 PRIVATE
+        "${ULTRAFAST_ROOT}/src/gpu/src/gpu_registry.cpp"
+        "${ULTRAFAST_ROOT}/src/gpu/src/gpu_backend_fallback.cpp"
+    )
+endif()
+
+# -- Platform-specific flags -----------------------------------------------
+
+if(WIN32)
+    # Windows: export all symbols through the SECP256K1_API macro
+    set_target_properties(ultrafast_secp256k1 PROPERTIES
+        WINDOWS_EXPORT_ALL_SYMBOLS OFF
+    )
+    # Link bcrypt for BCryptGenRandom (ECIES + BIP-39 CSPRNG)
+    target_link_libraries(ultrafast_secp256k1 PRIVATE bcrypt)
+elseif(APPLE)
+    set_target_properties(ultrafast_secp256k1 PROPERTIES
+        MACOSX_RPATH ON
+        INSTALL_RPATH "@loader_path"
+    )
+    # Link Security framework for SecRandomCopyBytes (ECIES CSPRNG)
+    find_library(SECURITY_FRAMEWORK Security REQUIRED)
+    target_link_libraries(ultrafast_secp256k1 PRIVATE ${SECURITY_FRAMEWORK})
+    # Link CoreFoundation for CFStringNormalize (unicode_nfkd.cpp BIP-39 NFKD)
+    find_library(COREFOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
+    target_link_libraries(ultrafast_secp256k1 PRIVATE ${COREFOUNDATION_FRAMEWORK})
+else()
+    set_target_properties(ultrafast_secp256k1 PROPERTIES
+        INSTALL_RPATH "$ORIGIN"
+    )
+    target_link_options(ultrafast_secp256k1 PRIVATE
+        -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports.map
+    )
+endif()
+
+set_target_properties(ultrafast_secp256k1 PROPERTIES
+    VERSION ${PROJECT_VERSION}
+    SOVERSION 1
+    PUBLIC_HEADER ultrafast_secp256k1.h
+)
+
+# -- Install ---------------------------------------------------------------
+
+include(GNUInstallDirs)
+install(TARGETS ultrafast_secp256k1
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)

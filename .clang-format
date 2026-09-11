@@ -1,0 +1,60 @@
+---
+Language: Cpp
+BasedOnStyle: Google
+
+# Indentation
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ContinuationIndentWidth: 4
+NamespaceIndentation: None
+IndentCaseLabels: true
+IndentPPDirectives: AfterHash
+
+# Line length
+ColumnLimit: 120
+
+# Braces
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+
+# Alignment
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+AlignOperands: true
+AlignTrailingComments: true
+
+# Includes
+SortIncludes: CaseInsensitive
+IncludeBlocks: Regroup
+IncludeCategories:
+  # Project headers
+  - Regex: '^"secp256k1/'
+    Priority: 2
+  # Local headers
+  - Regex: '^"'
+    Priority: 3
+  # System headers
+  - Regex: '^<'
+    Priority: 1
+
+# Spacing
+SpaceAfterCStyleCast: false
+SpaceBeforeParens: ControlStatements
+SpacesInAngles: false
+SpacesInParentheses: false
+SpaceBeforeAssignmentOperators: true
+
+# Other
+PointerAlignment: Left
+DerivePointerAlignment: false
+ReflowComments: true
+AllowAllParametersOfDeclarationOnNextLine: true
+BinPackParameters: true
+BinPackArguments: true
+
+# C++20
+Standard: c++20
+...

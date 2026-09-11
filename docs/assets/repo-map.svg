@@ -1,0 +1,205 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1758" viewBox="0 0 1400 1758" role="img" aria-labelledby="title desc">
+<title id="title">UltrafastSecp256k1 Repository Map</title>
+<desc id="desc">Generated visual map of repository product profiles, tiers, and primary paths.</desc>
+<defs>
+<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+<stop offset="0%" stop-color="#f8fafc"/>
+<stop offset="100%" stop-color="#e0f2fe"/>
+</linearGradient>
+<filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+<feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#0f172a" flood-opacity="0.10"/>
+</filter>
+</defs>
+<rect width="100%" height="100%" fill="url(#bg)"/>
+<g font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">
+<text x="44" y="62" font-size="46" font-weight="950" fill="#0f172a">UltrafastSecp256k1 Repository Map</text>
+<text x="44" y="104" font-size="22" font-weight="500" fill="#334155">Generated map of product profiles, scope boundaries, and primary code surfaces.</text>
+<text x="44" y="136" font-size="14" fill="#64748b">Generated from docs/repo_map_manifest.json by tools/render_repo_map.py</text>
+<text x="980" y="54" font-size="15" font-weight="800" fill="#334155">Scope legend</text>
+<rect x="980" y="67" width="18" height="18" rx="5" fill="#ecfeff" stroke="#0f766e" stroke-width="2.5"/>
+<text x="1008" y="82" font-size="14" fill="#334155">Production</text>
+<rect x="1170" y="67" width="18" height="18" rx="5" fill="#eff6ff" stroke="#1d4ed8" stroke-width="2.5"/>
+<text x="1198" y="82" font-size="14" fill="#334155">Core scope</text>
+<rect x="980" y="95" width="18" height="18" rx="5" fill="#f5f3ff" stroke="#7c3aed" stroke-width="2.5"/>
+<text x="1008" y="110" font-size="14" fill="#334155">Public data</text>
+<rect x="1170" y="95" width="18" height="18" rx="5" fill="#fffbeb" stroke="#b45309" stroke-width="2.5"/>
+<text x="1198" y="110" font-size="14" fill="#334155">Needs hardening</text>
+<rect x="980" y="123" width="18" height="18" rx="5" fill="#f8fafc" stroke="#64748b" stroke-width="2.5"/>
+<text x="1008" y="138" font-size="14" fill="#334155">Compat only</text>
+<g filter="url(#shadow)">
+<g id="profile-core-engine">
+<rect x="42" y="176" width="640" height="350" rx="22" fill="#ecfeff" stroke="#0f766e" stroke-width="3"/>
+<rect x="66" y="198" width="250" height="34" rx="17" fill="#0f766e"/>
+<text x="84" y="221" font-size="15" font-weight="800" fill="#ffffff">production</text>
+<text x="68" y="268" font-size="24" font-weight="900" fill="#0f172a">Core Engine</text>
+<text x="68" y="324" font-size="17" font-weight="400" fill="#334155">CPU scalar, field, point, ECDSA, Schnorr, ECDH, and CT</text>
+<text x="68" y="347" font-size="17" font-weight="400" fill="#334155">primitives.</text>
+<text x="68" y="414" font-size="16" font-weight="800" fill="#334155">Primary paths</text>
+<text x="372" y="414" font-size="16" font-weight="800" fill="#334155">Signals</text>
+<circle cx="76" cy="440" r="3.2" fill="#64748b"/>
+<text x="88" y="444" font-size="15" fill="#0f172a">src/cpu/src/</text>
+<circle cx="76" cy="462" r="3.2" fill="#64748b"/>
+<text x="88" y="466" font-size="15" fill="#0f172a">src/cpu/include/secp256k1/</text>
+<circle cx="76" cy="484" r="3.2" fill="#64748b"/>
+<text x="88" y="488" font-size="15" fill="#0f172a">include/ufsecp/</text>
+<circle cx="380" cy="440" r="3.2" fill="#64748b"/>
+<text x="392" y="444" font-size="15" fill="#0f172a">CT signing primitives</text>
+<circle cx="380" cy="462" r="3.2" fill="#64748b"/>
+<text x="392" y="466" font-size="15" fill="#0f172a">Strict parsers</text>
+<circle cx="380" cy="484" r="3.2" fill="#64748b"/>
+<text x="392" y="488" font-size="15" fill="#0f172a">Fail-closed ABI</text>
+</g>
+<g id="profile-bitcoin-core-backend">
+<rect x="718" y="176" width="640" height="350" rx="22" fill="#eff6ff" stroke="#1d4ed8" stroke-width="3"/>
+<rect x="742" y="198" width="250" height="34" rx="17" fill="#1d4ed8"/>
+<text x="760" y="221" font-size="15" font-weight="800" fill="#ffffff">bitcoin-core-scope</text>
+<text x="744" y="268" font-size="24" font-weight="900" fill="#0f172a">Bitcoin Core Backend</text>
+<text x="744" y="324" font-size="17" font-weight="400" fill="#334155">Scoped libsecp256k1-compatible CPU backend for Bitcoin Core</text>
+<text x="744" y="347" font-size="17" font-weight="400" fill="#334155">review.</text>
+<text x="744" y="414" font-size="16" font-weight="800" fill="#334155">Primary paths</text>
+<text x="1048" y="414" font-size="16" font-weight="800" fill="#334155">Signals</text>
+<circle cx="752" cy="440" r="3.2" fill="#64748b"/>
+<text x="764" y="444" font-size="15" fill="#0f172a">compat/libsecp256k1_shim/</text>
+<circle cx="752" cy="462" r="3.2" fill="#64748b"/>
+<text x="764" y="466" font-size="15" fill="#0f172a">docs/BITCOIN_CORE_BACKEND_EVIDENCE.md</text>
+<circle cx="1056" cy="440" r="3.2" fill="#64748b"/>
+<text x="1068" y="444" font-size="15" fill="#0f172a">CPU only</text>
+<circle cx="1056" cy="462" r="3.2" fill="#64748b"/>
+<text x="1068" y="466" font-size="15" fill="#0f172a">Shim parity</text>
+<circle cx="1056" cy="484" r="3.2" fill="#64748b"/>
+<text x="1068" y="488" font-size="15" fill="#0f172a">FFI/GPU/WASM/alt-shims out of scope</text>
+</g>
+<g id="profile-gpu-public-data">
+<rect x="42" y="560" width="640" height="350" rx="22" fill="#f5f3ff" stroke="#7c3aed" stroke-width="3"/>
+<rect x="66" y="582" width="250" height="34" rx="17" fill="#7c3aed"/>
+<text x="84" y="605" font-size="15" font-weight="800" fill="#ffffff">public-data-only</text>
+<text x="68" y="652" font-size="24" font-weight="900" fill="#0f172a">GPU Public Data</text>
+<text x="68" y="708" font-size="17" font-weight="400" fill="#334155">CUDA, OpenCL, and Metal acceleration for public-data</text>
+<text x="68" y="731" font-size="17" font-weight="400" fill="#334155">workloads.</text>
+<text x="68" y="798" font-size="16" font-weight="800" fill="#334155">Primary paths</text>
+<text x="372" y="798" font-size="16" font-weight="800" fill="#334155">Signals</text>
+<circle cx="76" cy="824" r="3.2" fill="#64748b"/>
+<text x="88" y="828" font-size="15" fill="#0f172a">src/cuda/</text>
+<circle cx="76" cy="846" r="3.2" fill="#64748b"/>
+<text x="88" y="850" font-size="15" fill="#0f172a">src/opencl/</text>
+<circle cx="76" cy="868" r="3.2" fill="#64748b"/>
+<text x="88" y="872" font-size="15" fill="#0f172a">src/metal/</text>
+<circle cx="76" cy="890" r="3.2" fill="#64748b"/>
+<text x="88" y="894" font-size="15" fill="#0f172a">src/gpu/</text>
+<circle cx="380" cy="824" r="3.2" fill="#64748b"/>
+<text x="392" y="828" font-size="15" fill="#0f172a">Batch verify/scanning</text>
+<circle cx="380" cy="846" r="3.2" fill="#64748b"/>
+<text x="392" y="850" font-size="15" fill="#0f172a">Backend parity</text>
+<circle cx="380" cy="868" r="3.2" fill="#64748b"/>
+<text x="392" y="872" font-size="15" fill="#0f172a">No Core PR dependency</text>
+</g>
+<g id="profile-ffi-bindings">
+<rect x="718" y="560" width="640" height="350" rx="22" fill="#fffbeb" stroke="#b45309" stroke-width="3"/>
+<rect x="742" y="582" width="250" height="34" rx="17" fill="#b45309"/>
+<text x="760" y="605" font-size="15" font-weight="800" fill="#ffffff">needs-hardening</text>
+<text x="744" y="652" font-size="24" font-weight="900" fill="#0f172a">FFI / Bindings</text>
+<text x="744" y="708" font-size="17" font-weight="400" fill="#334155">Language bindings and legacy C API product surface.</text>
+<text x="744" y="798" font-size="16" font-weight="800" fill="#334155">Primary paths</text>
+<text x="1048" y="798" font-size="16" font-weight="800" fill="#334155">Signals</text>
+<circle cx="752" cy="824" r="3.2" fill="#64748b"/>
+<text x="764" y="828" font-size="15" fill="#0f172a">bindings/c_api/</text>
+<circle cx="752" cy="846" r="3.2" fill="#64748b"/>
+<text x="764" y="850" font-size="15" fill="#0f172a">bindings/nodejs/</text>
+<circle cx="752" cy="868" r="3.2" fill="#64748b"/>
+<text x="764" y="872" font-size="15" fill="#0f172a">bindings/python/</text>
+<circle cx="752" cy="890" r="3.2" fill="#64748b"/>
+<text x="764" y="894" font-size="15" fill="#0f172a">bindings/rust/</text>
+<circle cx="1056" cy="824" r="3.2" fill="#64748b"/>
+<text x="1068" y="828" font-size="15" fill="#0f172a">Separate product</text>
+<circle cx="1056" cy="846" r="3.2" fill="#64748b"/>
+<text x="1068" y="850" font-size="15" fill="#0f172a">Strict scalar parsing required</text>
+<circle cx="1056" cy="868" r="3.2" fill="#64748b"/>
+<text x="1068" y="872" font-size="15" fill="#0f172a">CT route required for signing</text>
+</g>
+<g id="profile-wasm">
+<rect x="42" y="944" width="640" height="350" rx="22" fill="#fffbeb" stroke="#b45309" stroke-width="3"/>
+<rect x="66" y="966" width="250" height="34" rx="17" fill="#b45309"/>
+<text x="84" y="989" font-size="15" font-weight="800" fill="#ffffff">needs-hardening</text>
+<text x="68" y="1036" font-size="24" font-weight="900" fill="#0f172a">WASM</text>
+<text x="68" y="1092" font-size="17" font-weight="400" fill="#334155">Browser and JavaScript runtime build target.</text>
+<text x="68" y="1182" font-size="16" font-weight="800" fill="#334155">Primary paths</text>
+<text x="372" y="1182" font-size="16" font-weight="800" fill="#334155">Signals</text>
+<circle cx="76" cy="1208" r="3.2" fill="#64748b"/>
+<text x="88" y="1212" font-size="15" fill="#0f172a">bindings/wasm/</text>
+<circle cx="380" cy="1208" r="3.2" fill="#64748b"/>
+<text x="392" y="1212" font-size="15" fill="#0f172a">Separate product</text>
+<circle cx="380" cy="1230" r="3.2" fill="#64748b"/>
+<text x="392" y="1234" font-size="15" fill="#0f172a">CT signing gate required</text>
+<circle cx="380" cy="1252" r="3.2" fill="#64748b"/>
+<text x="392" y="1256" font-size="15" fill="#0f172a">Dedicated tests required</text>
+</g>
+<g id="profile-node-compat-shims">
+<rect x="718" y="944" width="640" height="350" rx="22" fill="#f8fafc" stroke="#64748b" stroke-width="3"/>
+<rect x="742" y="966" width="250" height="34" rx="17" fill="#64748b"/>
+<text x="760" y="989" font-size="15" font-weight="800" fill="#ffffff">compat-only</text>
+<text x="744" y="1036" font-size="24" font-weight="900" fill="#0f172a">Node Compatibility Shims</text>
+<text x="744" y="1092" font-size="17" font-weight="400" fill="#334155">Compatibility shims for Bitcoin-family nodes; separate from</text>
+<text x="744" y="1115" font-size="17" font-weight="400" fill="#334155">the Bitcoin Core backend profile.</text>
+<text x="744" y="1182" font-size="16" font-weight="800" fill="#334155">Primary paths</text>
+<text x="1048" y="1182" font-size="16" font-weight="800" fill="#334155">Signals</text>
+<circle cx="752" cy="1208" r="3.2" fill="#64748b"/>
+<text x="764" y="1212" font-size="15" fill="#0f172a">compat/libsecp256k1_shim/</text>
+<circle cx="752" cy="1230" r="3.2" fill="#64748b"/>
+<text x="764" y="1234" font-size="15" fill="#0f172a">compat/libsecp256k1_bchn_shim/</text>
+<circle cx="1056" cy="1208" r="3.2" fill="#64748b"/>
+<text x="1068" y="1212" font-size="15" fill="#0f172a">Bitcoin/Litecoin/Dogecoin families</text>
+<circle cx="1056" cy="1230" r="3.2" fill="#64748b"/>
+<text x="1068" y="1234" font-size="15" fill="#0f172a">BCH node variants</text>
+<circle cx="1056" cy="1252" r="3.2" fill="#64748b"/>
+<text x="1068" y="1256" font-size="15" fill="#0f172a">Profile-gated compat surfaces</text>
+</g>
+<g id="profile-caas-audit">
+<rect x="42" y="1328" width="640" height="350" rx="22" fill="#fff1f2" stroke="#be123c" stroke-width="3"/>
+<rect x="66" y="1350" width="250" height="34" rx="17" fill="#be123c"/>
+<text x="84" y="1373" font-size="15" font-weight="800" fill="#ffffff">evidence-system</text>
+<text x="68" y="1420" font-size="24" font-weight="900" fill="#0f172a">CAAS / Audit</text>
+<text x="68" y="1476" font-size="17" font-weight="400" fill="#334155">Continuous Audit as a Service, exploit PoCs, source graph, and</text>
+<text x="68" y="1499" font-size="17" font-weight="400" fill="#334155">evidence bundles.</text>
+<text x="68" y="1566" font-size="16" font-weight="800" fill="#334155">Primary paths</text>
+<text x="372" y="1566" font-size="16" font-weight="800" fill="#334155">Signals</text>
+<circle cx="76" cy="1592" r="3.2" fill="#64748b"/>
+<text x="88" y="1596" font-size="15" fill="#0f172a">audit/</text>
+<circle cx="76" cy="1614" r="3.2" fill="#64748b"/>
+<text x="88" y="1618" font-size="15" fill="#0f172a">ci/caas_runner.py</text>
+<circle cx="76" cy="1636" r="3.2" fill="#64748b"/>
+<text x="88" y="1640" font-size="15" fill="#0f172a">ci/audit_gate.py</text>
+<circle cx="76" cy="1658" r="3.2" fill="#64748b"/>
+<text x="88" y="1662" font-size="15" fill="#0f172a">tools/source_graph_kit/</text>
+<circle cx="380" cy="1592" r="3.2" fill="#64748b"/>
+<text x="392" y="1596" font-size="15" fill="#0f172a">Profile gates</text>
+<circle cx="380" cy="1614" r="3.2" fill="#64748b"/>
+<text x="392" y="1618" font-size="15" fill="#0f172a">Fresh evidence</text>
+<circle cx="380" cy="1636" r="3.2" fill="#64748b"/>
+<text x="392" y="1640" font-size="15" fill="#0f172a">Traceability</text>
+</g>
+<g id="profile-docs-evidence">
+<rect x="718" y="1328" width="640" height="350" rx="22" fill="#ecfdf5" stroke="#047857" stroke-width="3"/>
+<rect x="742" y="1350" width="250" height="34" rx="17" fill="#047857"/>
+<text x="760" y="1373" font-size="15" font-weight="800" fill="#ffffff">claim-control</text>
+<text x="744" y="1420" font-size="24" font-weight="900" fill="#0f172a">Docs / Evidence</text>
+<text x="744" y="1476" font-size="17" font-weight="400" fill="#334155">Security claims, API contracts, benchmarks, and</text>
+<text x="744" y="1499" font-size="17" font-weight="400" fill="#334155">reviewer-facing evidence.</text>
+<text x="744" y="1566" font-size="16" font-weight="800" fill="#334155">Primary paths</text>
+<text x="1048" y="1566" font-size="16" font-weight="800" fill="#334155">Signals</text>
+<circle cx="752" cy="1592" r="3.2" fill="#64748b"/>
+<text x="764" y="1596" font-size="15" fill="#0f172a">docs/</text>
+<circle cx="752" cy="1614" r="3.2" fill="#64748b"/>
+<text x="764" y="1618" font-size="15" fill="#0f172a">SECURITY.md</text>
+<circle cx="752" cy="1636" r="3.2" fill="#64748b"/>
+<text x="764" y="1640" font-size="15" fill="#0f172a">AUDIT_REPORT.md</text>
+<circle cx="1056" cy="1592" r="3.2" fill="#64748b"/>
+<text x="1068" y="1596" font-size="15" fill="#0f172a">No stale claims</text>
+<circle cx="1056" cy="1614" r="3.2" fill="#64748b"/>
+<text x="1068" y="1618" font-size="15" fill="#0f172a">Bench sanity</text>
+<circle cx="1056" cy="1636" r="3.2" fill="#64748b"/>
+<text x="1068" y="1640" font-size="15" fill="#0f172a">Reviewer map</text>
+</g>
+</g>
+</g>
+</svg>

@@ -1,0 +1,318 @@
+# Contributing to UltrafastSecp256k1
+
+Thank you for your interest in contributing to UltrafastSecp256k1! This document provides guidelines for contributing to the project.
+
+## [!] Requirements for Acceptable Contributions
+
+All contributions **MUST** comply with the following before they can be accepted:
+
+1. **Coding Standards** -- read and follow the [Coding Standards](https://github.com/shrec/UltrafastSecp256k1/blob/main/docs/CODING_STANDARDS.md) document in full
+2. **All tests pass** -- `ctest --test-dir out/dev --output-on-failure`
+3. **Code formatted** -- `clang-format -i <files>` (`.clang-format` config in repo root)
+4. **No compiler warnings** -- clean build with `-Wall -Wextra`
+5. **License** -- all contributions are licensed under the [MIT License](https://github.com/shrec/UltrafastSecp256k1/blob/main/LICENSE)
+6. **Security** -- follow the [Security Policy](https://github.com/shrec/UltrafastSecp256k1/blob/main/SECURITY.md); never open public issues for vulnerabilities
+
+Pull requests that do not meet these requirements will be rejected.
+
+## 📋 Table of Contents
+
+- [Requirements for Acceptable Contributions](#-requirements-for-acceptable-contributions)
+- [Developer Certificate of Origin (DCO)](#developer-certificate-of-origin-dco)
+- [Code of Conduct](#code-of-conduct)
+- [Getting Started](#getting-started)
+- [Development Process](#development-process)
+- [Coding Standards](#coding-standards)
+- [Testing](#testing)
+- [Pull Request Process](#pull-request-process)
+- [Reporting Issues](#reporting-issues)
+- [Areas for Contribution](#areas-for-contribution)
+
+## 📜 Developer Certificate of Origin (DCO)
+
+All contributors **MUST** sign off their commits to certify they have the legal right to submit the contribution under the project's license. This project uses the [Developer Certificate of Origin (DCO)](https://developercertificate.org/).
+
+By adding a `Signed-off-by` line to your commit messages, you certify that:
+
+1. The contribution was created in whole or in part by you, and you have the right to submit it under the MIT license; or
+2. The contribution is based on previous work that, to the best of your knowledge, is covered under an appropriate open-source license; or
+3. The contribution was provided to you by someone who certified (1) or (2), and you have not modified it.
+
+### How to Sign Off
+
+Add `-s` (or `--signoff`) to your `git commit` command:
+
+```bash
+git commit -s -m "Add new feature"
+```
+
+This appends a line like:
+
+```
+Signed-off-by: Your Name <your.email@example.com>
+```
+
+All commits in a pull request **must** include this sign-off line. Commits without it will not be accepted.
+
+## 🤝 Code of Conduct
+
+- Be respectful and inclusive
+- Focus on constructive feedback
+- Help others learn and grow
+- Maintain professional communication
+
+## 🚀 Getting Started
+
+### Prerequisites
+
+```bash
+# Install dependencies
+# Ubuntu/Debian
+sudo apt install cmake ninja-build g++-14 clang-tidy
+
+# Arch Linux
+sudo pacman -S cmake ninja gcc clang
+
+# macOS
+brew install cmake ninja llvm
+```
+
+### Development Build
+
+```bash
+git clone https://github.com/shrec/UltrafastSecp256k1.git
+cd UltrafastSecp256k1
+cmake -S . -B out/dev -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DSECP256K1_BUILD_TESTS=ON
+cmake --build out/dev -j
+```
+
+## 🔄 Development Process
+
+### For maintainer (shrec):
+
+1. **Commit** changes directly to `dev`: `git commit -m 'Add amazing feature'`
+2. **Push** immediately: `git push origin dev`
+
+### For external contributors:
+
+1. **Fork** the repository on GitHub
+2. **Commit** your changes on your fork (use `dev` as the base branch)
+3. **Push** to your fork: `git push origin dev`
+4. **Open** a Pull Request against the upstream `dev` branch
+
+### Strict Branch Governance (Mandatory)
+
+This repository has exactly **two long-lived branches**:
+
+| Branch | Purpose |
+|--------|---------|
+| `dev` | All development work — every feature, fix, optimization, and experiment |
+| `main` | Release branch only — merged from `dev` at release time only |
+
+**Do not create feature branches.** All work goes directly to `dev`. There are no
+`feature/*`, `fix/*`, `perf/*`, or any other sub-branches. Any branch other than
+`dev`, `main`, or `gh-pages` will be deleted immediately.
+
+Release flow: `dev` → CI green → owner authorization → merge to `main` → release tag.
+
+## 📝 Coding Standards
+
+> **Full reference:** [docs/CODING_STANDARDS.md](https://github.com/shrec/UltrafastSecp256k1/blob/main/docs/CODING_STANDARDS.md)
+
+The complete coding standards document covers naming, formatting, hot-path contracts, memory model, cryptographic correctness, GPU rules, and commit standards. Below is a summary.
+
+### C++ Style
+
+- **Standard**: C++20
+- **Formatting**: ClangFormat (`.clang-format` provided)
+- **Naming Conventions**:
+  - Classes: `PascalCase`
+  - Functions: `snake_case`
+  - Variables: `snake_case`
+  - Constants: `UPPER_SNAKE_CASE`
+  - Member variables: `m_snake_case` or `snake_case_`
+
+### Code Example
+
+```cpp
+namespace secp256k1::fast {
+
+class FieldElement {
+public:
+    FieldElement() = default;
+    
+    static FieldElement from_hex(std::string_view hex);
+    
+    FieldElement operator+(const FieldElement& other) const;
+    
+private:
+    std::array<uint64_t, 4> m_limbs{};
+};
+
+} // namespace secp256k1::fast
+```
+
+### Documentation
+
+- Use Doxygen-style comments for public APIs
+- Document complex algorithms
+- Include performance characteristics where relevant
+
+```cpp
+/**
+ * @brief Multiply two field elements modulo p
+ * 
+ * @param a First operand
+ * @param b Second operand
+ * @return Product a * b (mod p)
+ * 
+ * @note This operation is constant-time
+ * @performance ~8ns on x86-64 with assembly, ~25ns portable
+ */
+FieldElement field_mul(const FieldElement& a, const FieldElement& b);
+```
+
+## 🧪 Testing
+
+### Running Tests
+
+```bash
+# All tests
+ctest --test-dir out/dev --output-on-failure
+
+# Specific test
+./build-dev/cpu/tests/test_field
+
+# With verbose output
+ctest --test-dir out/dev -V
+```
+
+### Adding Tests
+
+- Place tests in `cpu/tests/` or `cuda/tests/`
+- Use descriptive test names
+- Test edge cases and error conditions
+- Include performance regression tests
+
+```cpp
+TEST(FieldElement, MultiplicationIsCommutative) {
+    auto a = FieldElement::from_hex("1234...");
+    auto b = FieldElement::from_hex("5678...");
+    
+    EXPECT_EQ(a * b, b * a);
+}
+```
+
+## 📤 Pull Request Process
+
+### Before Submitting
+
+1. **Build** successfully: `cmake --build out/dev`
+2. **Pass all tests**: `ctest --test-dir out/dev`
+3. **Format code**: `clang-format -i <files>`
+4. **Run clang-tidy**: `clang-tidy -p build-dev cpu/src/*.cpp`
+5. **Update documentation** if needed
+6. **Add tests** for new features
+
+A PR checklist template is automatically applied -- see [.github/PULL_REQUEST_TEMPLATE.md](https://github.com/shrec/UltrafastSecp256k1/blob/main/.github/PULL_REQUEST_TEMPLATE.md).
+
+### Review Process
+
+- Maintainers will review within 48-72 hours
+- Address feedback in new commits (don't force push)
+- Once approved, maintainers will merge
+
+## 🎯 Areas for Contribution
+
+### High Priority
+
+- **Formal verification** of field/scalar arithmetic
+- **Side-channel analysis** and hardening (cache-timing, power analysis)
+- **Performance benchmarking** on new hardware (Apple M3/M4, Intel Raptor Lake, AMD Zen 5)
+- **GPU kernel optimization** (occupancy, register pressure, warp-level primitives)
+- **Additional signature schemes** (EdDSA/Ed25519, multi-sig)
+
+### Good First Issues
+
+- Documentation improvements and typo fixes
+- Example programs (key derivation, address generation, HD wallets)
+- Test coverage improvements (edge cases, error paths)
+- Build system enhancements (new compilers, package managers)
+- Localization of documentation
+
+### Advanced Contributions
+
+- **FPGA** acceleration port
+- **New embedded targets** (nRF52, RP2040, AVR)
+- **Multi-scalar multiplication** (Pippenger, Straus)
+- **Batch verification** for ECDSA and Schnorr signatures
+- **Zero-knowledge proof** integration
+- **Threshold signatures** (FROST, GG20)
+
+### Already Implemented [OK]
+
+The following were previously listed as desired contributions and are now part of v3.12:
+
+- [OK] ARM64/AArch64 assembly optimizations (MUL/UMULH)
+- [OK] OpenCL implementation (3.39M kG/s)
+- [OK] WebAssembly port (Emscripten, npm package)
+- [OK] Constant-time layer (ct:: namespace)
+- [OK] ECDSA signatures (RFC 6979)
+- [OK] Schnorr signatures (BIP-340)
+- [OK] iOS support (XCFramework, SPM, CocoaPods)
+- [OK] Android NDK support
+- [OK] ROCm/HIP GPU support
+- [OK] ESP32/STM32 embedded support
+- [OK] Linux distribution packaging (DEB, RPM, Arch/AUR)
+- [OK] Docker multi-stage build
+- [OK] Clang-tidy CI integration
+- [OK] GitHub Scorecard + OpenSSF Best Practices badge
+
+## 🐛 Reporting Issues
+
+### Bug Reports
+
+Include:
+- **Description**: What happened vs. what should happen
+- **Steps to reproduce**: Minimal reproducible example
+- **Environment**: OS, compiler, CMake version, CPU architecture
+- **Build configuration**: CMake options used
+- **Logs**: Relevant error messages or stack traces
+
+### Feature Requests
+
+Include:
+- **Use case**: What problem does it solve?
+- **Proposed API**: How would you like to use it?
+- **Alternatives**: What workarounds exist?
+
+## 📚 Resources
+
+- [Documentation Index](docs/README.md)
+- [API Reference](docs/API_REFERENCE.md)
+- [Building Guide](docs/BUILDING.md)
+- [Benchmarks](docs/BENCHMARKS.md)
+- [Security Policy](SECURITY.md)
+- [Changelog](CHANGELOG.md)
+
+## 📧 Contact
+
+- **Issues**: [GitHub Issues](https://github.com/shrec/UltrafastSecp256k1/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/shrec/UltrafastSecp256k1/discussions)
+
+---
+
+## Sponsorship & Funding
+
+We are actively seeking sponsors for:
+
+- **Bug bounty program** -- financial rewards for security researchers
+- **Ongoing development** -- GPU acceleration, ZK proofs, formal verification, platform ports
+
+See the [README](README.md#seeking-sponsors----audit-bug-bounty--development) for details, or sponsor via [GitHub Sponsors](https://github.com/sponsors/shrec).
+
+---
+
+Thank you for contributing to UltrafastSecp256k1!

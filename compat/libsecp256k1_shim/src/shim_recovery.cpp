@@ -1,0 +1,240 @@
+// ============================================================================
+// shim_recovery.cpp -- ECDSA sign-recoverable + public key recovery
+// ============================================================================
+// Implements the libsecp256k1 recovery module API using the internal
+// ct::ecdsa_sign_recoverable() (constant-time) and ecdsa_recover() (fast,
+// recovery is a public operation).
+// ============================================================================
+
+#include "secp256k1_recovery.h"
+#include "shim_internal.hpp"
+#include "shim_pubkey_helpers.hpp"
+
+#include <cstring>
+#include <array>
+
+#include "secp256k1/scalar.hpp"
+#include "secp256k1/point.hpp"
+#include "secp256k1/field.hpp"
+#include "secp256k1/recovery.hpp"
+#include "secp256k1/ct/sign.hpp"
+#include "secp256k1/detail/secure_erase.hpp"   // CT-01: erase parsed private-key scalar
+#include "secp256k1/ct/point.hpp"
+
+using namespace secp256k1::fast;
+
+// Context flag helpers — use the canonical implementations from shim_internal.hpp.
+// NULL ctx returns false (matches libsecp256k1: triggers illegal callback, returns 0).
+using secp256k1_shim_internal::ctx_flags;
+using secp256k1_shim_internal::ctx_can_sign;
+using secp256k1_shim_internal::ctx_can_verify;
+using secp256k1_shim_internal::scalar_be_to_internal;
+using secp256k1_shim_internal::scalar_internal_to_be;
+
+// point_to_pubkey_data from shim_pubkey_helpers.hpp
+using secp256k1_shim_internal::point_to_pubkey_data;
+
+// Recoverable sig opaque layout: data[0] = recid, then r and s in libsecp-style
+// little-endian internal scalar bytes. Public compact parse/serialize stays BE.
+
+static void rsig_to_data(const secp256k1::RecoverableSignature& rsig,
+                         unsigned char data[65]) {
+    data[0] = static_cast<unsigned char>(rsig.recid & 0x03);
+    auto rb = rsig.sig.r.to_bytes();
+    auto sb = rsig.sig.s.to_bytes();
+    scalar_be_to_internal(data + 1, rb.data());
+    scalar_be_to_internal(data + 33, sb.data());
+}
+
+static secp256k1::RecoverableSignature rsig_from_data(const unsigned char data[65]) {
+    // T-07: strict parse — values >= n are cleared to zero so downstream verify fails cleanly.
+    Scalar r_scalar, s_scalar;
+    unsigned char r_be[32]{}, s_be[32]{};
+    scalar_internal_to_be(r_be, data + 1);
+    scalar_internal_to_be(s_be, data + 33);
+    if (!Scalar::parse_bytes_strict(r_be, r_scalar)) r_scalar = Scalar::zero();
+    if (!Scalar::parse_bytes_strict(s_be, s_scalar)) s_scalar = Scalar::zero();
+    return {
+        { r_scalar, s_scalar },
+        static_cast<int>(data[0] & 0x03)
+    };
+}
+
+extern "C" {
+
+// -- Parse / Serialize --------------------------------------------------------
+
+int secp256k1_ecdsa_recoverable_signature_parse_compact(
+    const secp256k1_context *ctx,
+    secp256k1_ecdsa_recoverable_signature *sig,
+    const unsigned char *input64,
+    int recid)
+{
+    SHIM_REQUIRE_CTX(ctx);
+    if (!sig || !input64) {
+        secp256k1_shim_call_illegal_cb(ctx,
+            "secp256k1_ecdsa_recoverable_signature_parse_compact: NULL argument");
+        return 0;
+    }
+    // On any parse failure, zero the output to match upstream libsecp256k1
+    // (main_impl.h memsets the recoverable sig on its failure path) — fail-closed,
+    // no stale/partial recid+r+s left behind (PASS3-SHIM-001).
+    if (recid < 0 || recid > 3) { std::memset(sig->data, 0, sizeof(sig->data)); return 0; }
+    // Accept r and s in [0, n-1] at parse time — matches libsecp256k1 behavior.
+    // Rejection of r==0 or s==0 happens at secp256k1_ecdsa_recover time, not here.
+    // Using parse_bytes_strict_nonzero was a divergence from libsecp (PASS3-002 fix).
+    Scalar r, s;
+    if (!Scalar::parse_bytes_strict(reinterpret_cast<const uint8_t*>(input64),      r) ||
+        !Scalar::parse_bytes_strict(reinterpret_cast<const uint8_t*>(input64 + 32), s)) {
+        std::memset(sig->data, 0, sizeof(sig->data));
+        return 0;
+    }
+    sig->data[0] = static_cast<unsigned char>(recid);
+    scalar_be_to_internal(sig->data + 1, input64);
+    scalar_be_to_internal(sig->data + 33, input64 + 32);
+    return 1;
+}
+
+int secp256k1_ecdsa_recoverable_signature_serialize_compact(
+    const secp256k1_context *ctx,
+    unsigned char *output64,
+    int *recid,
+    const secp256k1_ecdsa_recoverable_signature *sig)
+{
+    SHIM_REQUIRE_CTX(ctx);
+    if (!output64 || !recid || !sig) {
+        secp256k1_shim_call_illegal_cb(ctx,
+            "secp256k1_ecdsa_recoverable_signature_serialize_compact: NULL argument");
+        return 0;
+    }
+    *recid = static_cast<int>(sig->data[0] & 0x03);
+    scalar_internal_to_be(output64, sig->data + 1);
+    scalar_internal_to_be(output64 + 32, sig->data + 33);
+    return 1;
+}
+
+int secp256k1_ecdsa_recoverable_signature_convert(
+    const secp256k1_context *ctx,
+    secp256k1_ecdsa_signature *sig,
+    const secp256k1_ecdsa_recoverable_signature *sigin)
+{
+    SHIM_REQUIRE_CTX(ctx);
+    if (!sig || !sigin) {
+        secp256k1_shim_call_illegal_cb(ctx,
+            "secp256k1_ecdsa_recoverable_signature_convert: NULL argument");
+        return 0;
+    }
+    // Non-recoverable sig uses the same internal scalar layout; strip recid.
+    std::memcpy(sig->data, sigin->data + 1, 64);
+    return 1;
+}
+
+// -- Sign (recoverable) -------------------------------------------------------
+
+int secp256k1_ecdsa_sign_recoverable(
+    const secp256k1_context *ctx,
+    secp256k1_ecdsa_recoverable_signature *sig,
+    const unsigned char *msghash32,
+    const unsigned char *seckey,
+    secp256k1_nonce_function noncefp,
+    const void *ndata)
+{
+    if (!ctx) {
+        secp256k1_shim_call_illegal_cb(nullptr, "secp256k1_ecdsa_sign_recoverable: NULL context");
+        return 0;
+    }
+    if (!ctx_can_sign(ctx)) return 0;
+    // SHIM-005: NULL args must fire the illegal callback (matching libsecp behavior)
+    if (!sig || !msghash32 || !seckey) {
+        secp256k1_shim_call_illegal_cb(ctx, "secp256k1_ecdsa_sign_recoverable: NULL argument");
+        return 0;
+    }
+    std::memset(sig->data, 0, sizeof(sig->data));
+    secp256k1_shim_internal::ContextBlindingScope _blind(ctx);
+    if (noncefp != nullptr &&
+        noncefp != secp256k1_nonce_function_rfc6979 &&
+        noncefp != secp256k1_nonce_function_default) {
+        secp256k1_shim_call_illegal_cb(ctx,
+            "secp256k1_ecdsa_sign_recoverable: custom nonce functions are not supported; "
+            "pass NULL or secp256k1_nonce_function_rfc6979");
+        return 0;
+    }
+
+    std::array<uint8_t, 32> msg{};
+    std::memcpy(msg.data(), msghash32, 32);
+
+    Scalar privkey_scalar;
+    if (!Scalar::parse_bytes_strict_nonzero(
+            reinterpret_cast<const uint8_t*>(seckey), privkey_scalar)) {
+        secp256k1::detail::secure_erase(&privkey_scalar, sizeof(privkey_scalar));  // CT-01
+        return 0;
+    }
+
+    secp256k1::RecoverableSignature rsig;
+#ifdef SECP256K1_SHIM_RFC6979_COMPAT
+    rsig = secp256k1::ct::ecdsa_sign_libsecp_compat_recoverable(
+        msg, privkey_scalar,
+        ndata ? reinterpret_cast<const uint8_t*>(ndata) : nullptr);
+    // CT-01: privkey_scalar consumed by the sign call — erase before any return.
+    secp256k1::detail::secure_erase(&privkey_scalar, sizeof(privkey_scalar));
+    if (rsig.sig.r.is_zero() || rsig.sig.s.is_zero()) return 0;
+#else
+    if (ndata) {
+        // RFC 6979 + extra entropy: sign hedged and derive recid from R's y-parity
+        // during signing — no post-sign ecdsa_recover loop needed.
+        // Previously this called ecdsa_sign_hedged() then 4x ecdsa_recover (4-5×
+        // overhead per grind iteration). ecdsa_sign_hedged_recoverable() eliminates
+        // the recovery loop by computing recid from K's affine y-coordinate and
+        // x-overflow flag, the same as ct::ecdsa_sign_recoverable().
+        std::array<uint8_t, 32> aux{};
+        std::memcpy(aux.data(), ndata, 32);
+        rsig = secp256k1::ct::ecdsa_sign_hedged_recoverable(msg, privkey_scalar, aux);
+        // CT-01: erase the parsed key scalar and the hedging entropy.
+        secp256k1::detail::secure_erase(&privkey_scalar, sizeof(privkey_scalar));
+        secp256k1::detail::secure_erase(aux.data(), aux.size());
+        if (rsig.sig.r.is_zero() || rsig.sig.s.is_zero()) return 0;
+    } else {
+        rsig = secp256k1::ct::ecdsa_sign_recoverable(msg, privkey_scalar);
+        secp256k1::detail::secure_erase(&privkey_scalar, sizeof(privkey_scalar));  // CT-01
+    }
+#endif
+
+    if (rsig.sig.r.is_zero() || rsig.sig.s.is_zero()) return 0;
+
+    rsig_to_data(rsig, sig->data);
+    return 1;
+}
+
+// -- Recover public key -------------------------------------------------------
+
+int secp256k1_ecdsa_recover(
+    const secp256k1_context *ctx,
+    secp256k1_pubkey *pubkey,
+    const secp256k1_ecdsa_recoverable_signature *sig,
+    const unsigned char *msghash32)
+{
+    if (!ctx_can_verify(ctx)) return 0;
+    if (!pubkey || !sig || !msghash32) {
+        secp256k1_shim_call_illegal_cb(ctx, "secp256k1_ecdsa_recover: NULL argument");
+        return 0;
+    }
+
+    std::array<uint8_t, 32> msg{};
+    std::memcpy(msg.data(), msghash32, 32);
+
+    auto rsig = rsig_from_data(sig->data);
+
+    auto [pk, ok] = secp256k1::ecdsa_recover(msg, rsig.sig, rsig.recid);
+    if (!ok || pk.is_infinity()) {
+        // PASS-COMPAT-002: upstream secp256k1_ecdsa_recover memsets the output
+        // pubkey to 0 on failure. pubkey is output-only (separate from msg/sig),
+        // so zero it to match (no in-place hazard).
+        std::memset(pubkey->data, 0, sizeof(pubkey->data));
+        return 0;
+    }
+
+    point_to_pubkey_data(pk, pubkey->data);
+    return 1;
+}
+
+} // extern "C"

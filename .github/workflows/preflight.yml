@@ -1,0 +1,283 @@
+# preflight.yml -- Pre-commit quality gate
+# Runs preflight.py checks on every push/PR to main/dev.
+# Hard-fail: --security, --abi, --freshness, validate_assurance.py
+# Advisory: --coverage (may flag gaps that are acknowledged in FEATURE_ASSURANCE_LEDGER),
+#           --changed (informational only, no blocking threshold)
+
+name: Preflight
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preflight-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0  # full history for git diff
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Build project graph
+        run: python3 ci/build_project_graph.py --rebuild
+
+      - name: Build source graph
+        run: python3 tools/source_graph_kit/source_graph.py build -i
+
+      - name: Preflight -- Security invariants (hard-fail)
+        run: python3 ci/preflight.py --security
+
+      - name: Preflight -- CUDA/MSVC portability (hard-fail)
+        run: python3 ci/preflight.py --cuda-msvc
+
+      - name: Preflight -- ABI surface (hard-fail)
+        run: python3 ci/preflight.py --abi
+
+      - name: Preflight -- Coverage gaps (advisory)
+        # Advisory: coverage regressions surface as a yellow step in the UI
+        # rather than silently passing. "|| true" was previously masking the
+        # outcome entirely.
+        continue-on-error: true
+        run: python3 ci/preflight.py --coverage
+
+      - name: Preflight -- Graph freshness (hard-fail)
+        run: python3 ci/preflight.py --freshness
+
+      - name: Preflight -- Changed files impact (advisory)
+        # Advisory: changed-file impact analysis is informational; surface
+        # any non-zero outcome as a yellow step in the UI.
+        continue-on-error: true
+        run: python3 ci/preflight.py --changed
+
+      - name: Preflight -- Advisory summary (CI-005)
+        # Aggregate outcomes of continue-on-error advisory steps and surface them
+        # as a visible ::notice:: in the step summary so coverage/impact regressions
+        # are not silently dropped even when they don't block the job.
+        if: always()
+        run: |
+          python3 ci/preflight.py --coverage --summary-only 2>/dev/null \
+            && echo "::notice::Coverage advisory: PASS" \
+            || echo "::notice::Coverage advisory: FAIL — review coverage gaps before merge"
+          python3 ci/preflight.py --changed --summary-only 2>/dev/null \
+            && echo "::notice::Impact advisory: PASS" \
+            || echo "::notice::Impact advisory: FAIL — changed-file analysis flagged issues"
+
+      - name: Preflight -- Code quality gate (hard-fail on regression)
+        run: python3 ci/preflight.py --bug-scan
+
+      - name: Preflight — doc sync check
+        run: python3 ci/preflight.py --doc-sync
+
+      - name: Python audit infrastructure self-test (hard-fail)
+        run: python3 ci/test_audit_scripts.py --quick
+
+      - name: Assurance docs validation (hard-fail)
+        run: python3 ci/validate_assurance.py
+
+      - name: GPU backend parity gate (CUDA/OpenCL/Metal, hard-fail)
+        # Enforces the owner rule that any GpuBackend operation must be native
+        # on CUDA, OpenCL, and Metal (plus required C ABI exposure), unless a
+        # documented owner-approved exception exists in
+        # docs/BACKEND_ASSURANCE_MATRIX.md's "Permanent Architecture
+        # Exceptions" table. Pure static source scan, no GPU hardware needed.
+        run: python3 ci/check_gpu_backend_parity.py
+
+      # -----------------------------------------------------------------------
+      # CAAS gates — all four stages run here as a fast preflight guard.
+      # The dedicated caas.yml workflow runs them as separate blocking jobs;
+      # we include them here so a single preflight job also catches regressions.
+      # -----------------------------------------------------------------------
+
+      - name: Install build dependencies (needed by CAAS P0 harnesses)
+        run: sudo apt-get install -y --no-install-recommends ninja-build g++-14
+
+      - name: Build shared library (needed by CAAS P0 harnesses)
+        run: |
+          cmake -S . -B out/ci-audit -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DBUILD_TESTING=OFF \
+            -DSECP256K1_BUILD_PROTOCOL_TESTS=OFF \
+            -DSECP256K1_BUILD_FUZZ_TESTS=OFF
+          cmake --build out/ci-audit --target ufsecp_shared -j $(nproc)
+
+      - name: CAAS Stage 0 — Exploit Wiring Parity (hard-fail)
+        # Enforces the Conversion Standard: every audit/test_exploit_*.cpp file
+        # that exposes a *_run() entry point must be registered in
+        # unified_audit_runner.cpp. Added 2026-04-17 after BUG-A1 where 16
+        # on-disk PoCs bypassed the aggregated audit verdict.
+        run: python3 ci/check_exploit_wiring.py
+
+      - name: CAAS Stage 0c — Exploit Traceability Join (hard-fail)
+        # G-9b: joins exploit catalog, threat model, and spec traceability matrix.
+        # Fails if any exploit PoC is uncatalogued, any RR-NNN is undefined, or
+        # any spec row points at a non-existent path.
+        # Added here so it runs on every push/PR (was only in manual caas.yml).
+        run: python3 ci/exploit_traceability_join.py
+
+      - name: Build unified_audit_runner (exploit_poc smoke)
+        # Builds the full audit runner binary so we can run the exploit_poc
+        # section in preflight. Without this, individual module regressions
+        # (MEDIUM-1) are invisible to the preflight gate — only script-level
+        # CAAS stages ran. Separate build dir so BUILD_TESTING=ON does not
+        # pollute the ufsecp_shared build used by P0 harnesses.
+        run: |
+          cmake -S . -B out/ci-preflight-runner -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DBUILD_TESTING=ON \
+            -DSECP256K1_BUILD_FUZZ_TESTS=OFF \
+            -DSECP256K1_BUILD_PROTOCOL_TESTS=OFF
+          cmake --build out/ci-preflight-runner --target unified_audit_runner -j $(nproc)
+
+      - name: CAAS Stage 0b — exploit_poc section smoke (hard-fail)
+        # Runs only the exploit_poc section so we catch PoC-level regressions
+        # in preflight without the full 327-module run (which belongs to ci.yml
+        # caas-full). Fails if any mandatory module fails.
+        run: |
+          ./out/ci-preflight-runner/audit/unified_audit_runner \
+            --section exploit_poc \
+            --json-only \
+            --report-dir .
+          python3 -c "
+          import json, sys
+          d = json.load(open('audit_report.json'))
+          s = d.get('summary', d)
+          failed = s.get('failed', 0)
+          verdict = s.get('audit_verdict', 'unknown')
+          print(f'exploit_poc smoke: verdict={verdict}  failed={failed}')
+          if failed > 0:
+              print(f'::error::exploit_poc: {failed} module(s) FAILED — see audit_report.json')
+              sys.exit(1)
+          print('::notice::exploit_poc section: all modules PASS')
+          "
+
+      - name: CAAS Stage 0d — Rule 16 enforcement (advisory skip-return)
+        # P1-CI-01 fix (2026-05-23): post-build Rule 16 enforcement via the
+        # shared ci/rule16_enforce.sh wrapper (introduced 2026-05-24 to
+        # deduplicate the previously-inline three-workflow wrapper that
+        # SonarCloud Quality Gate flagged at 9.1% duplication).
+        env:
+          UFSECP_BUILD_DIR: ${{ github.workspace }}/out/ci-preflight-runner
+        run: bash ci/rule16_enforce.sh
+
+      - name: CAAS Stage 1 — Static Analysis (hard-fail on HIGH findings)
+        run: |
+          python3 ci/audit_test_quality_scanner.py --json -o caas_scanner.json
+          python3 - <<'EOF'
+          import json, sys
+          with open("caas_scanner.json") as f:
+              report = json.load(f)
+          findings = report.get("findings", [])
+          high = [f for f in findings if f.get("severity","").upper() == "HIGH"]
+          if high:
+              for fnd in high:
+                  print(f"  [HIGH] {fnd['file']}:{fnd['line']} {fnd['label']}: {fnd['description']}")
+              print(f"FAIL: {len(high)} HIGH finding(s) — CAAS Stage 1 blocks on HIGH severity", file=sys.stderr)
+              sys.exit(1)
+          total = len(findings)
+          print(f"PASS: 0 HIGH findings ({total} MEDIUM/LOW are tracked in baseline, not blocking)")
+          EOF
+
+      - name: Rebuild project graph (ensures fresh paths for audit gate)
+        run: python3 ci/build_project_graph.py --rebuild
+
+      - name: Rebuild source graph (ensures fresh CAAS graph-quality evidence)
+        run: python3 tools/source_graph_kit/source_graph.py build -i
+
+      - name: CAAS Stage 2 — Audit Gate P0–P21 (hard-fail)
+        run: |
+          set +e
+          python3 ci/audit_gate.py --json -o caas_audit_gate.json
+          GATE_EXIT=$?
+          set -e
+          python3 ci/parse_gate_report.py caas_audit_gate.json
+          exit $GATE_EXIT
+
+      - name: CAAS Stage 2b — Shim Parser Parity (hard-fail)
+        run: python3 ci/check_libsecp_shim_parity.py
+
+      - name: CAAS Stage 2f — Libsecp Shim API Compatibility (hard-fail)
+        run: bash ci/run_libsecp_shim_api_test.sh out/ci-preflight-shim-api
+
+      - name: CAAS Stage 2c — Core Build Mode (hard-fail)
+        run: python3 ci/check_core_build_mode.py
+
+      - name: CAAS Stage 2d — Source Graph Quality (hard-fail)
+        run: python3 ci/check_source_graph_quality.py
+
+      - name: CAAS Stage 2e — Bitcoin Core test_bitcoin Gate (hard-fail)
+        run: python3 ci/check_bitcoin_core_test_results.py
+
+      - name: CAAS Stage 3 — Security Autonomy 100/100 (hard-fail)
+        run: |
+          python3 ci/security_autonomy_check.py --json -o caas_autonomy.json
+          rc=$?
+          # Exit 77 = ADVISORY_SKIP_CODE: all gates absent (no GPU/infra) → advisory skip, not failure
+          if [ $rc -eq 77 ]; then
+            echo "::notice::security_autonomy advisory-skip (exit 77 — GPU/infrastructure absent)"
+            # F-06 fix: write a placeholder so the upload step (if-no-files-found: error)
+            # does not fail when caas_autonomy.json was never written before exit 77.
+            if [ ! -f caas_autonomy.json ]; then
+              echo '{"autonomy_score":0,"autonomy_ready":false,"advisory_skip":true,"reason":"exit 77 — infrastructure absent"}' > caas_autonomy.json
+            fi
+            exit 0
+          fi
+          [ $rc -ne 0 ] && exit $rc
+          python3 - <<'EOF'
+          import json, sys
+          with open("caas_autonomy.json") as f:
+              report = json.load(f)
+          score = report.get("autonomy_score", 0)
+          ready = report.get("autonomy_ready", False)
+          if not ready or score < 100:
+              print(f"FAIL: autonomy score {score}/100 (ready={ready})", file=sys.stderr)
+              sys.exit(1)
+          print(f"PASS: {score}/100")
+          EOF
+
+      - name: Export assurance report (JSON)
+        run: python3 ci/export_assurance.py -o assurance_report.json
+
+      - name: Coverage gaps summary (advisory)
+        # Visibility-only: surface gaps as a yellow step rather than swallowing
+        # the exit code with `|| true`. Same pattern as the other --advisory
+        # steps in this workflow.
+        continue-on-error: true
+        run: python3 ci/query_graph.py gaps
+
+      - name: Upload assurance artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: preflight-reports-${{ github.run_id }}
+          path: |
+            assurance_report.json
+            caas_scanner.json
+            caas_audit_gate.json
+            caas_autonomy.json
+            audit_report.json
+          if-no-files-found: error
+          # H-3 fix: match CAAS 365-day retention so preflight gate state is
+          # available for retrospective audit beyond the 90-day default.
+          retention-days: 365

@@ -1,0 +1,11 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: ultrafast_secp256k1
+Description: UltrafastSecp256k1 — high-performance secp256k1 engine that exports the libsecp256k1 C ABI (secp256k1_* symbols + secp256k1*.h headers) under our OWN name. Installed as ultrafast_secp256k1 so it never overwrites or shadows a system libsecp256k1. To use it as a Bitcoin Core/Knots backend, alias secp256k1 explicitly — see docs/BITCOIN_KNOTS_INTEGRATION.md.
+URL: https://github.com/shrec/UltrafastSecp256k1
+Version: @UFSECP_SHIM_PC_VERSION@
+Cflags: -I${includedir}/ultrafast_secp256k1
+Libs: -L${libdir} -lultrafast_secp256k1

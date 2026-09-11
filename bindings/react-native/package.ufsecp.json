@@ -1,0 +1,24 @@
+{
+  "name": "react-native-ufsecp",
+  "version": "0.0.0-dev",
+  "description": "React Native bindings for UltrafastSecp256k1 — high-performance secp256k1 ECC (ufsecp C ABI v1)",
+  "main": "lib/ufsecp.js",
+  "react-native": "lib/ufsecp.js",
+  "files": ["lib/ufsecp.js", "android/", "ios/", "react-native-ufsecp.podspec", "README.md"],
+  "scripts": {},
+  "keywords": [
+    "react-native", "secp256k1", "bitcoin", "crypto", "ecdsa",
+    "schnorr", "taproot", "ufsecp"
+  ],
+  "author": "UltrafastSecp256k1",
+  "license": "MIT",
+  "peerDependencies": {
+    "react": ">=18.0.0",
+    "react-native": ">=0.71.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shrec/UltrafastSecp256k1"
+  },
+  "homepage": "https://github.com/shrec/UltrafastSecp256k1"
+}

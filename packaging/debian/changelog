@@ -1,0 +1,25 @@
+libufsecp (4.1.0-1) unstable; urgency=medium
+
+  * Release 4.1.0: CT signing optimization, ConnectBlock benchmark evidence,
+    CAAS audit expansion (419 modules, 270 exploit PoCs), shim security hardening.
+  * No ABI break from 4.0.0. SOVERSION remains 4.
+
+ -- shrec <payysoon@gmail.com>  Wed, 28 May 2026 00:00:00 +0000
+
+libufsecp4 (4.0.0-1) unstable; urgency=medium
+
+  * Major version bump to 4.0.0: ABI/SONAME 4.
+  * Rename binary package libufsecp3 → libufsecp4 (SONAME change).
+  * Security: CT signing fixes in shim (sign_custom, keypair_xonly_tweak_add).
+  * Security: BIP32 strict key parsing, FROST lagrange CT inverse.
+  * Performance: shim pubkey cache 16→256 slots with FNV-1a hash.
+
+ -- shrec <shrec@users.noreply.github.com>  Wed, 06 May 2026 00:00:00 +0000
+
+libufsecp (3.12.1-1) unstable; urgency=medium
+
+  * New upstream release.
+  * Security: bump wheel 0.45.1 -> 0.46.2 (CVE-2026-24049).
+  * Security: bump setuptools 75.8.0 -> 78.1.1 (CVE-2025-47273).
+
+ -- shrec <shrec@users.noreply.github.com>  Sun, 23 Feb 2026 12:00:00 +0000

@@ -1,0 +1,2911 @@
+// =============================================================================
+// UltrafastSecp256k1 OpenCL - Context Implementation
+// =============================================================================
+// Cross-platform OpenCL initialization and management
+// Supports Windows (MSVC, Clang) and Linux (GCC, Clang)
+// =============================================================================
+
+#include "secp256k1_opencl.hpp"
+
+// Platform detection
+#ifdef _WIN32
+    #define NOMINMAX
+    #define WIN32_LEAN_AND_MEAN
+    #include <windows.h>
+#endif
+
+// OpenCL headers
+#define CL_TARGET_OPENCL_VERSION 120
+#define CL_USE_DEPRECATED_OPENCL_1_2_APIS
+#ifdef __APPLE__
+    #include <OpenCL/cl.h>
+#else
+    #include <CL/cl.h>
+#endif
+
+#include <cstring>
+#include <algorithm>
+#include <iostream>
+#include <sstream>
+
+namespace secp256k1 {
+namespace opencl {
+
+// =============================================================================
+// OpenCL Error Strings
+// =============================================================================
+
+const char* cl_error_string(int error_code) {
+    switch (error_code) {
+        case CL_SUCCESS:                         return "CL_SUCCESS";
+        case CL_DEVICE_NOT_FOUND:                return "CL_DEVICE_NOT_FOUND";
+        case CL_DEVICE_NOT_AVAILABLE:            return "CL_DEVICE_NOT_AVAILABLE";
+        case CL_COMPILER_NOT_AVAILABLE:          return "CL_COMPILER_NOT_AVAILABLE";
+        case CL_MEM_OBJECT_ALLOCATION_FAILURE:   return "CL_MEM_OBJECT_ALLOCATION_FAILURE";
+        case CL_OUT_OF_RESOURCES:                return "CL_OUT_OF_RESOURCES";
+        case CL_OUT_OF_HOST_MEMORY:              return "CL_OUT_OF_HOST_MEMORY";
+        case CL_PROFILING_INFO_NOT_AVAILABLE:    return "CL_PROFILING_INFO_NOT_AVAILABLE";
+        case CL_MEM_COPY_OVERLAP:                return "CL_MEM_COPY_OVERLAP";
+        case CL_IMAGE_FORMAT_MISMATCH:           return "CL_IMAGE_FORMAT_MISMATCH";
+        case CL_IMAGE_FORMAT_NOT_SUPPORTED:      return "CL_IMAGE_FORMAT_NOT_SUPPORTED";
+        case CL_BUILD_PROGRAM_FAILURE:           return "CL_BUILD_PROGRAM_FAILURE";
+        case CL_MAP_FAILURE:                     return "CL_MAP_FAILURE";
+        case CL_INVALID_VALUE:                   return "CL_INVALID_VALUE";
+        case CL_INVALID_DEVICE_TYPE:             return "CL_INVALID_DEVICE_TYPE";
+        case CL_INVALID_PLATFORM:                return "CL_INVALID_PLATFORM";
+        case CL_INVALID_DEVICE:                  return "CL_INVALID_DEVICE";
+        case CL_INVALID_CONTEXT:                 return "CL_INVALID_CONTEXT";
+        case CL_INVALID_QUEUE_PROPERTIES:        return "CL_INVALID_QUEUE_PROPERTIES";
+        case CL_INVALID_COMMAND_QUEUE:           return "CL_INVALID_COMMAND_QUEUE";
+        case CL_INVALID_HOST_PTR:                return "CL_INVALID_HOST_PTR";
+        case CL_INVALID_MEM_OBJECT:              return "CL_INVALID_MEM_OBJECT";
+        case CL_INVALID_IMAGE_FORMAT_DESCRIPTOR: return "CL_INVALID_IMAGE_FORMAT_DESCRIPTOR";
+        case CL_INVALID_IMAGE_SIZE:              return "CL_INVALID_IMAGE_SIZE";
+        case CL_INVALID_SAMPLER:                 return "CL_INVALID_SAMPLER";
+        case CL_INVALID_BINARY:                  return "CL_INVALID_BINARY";
+        case CL_INVALID_BUILD_OPTIONS:           return "CL_INVALID_BUILD_OPTIONS";
+        case CL_INVALID_PROGRAM:                 return "CL_INVALID_PROGRAM";
+        case CL_INVALID_PROGRAM_EXECUTABLE:      return "CL_INVALID_PROGRAM_EXECUTABLE";
+        case CL_INVALID_KERNEL_NAME:             return "CL_INVALID_KERNEL_NAME";
+        case CL_INVALID_KERNEL_DEFINITION:       return "CL_INVALID_KERNEL_DEFINITION";
+        case CL_INVALID_KERNEL:                  return "CL_INVALID_KERNEL";
+        case CL_INVALID_ARG_INDEX:               return "CL_INVALID_ARG_INDEX";
+        case CL_INVALID_ARG_VALUE:               return "CL_INVALID_ARG_VALUE";
+        case CL_INVALID_ARG_SIZE:                return "CL_INVALID_ARG_SIZE";
+        case CL_INVALID_KERNEL_ARGS:             return "CL_INVALID_KERNEL_ARGS";
+        case CL_INVALID_WORK_DIMENSION:          return "CL_INVALID_WORK_DIMENSION";
+        case CL_INVALID_WORK_GROUP_SIZE:         return "CL_INVALID_WORK_GROUP_SIZE";
+        case CL_INVALID_WORK_ITEM_SIZE:          return "CL_INVALID_WORK_ITEM_SIZE";
+        case CL_INVALID_GLOBAL_OFFSET:           return "CL_INVALID_GLOBAL_OFFSET";
+        case CL_INVALID_EVENT_WAIT_LIST:         return "CL_INVALID_EVENT_WAIT_LIST";
+        case CL_INVALID_EVENT:                   return "CL_INVALID_EVENT";
+        case CL_INVALID_OPERATION:               return "CL_INVALID_OPERATION";
+        case CL_INVALID_GL_OBJECT:               return "CL_INVALID_GL_OBJECT";
+        case CL_INVALID_BUFFER_SIZE:             return "CL_INVALID_BUFFER_SIZE";
+        case CL_INVALID_MIP_LEVEL:               return "CL_INVALID_MIP_LEVEL";
+        default:                                 return "UNKNOWN_ERROR";
+    }
+}
+
+// =============================================================================
+// Buffer Implementation
+// =============================================================================
+
+struct Buffer::Impl {
+    cl_mem buffer = nullptr;
+    std::size_t size = 0;
+
+    ~Impl() {
+        if (buffer) {
+            clReleaseMemObject(buffer);
+        }
+    }
+};
+
+Buffer::Buffer() : impl_(std::make_unique<Impl>()) {}
+
+Buffer::~Buffer() = default;
+
+Buffer::Buffer(Buffer&&) noexcept = default;
+Buffer& Buffer::operator=(Buffer&&) noexcept = default;
+
+std::size_t Buffer::size() const noexcept {
+    return impl_ ? impl_->size : 0;
+}
+
+bool Buffer::is_valid() const noexcept {
+    return impl_ && impl_->buffer != nullptr;
+}
+
+void* Buffer::native_handle() const noexcept {
+    return impl_ ? impl_->buffer : nullptr;
+}
+
+// =============================================================================
+// Context Implementation
+// =============================================================================
+
+struct Context::Impl {
+    cl_platform_id platform = nullptr;
+    cl_device_id device = nullptr;
+    cl_context context = nullptr;
+    cl_command_queue queue = nullptr;
+    cl_program program = nullptr;
+
+    // Kernels
+    cl_kernel kernel_field_add = nullptr;
+    cl_kernel kernel_field_sub = nullptr;
+    cl_kernel kernel_field_mul = nullptr;
+    cl_kernel kernel_field_sqr = nullptr;
+    cl_kernel kernel_field_inv = nullptr;
+    cl_kernel kernel_point_double = nullptr;
+    cl_kernel kernel_point_add = nullptr;
+    cl_kernel kernel_scalar_mul = nullptr;
+    cl_kernel kernel_scalar_mul_generator = nullptr;
+    cl_kernel kernel_batch_inversion = nullptr;
+    cl_kernel kernel_batch_jacobian_to_affine = nullptr;
+
+    // Affine point addition kernels
+    cl_kernel kernel_affine_add = nullptr;
+    cl_kernel kernel_affine_add_lambda = nullptr;
+    cl_kernel kernel_affine_add_x_only = nullptr;
+    cl_kernel kernel_jacobian_to_affine = nullptr;
+    cl_kernel kernel_msm_block_reduce = nullptr;
+
+    DeviceInfo device_info;
+    std::string last_error;
+    DeviceConfig config;
+
+    // Cached GPU buffers for hot-path batch operations (grow-only, reused across calls)
+    cl_mem cache_smg_scalars = nullptr;  // batch_scalar_mul_generator input
+    cl_mem cache_smg_results = nullptr;  // batch_scalar_mul_generator output
+    std::size_t cache_smg_count = 0;     // current capacity in elements
+
+    cl_mem cache_sm_scalars = nullptr;   // batch_scalar_mul input
+    cl_mem cache_sm_points = nullptr;    // batch_scalar_mul input
+    cl_mem cache_sm_results = nullptr;   // batch_scalar_mul output
+    std::size_t cache_sm_count = 0;
+
+    cl_mem cache_fi_input = nullptr;     // batch_field_inv input
+    cl_mem cache_fi_output = nullptr;    // batch_field_inv output
+    std::size_t cache_fi_count = 0;
+
+    cl_mem cache_j2a_input = nullptr;    // batch_jacobian_to_affine input
+    cl_mem cache_j2a_output = nullptr;   // batch_jacobian_to_affine output
+    std::size_t cache_j2a_count = 0;
+
+    ~Impl() {
+        // Zero scalar caches before release to prevent secret key leakage
+        // in GPU memory (grow-only buffers may retain ECDH private keys)
+        if (queue && cache_smg_scalars && cache_smg_count > 0) {
+            cl_uchar zero = 0;
+            clEnqueueFillBuffer(queue, cache_smg_scalars, &zero, 1, 0,
+                                cache_smg_count * sizeof(Scalar), 0, nullptr, nullptr);
+            clFinish(queue);
+        }
+        if (queue && cache_sm_scalars && cache_sm_count > 0) {
+            cl_uchar zero = 0;
+            clEnqueueFillBuffer(queue, cache_sm_scalars, &zero, 1, 0,
+                                cache_sm_count * sizeof(Scalar), 0, nullptr, nullptr);
+            clFinish(queue);
+        }
+
+        // Release cached buffers
+        if (cache_smg_scalars) clReleaseMemObject(cache_smg_scalars);
+        if (cache_smg_results) clReleaseMemObject(cache_smg_results);
+        if (cache_sm_scalars) clReleaseMemObject(cache_sm_scalars);
+        if (cache_sm_points) clReleaseMemObject(cache_sm_points);
+        if (cache_sm_results) clReleaseMemObject(cache_sm_results);
+        if (cache_fi_input) clReleaseMemObject(cache_fi_input);
+        if (cache_fi_output) clReleaseMemObject(cache_fi_output);
+        if (cache_j2a_input) clReleaseMemObject(cache_j2a_input);
+        if (cache_j2a_output) clReleaseMemObject(cache_j2a_output);
+
+        // Release kernels
+        if (kernel_field_add) clReleaseKernel(kernel_field_add);
+        if (kernel_field_sub) clReleaseKernel(kernel_field_sub);
+        if (kernel_field_mul) clReleaseKernel(kernel_field_mul);
+        if (kernel_field_sqr) clReleaseKernel(kernel_field_sqr);
+        if (kernel_field_inv) clReleaseKernel(kernel_field_inv);
+        if (kernel_point_double) clReleaseKernel(kernel_point_double);
+        if (kernel_point_add) clReleaseKernel(kernel_point_add);
+        if (kernel_scalar_mul) clReleaseKernel(kernel_scalar_mul);
+        if (kernel_scalar_mul_generator) clReleaseKernel(kernel_scalar_mul_generator);
+        if (kernel_batch_inversion) clReleaseKernel(kernel_batch_inversion);
+        if (kernel_batch_jacobian_to_affine) clReleaseKernel(kernel_batch_jacobian_to_affine);
+        if (kernel_affine_add) clReleaseKernel(kernel_affine_add);
+        if (kernel_affine_add_lambda) clReleaseKernel(kernel_affine_add_lambda);
+        if (kernel_affine_add_x_only) clReleaseKernel(kernel_affine_add_x_only);
+        if (kernel_jacobian_to_affine) clReleaseKernel(kernel_jacobian_to_affine);
+        if (kernel_msm_block_reduce)    clReleaseKernel(kernel_msm_block_reduce);
+
+        // Release program
+        if (program) clReleaseProgram(program);
+
+        // Release queue and context
+        if (queue) clReleaseCommandQueue(queue);
+        if (context) clReleaseContext(context);
+    }
+
+    bool init(const DeviceConfig& cfg);
+    bool build_program();
+    bool create_kernels();
+
+    cl_kernel get_kernel(const char* name);
+};
+
+bool Context::Impl::init(const DeviceConfig& cfg) {
+    config = cfg;
+    cl_int err;
+
+    // Get platforms
+    cl_uint num_platforms = 0;
+    err = clGetPlatformIDs(0, nullptr, &num_platforms);
+    if (err != CL_SUCCESS || num_platforms == 0) {
+        last_error = "No OpenCL platforms found";
+        return false;
+    }
+
+    std::vector<cl_platform_id> platforms(num_platforms);
+    clGetPlatformIDs(num_platforms, platforms.data(), nullptr);
+
+    // Find suitable platform/device
+    cl_platform_id selected_platform = nullptr;
+    cl_device_id selected_device = nullptr;
+    int best_score = 0;
+    bool found_exact = false;
+
+    for (cl_uint i = 0; i < num_platforms; i++) {
+        // Get platform name
+        char platform_name[256] = {0};
+        clGetPlatformInfo(platforms[i], CL_PLATFORM_NAME, sizeof(platform_name), platform_name, nullptr);
+
+        bool is_intel = (std::string(platform_name).find("Intel") != std::string::npos);
+
+        // Get devices
+        cl_uint num_devices = 0;
+        clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_GPU, 0, nullptr, &num_devices);
+
+        if (num_devices == 0) continue;
+
+        std::vector<cl_device_id> devices(num_devices);
+        clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_GPU, num_devices, devices.data(), nullptr);
+
+        for (cl_uint j = 0; j < num_devices; j++) {
+            // Check if this is the explicitly requested device
+            if (cfg.platform_id >= 0 &&
+                static_cast<int>(i) == cfg.platform_id &&
+                static_cast<int>(j) == cfg.device_id) {
+                selected_platform = platforms[i];
+                selected_device = devices[j];
+                found_exact = true;
+                break;
+            }
+
+            // Auto-selection: Score Intel devices higher if preferred
+            if (cfg.platform_id < 0) {
+                int score = 1;
+                if (is_intel && cfg.prefer_intel) {
+                    score = 10;
+                }
+
+                if (score > best_score) {
+                    best_score = score;
+                    selected_platform = platforms[i];
+                    selected_device = devices[j];
+                }
+            }
+        }
+
+        if (found_exact) break;
+    }
+
+    if (!selected_device) {
+        last_error = "No suitable GPU device found";
+        return false;
+    }
+
+    platform = selected_platform;
+    device = selected_device;
+
+    // Get device info
+    char buffer[256];
+    clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(buffer), buffer, nullptr);
+    device_info.name = buffer;
+
+    clGetDeviceInfo(device, CL_DEVICE_VENDOR, sizeof(buffer), buffer, nullptr);
+    device_info.vendor = buffer;
+
+    clGetDeviceInfo(device, CL_DEVICE_VERSION, sizeof(buffer), buffer, nullptr);
+    device_info.version = buffer;
+
+    clGetDeviceInfo(device, CL_DRIVER_VERSION, sizeof(buffer), buffer, nullptr);
+    device_info.driver_version = buffer;
+
+    clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(device_info.global_mem_size),
+                    &device_info.global_mem_size, nullptr);
+    clGetDeviceInfo(device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(device_info.local_mem_size),
+                    &device_info.local_mem_size, nullptr);
+    clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(device_info.max_work_group_size),
+                    &device_info.max_work_group_size, nullptr);
+    clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(device_info.compute_units),
+                    &device_info.compute_units, nullptr);
+    clGetDeviceInfo(device, CL_DEVICE_MAX_CLOCK_FREQUENCY, sizeof(device_info.max_clock_freq),
+                    &device_info.max_clock_freq, nullptr);
+
+    // Check for double precision support
+    cl_device_fp_config fp_config;
+    clGetDeviceInfo(device, CL_DEVICE_DOUBLE_FP_CONFIG, sizeof(fp_config), &fp_config, nullptr);
+    device_info.supports_double = (fp_config != 0);
+
+    // Detect vendor
+    device_info.is_intel = (device_info.vendor.find("Intel") != std::string::npos);
+    device_info.is_amd = (device_info.vendor.find("AMD") != std::string::npos ||
+                          device_info.vendor.find("Advanced Micro") != std::string::npos);
+    device_info.is_nvidia = (device_info.vendor.find("NVIDIA") != std::string::npos);
+
+    if (cfg.verbose) {
+        std::cout << "OpenCL Device: " << device_info.name << std::endl;
+        std::cout << "  Vendor: " << device_info.vendor << std::endl;
+        std::cout << "  Version: " << device_info.version << std::endl;
+        std::cout << "  Driver: " << device_info.driver_version << std::endl;
+        std::cout << "  Global Memory: " << (device_info.global_mem_size / (1024*1024)) << " MB" << std::endl;
+        std::cout << "  Local Memory: " << (device_info.local_mem_size / 1024) << " KB" << std::endl;
+        std::cout << "  Compute Units: " << device_info.compute_units << std::endl;
+        std::cout << "  Max Clock: " << device_info.max_clock_freq << " MHz" << std::endl;
+    }
+
+    // Create context
+    if (cfg.verbose) std::cerr << "[DEBUG] Creating OpenCL context for device: " << device_info.name << std::endl;
+    context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &err);
+    if (err != CL_SUCCESS) {
+        last_error = std::string("Failed to create OpenCL context: ") + cl_error_string(err);
+        if (cfg.verbose) std::cerr << "[DEBUG] " << last_error << std::endl;
+        return false;
+    }
+    if (cfg.verbose) std::cerr << "[DEBUG] Context created successfully" << std::endl;
+
+    // Create command queue; enable profiling only when verbose (C-4: avoid 1-5% overhead)
+    cl_command_queue_properties prof_flag = cfg.verbose ? CL_QUEUE_PROFILING_ENABLE : 0;
+#ifdef CL_VERSION_2_0
+    cl_queue_properties props[] = {
+        CL_QUEUE_PROPERTIES, prof_flag,
+        0
+    };
+    queue = clCreateCommandQueueWithProperties(context, device, props, &err);
+#else
+    queue = clCreateCommandQueue(context, device, prof_flag, &err);
+#endif
+
+    if (err != CL_SUCCESS) {
+        last_error = std::string("Failed to create command queue: ") + cl_error_string(err);
+        if (cfg.verbose) std::cerr << "[DEBUG] " << last_error << std::endl;
+        return false;
+    }
+    if (cfg.verbose) std::cerr << "[DEBUG] Command queue created successfully" << std::endl;
+
+    // Build program
+    if (!build_program()) {
+        if (cfg.verbose) std::cerr << "[DEBUG] build_program failed: " << last_error << std::endl;
+        return false;
+    }
+    if (cfg.verbose) std::cerr << "[DEBUG] Program built successfully" << std::endl;
+
+    // Create kernels
+    if (!create_kernels()) {
+        if (cfg.verbose) std::cerr << "[DEBUG] create_kernels failed: " << last_error << std::endl;
+        return false;
+    }
+    if (cfg.verbose) std::cerr << "[DEBUG] Kernels created successfully" << std::endl;
+
+    return true;
+}
+
+// Embedded kernel source — split into separate array entries so that
+// no single string literal exceeds MSVC's 65535-byte C2026 limit.
+static const char* const kernel_parts[] = { R"KERNEL(
+// =============================================================================
+// Secp256k1 OpenCL Kernels - Embedded Version
+// =============================================================================
+
+#define SECP256K1_P0 0xFFFFFFFEFFFFFC2FUL
+#define SECP256K1_P1 0xFFFFFFFFFFFFFFFFUL
+#define SECP256K1_P2 0xFFFFFFFFFFFFFFFFUL
+#define SECP256K1_P3 0xFFFFFFFFFFFFFFFFUL
+#define SECP256K1_K 0x1000003D1UL
+
+typedef struct { ulong limbs[4]; } FieldElement;
+typedef struct { ulong limbs[4]; } Scalar;
+typedef struct { FieldElement x; FieldElement y; } AffinePoint;
+typedef struct { FieldElement x; FieldElement y; FieldElement z; uint infinity; uint pad[7]; } JacobianPoint;
+
+// =============================================================================
+// NVIDIA PTX Optimized Helpers (hardware carry-chain multiply + reduce)
+// =============================================================================
+#ifdef __NV_CL_C_VERSION
+
+#define PTX_MAD_ACC(c0, c1, c2, a, b) \
+    asm volatile( \
+        "mad.lo.cc.u64 %0, %3, %4, %0;\n\t" \
+        "madc.hi.cc.u64 %1, %3, %4, %1;\n\t" \
+        "addc.u64 %2, %2, 0;\n\t" \
+        : "+l"(c0), "+l"(c1), "+l"(c2) \
+        : "l"((ulong)(a)), "l"((ulong)(b)) \
+    )
+
+inline void mul_256_512_cl(const ulong* a, const ulong* b, ulong* r) {
+    ulong a0=a[0],a1=a[1],a2=a[2],a3=a[3];
+    ulong b0=b[0],b1=b[1],b2=b[2],b3=b[3];
+    ulong c0=0,c1=0,c2=0;
+    PTX_MAD_ACC(c0,c1,c2,a0,b0);
+    r[0]=c0; c0=c1; c1=c2; c2=0;
+    PTX_MAD_ACC(c0,c1,c2,a0,b1); PTX_MAD_ACC(c0,c1,c2,a1,b0);
+    r[1]=c0; c0=c1; c1=c2; c2=0;
+    PTX_MAD_ACC(c0,c1,c2,a0,b2); PTX_MAD_ACC(c0,c1,c2,a1,b1); PTX_MAD_ACC(c0,c1,c2,a2,b0);
+    r[2]=c0; c0=c1; c1=c2; c2=0;
+    PTX_MAD_ACC(c0,c1,c2,a0,b3); PTX_MAD_ACC(c0,c1,c2,a1,b2); PTX_MAD_ACC(c0,c1,c2,a2,b1); PTX_MAD_ACC(c0,c1,c2,a3,b0);
+    r[3]=c0; c0=c1; c1=c2; c2=0;
+    PTX_MAD_ACC(c0,c1,c2,a1,b3); PTX_MAD_ACC(c0,c1,c2,a2,b2); PTX_MAD_ACC(c0,c1,c2,a3,b1);
+    r[4]=c0; c0=c1; c1=c2; c2=0;
+    PTX_MAD_ACC(c0,c1,c2,a2,b3); PTX_MAD_ACC(c0,c1,c2,a3,b2);
+    r[5]=c0; c0=c1; c1=c2; c2=0;
+    PTX_MAD_ACC(c0,c1,c2,a3,b3);
+    r[6]=c0; r[7]=c1;
+}
+
+inline void sqr_256_512_cl(const ulong* a, ulong* r) {
+    ulong a0=a[0],a1=a[1],a2=a[2],a3=a[3];
+    ulong c0=0,c1=0,c2=0;
+    PTX_MAD_ACC(c0,c1,c2,a0,a0);
+    r[0]=c0; c0=c1; c1=c2; c2=0;
+    PTX_MAD_ACC(c0,c1,c2,a0,a1); PTX_MAD_ACC(c0,c1,c2,a0,a1);
+    r[1]=c0; c0=c1; c1=c2; c2=0;
+    PTX_MAD_ACC(c0,c1,c2,a0,a2); PTX_MAD_ACC(c0,c1,c2,a0,a2); PTX_MAD_ACC(c0,c1,c2,a1,a1);
+    r[2]=c0; c0=c1; c1=c2; c2=0;
+    PTX_MAD_ACC(c0,c1,c2,a0,a3); PTX_MAD_ACC(c0,c1,c2,a0,a3); PTX_MAD_ACC(c0,c1,c2,a1,a2); PTX_MAD_ACC(c0,c1,c2,a1,a2);
+    r[3]=c0; c0=c1; c1=c2; c2=0;
+    PTX_MAD_ACC(c0,c1,c2,a1,a3); PTX_MAD_ACC(c0,c1,c2,a1,a3); PTX_MAD_ACC(c0,c1,c2,a2,a2);
+    r[4]=c0; c0=c1; c1=c2; c2=0;
+    PTX_MAD_ACC(c0,c1,c2,a2,a3); PTX_MAD_ACC(c0,c1,c2,a2,a3);
+    r[5]=c0; c0=c1; c1=c2; c2=0;
+    PTX_MAD_ACC(c0,c1,c2,a3,a3);
+    r[6]=c0; r[7]=c1;
+}
+
+inline void reduce_512_to_256_cl(ulong* t, FieldElement* r) {
+    ulong t0=t[0],t1=t[1],t2=t[2],t3=t[3],t4=t[4],t5=t[5],t6=t[6],t7=t[7];
+    ulong a0,a1,a2,a3,a4;
+    asm volatile("mul.lo.u64 %0, %5, 977;\n\t" "mul.hi.u64 %1, %5, 977;\n\t"
+        "mad.lo.cc.u64 %1, %6, 977, %1;\n\t" "madc.hi.u64 %2, %6, 977, 0;\n\t"
+        "mad.lo.cc.u64 %2, %7, 977, %2;\n\t" "madc.hi.u64 %3, %7, 977, 0;\n\t"
+        "mad.lo.cc.u64 %3, %8, 977, %3;\n\t" "madc.hi.u64 %4, %8, 977, 0;\n\t"
+        :"=l"(a0),"=l"(a1),"=l"(a2),"=l"(a3),"=l"(a4):"l"(t4),"l"(t5),"l"(t6),"l"(t7));
+    ulong carry_a;
+    asm volatile("add.cc.u64 %0,%0,%5;\n\t" "addc.cc.u64 %1,%1,%6;\n\t"
+        "addc.cc.u64 %2,%2,%7;\n\t" "addc.cc.u64 %3,%3,%8;\n\t" "addc.u64 %4,0,0;\n\t"
+        :"+l"(t0),"+l"(t1),"+l"(t2),"+l"(t3),"=l"(carry_a):"l"(a0),"l"(a1),"l"(a2),"l"(a3));
+    ulong s0=(t4<<32),s1=(t4>>32)|(t5<<32),s2=(t5>>32)|(t6<<32),s3=(t6>>32)|(t7<<32);
+    ulong carry_s;
+    asm volatile("add.cc.u64 %0,%0,%5;\n\t" "addc.cc.u64 %1,%1,%6;\n\t"
+        "addc.cc.u64 %2,%2,%7;\n\t" "addc.cc.u64 %3,%3,%8;\n\t" "addc.u64 %4,0,0;\n\t"
+        :"+l"(t0),"+l"(t1),"+l"(t2),"+l"(t3),"=l"(carry_s):"l"(s0),"l"(s1),"l"(s2),"l"(s3));
+    ulong extra = a4 + (t7>>32) + carry_a + carry_s;
+    ulong e_lo=extra*977, e_sh=extra<<32, e_sh_hi=extra>>32;
+    ulong c=0, ct=0;
+    asm volatile("add.cc.u64 %0,%0,%5;\n\t" "addc.cc.u64 %1,%1,0;\n\t"
+        "addc.cc.u64 %2,%2,0;\n\t" "addc.cc.u64 %3,%3,0;\n\t" "addc.u64 %4,0,0;\n\t"
+        :"+l"(t0),"+l"(t1),"+l"(t2),"+l"(t3),"=l"(ct):"l"(e_lo)); c+=ct;
+    asm volatile("add.cc.u64 %0,%0,%5;\n\t" "addc.cc.u64 %1,%1,%6;\n\t"
+        "addc.cc.u64 %2,%2,0;\n\t" "addc.cc.u64 %3,%3,0;\n\t" "addc.u64 %4,0,0;\n\t"
+        :"+l"(t0),"+l"(t1),"+l"(t2),"+l"(t3),"=l"(ct):"l"(e_sh),"l"(e_sh_hi)); c+=ct;
+    if (c) { ulong kv=SECP256K1_K;
+        asm volatile("add.cc.u64 %0,%0,%4;\n\t" "addc.cc.u64 %1,%1,0;\n\t"
+            "addc.cc.u64 %2,%2,0;\n\t" "addc.u64 %3,%3,0;\n\t"
+            :"+l"(t0),"+l"(t1),"+l"(t2),"+l"(t3):"l"(kv));
+    }
+    ulong r0,r1,r2,r3,bw;
+    ulong p0=SECP256K1_P0,p1=SECP256K1_P1,p2=SECP256K1_P2,p3=SECP256K1_P3;
+    asm volatile("sub.cc.u64 %0,%5,%9;\n\t" "subc.cc.u64 %1,%6,%10;\n\t"
+        "subc.cc.u64 %2,%7,%11;\n\t" "subc.cc.u64 %3,%8,%12;\n\t" "subc.u64 %4,0,0;\n\t"
+        :"=l"(r0),"=l"(r1),"=l"(r2),"=l"(r3),"=l"(bw)
+        :"l"(t0),"l"(t1),"l"(t2),"l"(t3),"l"(p0),"l"(p1),"l"(p2),"l"(p3));
+    if (bw==0) { r->limbs[0]=r0; r->limbs[1]=r1; r->limbs[2]=r2; r->limbs[3]=r3; }
+    else { r->limbs[0]=t0; r->limbs[1]=t1; r->limbs[2]=t2; r->limbs[3]=t3; }
+}
+
+#endif // __NV_CL_C_VERSION
+// =============================================================================
+
+inline ulong2 mul64_full(ulong a, ulong b) {
+    return (ulong2)(a * b, mul_hi(a, b));
+}
+
+inline ulong add_with_carry(ulong a, ulong b, ulong ci, ulong* co) {
+    ulong s = a + b; ulong c1 = (s < a) ? 1UL : 0UL;
+    s += ci; ulong c2 = (s < ci) ? 1UL : 0UL;
+    *co = c1 + c2; return s;
+}
+
+inline ulong sub_with_borrow(ulong a, ulong b, ulong bi, ulong* bo) {
+    ulong d = a - b; ulong b1 = (a < b) ? 1UL : 0UL;
+    ulong t = d; d -= bi; ulong b2 = (t < bi) ? 1UL : 0UL;
+    *bo = b1 + b2; return d;
+}
+
+inline void field_reduce(FieldElement* r, const ulong* a8) {
+    ulong carry = 0, c1; ulong temp[5]; ulong2 prod;
+    prod = mul64_full(SECP256K1_K, a8[4]); temp[0] = a8[0] + prod.x; carry = (temp[0] < a8[0]) ? 1UL : 0UL; carry += prod.y;
+    prod = mul64_full(SECP256K1_K, a8[5]); temp[1] = a8[1] + carry; c1 = (temp[1] < carry) ? 1UL : 0UL; temp[1] += prod.x; c1 += (temp[1] < prod.x) ? 1UL : 0UL; carry = c1 + prod.y;
+    prod = mul64_full(SECP256K1_K, a8[6]); temp[2] = a8[2] + carry; c1 = (temp[2] < carry) ? 1UL : 0UL; temp[2] += prod.x; c1 += (temp[2] < prod.x) ? 1UL : 0UL; carry = c1 + prod.y;
+    prod = mul64_full(SECP256K1_K, a8[7]); temp[3] = a8[3] + carry; c1 = (temp[3] < carry) ? 1UL : 0UL; temp[3] += prod.x; c1 += (temp[3] < prod.x) ? 1UL : 0UL; temp[4] = c1 + prod.y;
+    if (temp[4] != 0) { prod = mul64_full(SECP256K1_K, temp[4]); temp[0] += prod.x; carry = (temp[0] < prod.x) ? 1UL : 0UL; carry += prod.y; temp[1] += carry; carry = (temp[1] < carry) ? 1UL : 0UL; temp[2] += carry; carry = (temp[2] < carry) ? 1UL : 0UL; temp[3] += carry; }
+    ulong borrow = 0; ulong diff[4];
+    diff[0] = sub_with_borrow(temp[0], SECP256K1_P0, 0, &borrow);
+    diff[1] = sub_with_borrow(temp[1], SECP256K1_P1, borrow, &borrow);
+    diff[2] = sub_with_borrow(temp[2], SECP256K1_P2, borrow, &borrow);
+    diff[3] = sub_with_borrow(temp[3], SECP256K1_P3, borrow, &borrow);
+    ulong mask = (borrow == 0) ? ~0UL : 0UL;
+    r->limbs[0] = (diff[0] & mask) | (temp[0] & ~mask);
+    r->limbs[1] = (diff[1] & mask) | (temp[1] & ~mask);
+    r->limbs[2] = (diff[2] & mask) | (temp[2] & ~mask);
+    r->limbs[3] = (diff[3] & mask) | (temp[3] & ~mask);
+}
+
+inline void field_add_impl(FieldElement* r, const FieldElement* a, const FieldElement* b) {
+#ifdef __NV_CL_C_VERSION
+    ulong a0=a->limbs[0],a1=a->limbs[1],a2=a->limbs[2],a3=a->limbs[3];
+    ulong b0=b->limbs[0],b1=b->limbs[1],b2=b->limbs[2],b3=b->limbs[3];
+    ulong s0,s1,s2,s3,carry;
+    asm volatile("add.cc.u64 %0,%5,%9;\n\t" "addc.cc.u64 %1,%6,%10;\n\t"
+        "addc.cc.u64 %2,%7,%11;\n\t" "addc.cc.u64 %3,%8,%12;\n\t" "addc.u64 %4,0,0;\n\t"
+        :"=l"(s0),"=l"(s1),"=l"(s2),"=l"(s3),"=l"(carry)
+        :"l"(a0),"l"(a1),"l"(a2),"l"(a3),"l"(b0),"l"(b1),"l"(b2),"l"(b3));
+    ulong d0,d1,d2,d3,borrow;
+    ulong p0=SECP256K1_P0,p1=SECP256K1_P1,p2=SECP256K1_P2,p3=SECP256K1_P3;
+    asm volatile("sub.cc.u64 %0,%5,%9;\n\t" "subc.cc.u64 %1,%6,%10;\n\t"
+        "subc.cc.u64 %2,%7,%11;\n\t" "subc.cc.u64 %3,%8,%12;\n\t" "subc.u64 %4,0,0;\n\t"
+        :"=l"(d0),"=l"(d1),"=l"(d2),"=l"(d3),"=l"(borrow)
+        :"l"(s0),"l"(s1),"l"(s2),"l"(s3),"l"(p0),"l"(p1),"l"(p2),"l"(p3));
+    ulong use_diff = (carry != 0) | (borrow == 0);
+    ulong mask = use_diff ? ~0UL : 0UL;
+    r->limbs[0]=(d0&mask)|(s0&~mask); r->limbs[1]=(d1&mask)|(s1&~mask);
+    r->limbs[2]=(d2&mask)|(s2&~mask); r->limbs[3]=(d3&mask)|(s3&~mask);
+#else
+    ulong carry = 0; ulong sum[4];
+    sum[0] = add_with_carry(a->limbs[0], b->limbs[0], 0, &carry);
+    sum[1] = add_with_carry(a->limbs[1], b->limbs[1], carry, &carry);
+    sum[2] = add_with_carry(a->limbs[2], b->limbs[2], carry, &carry);
+    sum[3] = add_with_carry(a->limbs[3], b->limbs[3], carry, &carry);
+    ulong borrow = 0; ulong diff[4];
+    diff[0] = sub_with_borrow(sum[0], SECP256K1_P0, 0, &borrow);
+    diff[1] = sub_with_borrow(sum[1], SECP256K1_P1, borrow, &borrow);
+    diff[2] = sub_with_borrow(sum[2], SECP256K1_P2, borrow, &borrow);
+    diff[3] = sub_with_borrow(sum[3], SECP256K1_P3, borrow, &borrow);
+    ulong use_diff = (carry != 0) | (borrow == 0);
+    ulong mask = use_diff ? ~0UL : 0UL;
+    r->limbs[0] = (diff[0] & mask) | (sum[0] & ~mask);
+    r->limbs[1] = (diff[1] & mask) | (sum[1] & ~mask);
+    r->limbs[2] = (diff[2] & mask) | (sum[2] & ~mask);
+    r->limbs[3] = (diff[3] & mask) | (sum[3] & ~mask);
+#endif
+}
+
+inline void field_sub_impl(FieldElement* r, const FieldElement* a, const FieldElement* b) {
+#ifdef __NV_CL_C_VERSION
+    ulong a0=a->limbs[0],a1=a->limbs[1],a2=a->limbs[2],a3=a->limbs[3];
+    ulong b0=b->limbs[0],b1=b->limbs[1],b2=b->limbs[2],b3=b->limbs[3];
+    ulong d0,d1,d2,d3,borrow;
+    asm volatile("sub.cc.u64 %0,%5,%9;\n\t" "subc.cc.u64 %1,%6,%10;\n\t"
+        "subc.cc.u64 %2,%7,%11;\n\t" "subc.cc.u64 %3,%8,%12;\n\t" "subc.u64 %4,0,0;\n\t"
+        :"=l"(d0),"=l"(d1),"=l"(d2),"=l"(d3),"=l"(borrow)
+        :"l"(a0),"l"(a1),"l"(a2),"l"(a3),"l"(b0),"l"(b1),"l"(b2),"l"(b3));
+    ulong mp0 = (borrow!=0) ? (ulong)SECP256K1_P0 : 0UL;
+    ulong mp1 = (borrow!=0) ? (ulong)SECP256K1_P1 : 0UL;
+    ulong mp2 = (borrow!=0) ? (ulong)SECP256K1_P2 : 0UL;
+    ulong mp3 = (borrow!=0) ? (ulong)SECP256K1_P3 : 0UL;
+    asm volatile("add.cc.u64 %0,%0,%4;\n\t" "addc.cc.u64 %1,%1,%5;\n\t"
+        "addc.cc.u64 %2,%2,%6;\n\t" "addc.u64 %3,%3,%7;\n\t"
+        :"+l"(d0),"+l"(d1),"+l"(d2),"+l"(d3):"l"(mp0),"l"(mp1),"l"(mp2),"l"(mp3));
+    r->limbs[0]=d0; r->limbs[1]=d1; r->limbs[2]=d2; r->limbs[3]=d3;
+#else
+    ulong borrow = 0; ulong diff[4];
+    diff[0] = sub_with_borrow(a->limbs[0], b->limbs[0], 0, &borrow);
+    diff[1] = sub_with_borrow(a->limbs[1], b->limbs[1], borrow, &borrow);
+    diff[2] = sub_with_borrow(a->limbs[2], b->limbs[2], borrow, &borrow);
+    diff[3] = sub_with_borrow(a->limbs[3], b->limbs[3], borrow, &borrow);
+    ulong mask = borrow ? ~0UL : 0UL;
+    ulong carry = 0;
+    r->limbs[0] = add_with_carry(diff[0], SECP256K1_P0 & mask, 0, &carry);
+    r->limbs[1] = add_with_carry(diff[1], SECP256K1_P1 & mask, carry, &carry);
+    r->limbs[2] = add_with_carry(diff[2], SECP256K1_P2 & mask, carry, &carry);
+    r->limbs[3] = add_with_carry(diff[3], SECP256K1_P3 & mask, carry, &carry);
+#endif
+}
+
+inline void field_mul_impl(FieldElement* r, const FieldElement* a, const FieldElement* b) {
+#ifdef __NV_CL_C_VERSION
+    ulong t[8]; mul_256_512_cl(a->limbs, b->limbs, t); reduce_512_to_256_cl(t, r);
+#else
+    ulong product[8] = {0,0,0,0,0,0,0,0};
+    for (int i = 0; i < 4; i++) {
+        ulong carry = 0;
+        for (int j = 0; j < 4; j++) {
+            ulong2 mul = mul64_full(a->limbs[i], b->limbs[j]);
+            ulong sum = product[i+j] + mul.x; ulong c1 = (sum < product[i+j]) ? 1UL : 0UL;
+            sum += carry; ulong c2 = (sum < carry) ? 1UL : 0UL;
+            product[i+j] = sum; carry = mul.y + c1 + c2;
+        }
+        product[i+4] += carry;
+    }
+    field_reduce(r, product);
+#endif
+}
+
+inline void field_sqr_impl(FieldElement* r, const FieldElement* a) {
+#ifdef __NV_CL_C_VERSION
+    ulong t[8]; sqr_256_512_cl(a->limbs, t); reduce_512_to_256_cl(t, r);
+#else
+    field_mul_impl(r, a, a);
+#endif
+}
+
+inline void field_sqr_n_impl(FieldElement* r, int n) {
+    for (int i = 0; i < n; i++) field_sqr_impl(r, r);
+}
+
+inline int field_is_zero_impl(const FieldElement* a) {
+    return (a->limbs[0] | a->limbs[1] | a->limbs[2] | a->limbs[3]) == 0;
+}
+
+inline void field_set_zero_impl(FieldElement* a) {
+    a->limbs[0] = 0; a->limbs[1] = 0; a->limbs[2] = 0; a->limbs[3] = 0;
+}
+
+inline void field_set_one_impl(FieldElement* a) {
+    a->limbs[0] = 1; a->limbs[1] = 0; a->limbs[2] = 0; a->limbs[3] = 0;
+}
+
+inline void field_inv_impl(FieldElement* r, const FieldElement* a) {
+    FieldElement x2,x3,x6,x12,x24,x48,x96,x192,x7,x31,x223,x5,x11,x22,t;
+    field_sqr_impl(&x2, a); field_mul_impl(&x2, &x2, a);
+    field_sqr_impl(&x3, &x2); field_mul_impl(&x3, &x3, a);
+    t=x3; field_sqr_n_impl(&t,3); field_mul_impl(&x6,&t,&x3);
+    t=x6; field_sqr_n_impl(&t,6); field_mul_impl(&x12,&t,&x6);
+    t=x12; field_sqr_n_impl(&t,12); field_mul_impl(&x24,&t,&x12);
+    t=x24; field_sqr_n_impl(&t,24); field_mul_impl(&x48,&t,&x24);
+    t=x48; field_sqr_n_impl(&t,48); field_mul_impl(&x96,&t,&x48);
+    t=x96; field_sqr_n_impl(&t,96); field_mul_impl(&x192,&t,&x96);
+    field_sqr_impl(&x7,&x6); field_mul_impl(&x7,&x7,a);
+    t=x24; field_sqr_n_impl(&t,7); field_mul_impl(&x31,&t,&x7);
+    t=x192; field_sqr_n_impl(&t,31); field_mul_impl(&x223,&t,&x31);
+    t=x3; field_sqr_n_impl(&t,2); field_mul_impl(&x5,&t,&x2);
+    t=x6; field_sqr_n_impl(&t,5); field_mul_impl(&x11,&t,&x5);
+    t=x11; field_sqr_n_impl(&t,11); field_mul_impl(&x22,&t,&x11);
+    field_sqr_impl(&t,&x223);
+    field_sqr_n_impl(&t,22); field_mul_impl(&t,&t,&x22);
+    field_sqr_n_impl(&t,4);
+    field_sqr_impl(&t,&t); field_mul_impl(&t,&t,a);
+    field_sqr_impl(&t,&t);
+    field_sqr_impl(&t,&t); field_mul_impl(&t,&t,a);
+    field_sqr_impl(&t,&t); field_mul_impl(&t,&t,a);
+    field_sqr_impl(&t,&t);
+    field_sqr_impl(&t,&t); field_mul_impl(r,&t,a);
+}
+
+__kernel void field_add(__global const FieldElement* a, __global const FieldElement* b, __global FieldElement* r, uint count) {
+    uint gid = get_global_id(0); if (gid >= count) return;
+    FieldElement a_local = a[gid]; FieldElement b_local = b[gid];
+    FieldElement res; field_add_impl(&res, &a_local, &b_local); r[gid] = res;
+}
+
+__kernel void field_sub(__global const FieldElement* a, __global const FieldElement* b, __global FieldElement* r, uint count) {
+    uint gid = get_global_id(0); if (gid >= count) return;
+    FieldElement a_local = a[gid]; FieldElement b_local = b[gid];
+    FieldElement res; field_sub_impl(&res, &a_local, &b_local); r[gid] = res;
+}
+
+__kernel void field_mul(__global const FieldElement* a, __global const FieldElement* b, __global FieldElement* r, uint count) {
+    uint gid = get_global_id(0); if (gid >= count) return;
+    FieldElement a_local = a[gid]; FieldElement b_local = b[gid];
+    FieldElement res; field_mul_impl(&res, &a_local, &b_local); r[gid] = res;
+}
+
+__kernel void field_sqr(__global const FieldElement* a, __global FieldElement* r, uint count) {
+    uint gid = get_global_id(0); if (gid >= count) return;
+    FieldElement a_local = a[gid];
+    FieldElement res; field_sqr_impl(&res, &a_local); r[gid] = res;
+}
+
+__kernel void field_inv(__global const FieldElement* a, __global FieldElement* r, uint count) {
+    #define BATCH_INV_LOCAL_MAX 256
+    __local FieldElement local_vals[BATCH_INV_LOCAL_MAX];
+    __local FieldElement local_prefix[BATCH_INV_LOCAL_MAX];
+    __local FieldElement local_invs[BATCH_INV_LOCAL_MAX];
+    __local uint local_nonzero[BATCH_INV_LOCAL_MAX];
+
+    uint gid = get_global_id(0);
+    uint lid = get_local_id(0);
+    uint lsize = get_local_size(0);
+    uint group_start = get_group_id(0) * lsize;
+    uint active = (group_start < count) ? min(lsize, count - group_start) : 0;
+
+    if (gid >= count) return;
+
+    if (lsize > BATCH_INV_LOCAL_MAX) {
+        FieldElement a_local = a[gid];
+        FieldElement res; field_inv_impl(&res, &a_local); r[gid] = res;
+        return;
+    }
+
+    FieldElement v = a[gid];
+    uint nz = field_is_zero_impl(&v) ? 0U : 1U;
+    local_nonzero[lid] = nz;
+    local_vals[lid] = v;
+    if (!nz) { FieldElement _t; field_set_one_impl(&_t); local_vals[lid] = _t; }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (lid == 0) {
+        FieldElement acc;
+        field_set_one_impl(&acc);
+
+        for (uint i = 0; i < active; ++i) {
+            local_prefix[i] = acc;
+            if (local_nonzero[i]) { FieldElement _t = local_vals[i]; field_mul_impl(&acc, &acc, &_t); }
+        }
+
+        field_inv_impl(&acc, &acc);
+
+        for (int i = (int)active - 1; i >= 0; --i) {
+            if (local_nonzero[i]) {
+                FieldElement inv_i;
+                { FieldElement _t = local_prefix[i]; field_mul_impl(&inv_i, &acc, &_t); }
+                local_invs[i] = inv_i;
+                { FieldElement _t = local_vals[i]; field_mul_impl(&acc, &acc, &_t); }
+            } else {
+                FieldElement _t; field_set_zero_impl(&_t); local_invs[i] = _t;
+            }
+        }
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+    r[gid] = local_invs[lid];
+}
+
+)KERNEL",
+
+// ---- second segment (point operations + scalar mul + batch) ----
+R"KERNEL(
+
+// Point operations - simplified versions
+inline int point_is_infinity(const JacobianPoint* p) { return p->infinity || ((p->z.limbs[0] | p->z.limbs[1] | p->z.limbs[2] | p->z.limbs[3]) == 0); }
+inline void point_set_infinity(JacobianPoint* p) { p->x.limbs[0]=0; p->x.limbs[1]=0; p->x.limbs[2]=0; p->x.limbs[3]=0; p->y.limbs[0]=1; p->y.limbs[1]=0; p->y.limbs[2]=0; p->y.limbs[3]=0; p->z.limbs[0]=0; p->z.limbs[1]=0; p->z.limbs[2]=0; p->z.limbs[3]=0; p->infinity=1; }
+
+// Point doubling: dbl-2007-a for a=0 (secp256k1)
+// CUDA-matched: 3 temps, write directly into r
+inline void point_double_impl(JacobianPoint* r, const JacobianPoint* p) {
+    if (point_is_infinity(p)) { point_set_infinity(r); return; }
+    if ((p->y.limbs[0] | p->y.limbs[1] | p->y.limbs[2] | p->y.limbs[3]) == 0) {
+        point_set_infinity(r); return;
+    }
+
+    FieldElement t1, t2, t3;
+
+    // Z' = 2*Y*Z (compute first, only reads p->y, p->z)
+    field_mul_impl(&r->z, &p->y, &p->z);
+    field_add_impl(&r->z, &r->z, &r->z);
+
+    // t1 = X^2 (A)
+    field_sqr_impl(&t1, &p->x);
+
+    // t2 = Y^2 (B)
+    field_sqr_impl(&t2, &p->y);
+
+    // t3 = Y^4 (C = B^2)
+    field_sqr_impl(&t3, &t2);
+
+    // D = 2*((X+B)^2 - A - C), store in r->x
+    field_add_impl(&r->x, &p->x, &t2);
+    field_sqr_impl(&r->x, &r->x);
+    field_sub_impl(&r->x, &r->x, &t1);
+    field_sub_impl(&r->x, &r->x, &t3);
+    field_add_impl(&r->x, &r->x, &r->x);
+
+    // E = 3*A, store in t1 (reuse t2 as scratch)
+    field_add_impl(&t2, &t1, &t1);       // 2A
+    field_add_impl(&t1, &t2, &t1);       // 3A = E
+
+    // F = E^2, store in t2
+    field_sqr_impl(&t2, &t1);
+
+    // Save D in r->y
+    r->y = r->x;
+
+    // X' = F - 2*D
+    field_add_impl(&r->x, &r->x, &r->x);
+    field_sub_impl(&r->x, &t2, &r->x);
+
+    // Y' = E*(D - X') - 8*C
+    field_sub_impl(&r->y, &r->y, &r->x);
+    field_mul_impl(&r->y, &t1, &r->y);
+    field_add_impl(&t3, &t3, &t3);       // 2C
+    field_add_impl(&t3, &t3, &t3);       // 4C
+    field_add_impl(&t3, &t3, &t3);       // 8C
+    field_sub_impl(&r->y, &r->y, &t3);
+
+    r->infinity = 0;
+}
+
+// Mixed addition: Jacobian + Affine -> Jacobian (CUDA-matched, write directly to r)
+inline void point_add_mixed_impl(JacobianPoint* r, const JacobianPoint* p, const AffinePoint* q) {
+    if (point_is_infinity(p)) { r->x = q->x; r->y = q->y; r->z.limbs[0]=1; r->z.limbs[1]=0; r->z.limbs[2]=0; r->z.limbs[3]=0; r->infinity=0; return; }
+    FieldElement z1z1, u2, s2, h, hh, i, j, rr, v, t1;
+    field_sqr_impl(&z1z1, &p->z);
+    field_mul_impl(&u2, &q->x, &z1z1);
+    field_mul_impl(&t1, &p->z, &z1z1);       // Z1^3
+    field_mul_impl(&s2, &q->y, &t1);
+    field_sub_impl(&h, &u2, &p->x);
+    if ((h.limbs[0]|h.limbs[1]|h.limbs[2]|h.limbs[3]) == 0) { field_sub_impl(&t1, &s2, &p->y); if ((t1.limbs[0]|t1.limbs[1]|t1.limbs[2]|t1.limbs[3]) == 0) { point_double_impl(r, p); return; } point_set_infinity(r); return; }
+    field_sqr_impl(&hh, &h);
+    field_add_impl(&i, &hh, &hh); field_add_impl(&i, &i, &i);  // I = 4*HH
+    field_mul_impl(&j, &h, &i);
+    field_sub_impl(&rr, &s2, &p->y); field_add_impl(&rr, &rr, &rr);  // rr = 2*(S2-Y1)
+    field_mul_impl(&v, &p->x, &i);
+    // X3 = rr^2 - J - 2*V
+    field_sqr_impl(&r->x, &rr);
+    field_sub_impl(&r->x, &r->x, &j);
+    field_add_impl(&t1, &v, &v);
+    field_sub_impl(&r->x, &r->x, &t1);
+    // Y3 = rr*(V - X3) - 2*Y1*J  (compute Y1*J BEFORE writing r->y for r==p safety)
+    field_mul_impl(&t1, &p->y, &j);
+    field_add_impl(&t1, &t1, &t1);
+    field_sub_impl(&v, &v, &r->x);
+    field_mul_impl(&r->y, &rr, &v);
+    field_sub_impl(&r->y, &r->y, &t1);
+    // Z3 = (Z1+H)^2 - Z1^2 - HH  (reads p->z before writing r->z)
+    field_add_impl(&t1, &p->z, &h);
+    field_sqr_impl(&r->z, &t1);
+    field_sub_impl(&r->z, &r->z, &z1z1);
+    field_sub_impl(&r->z, &r->z, &hh);
+    r->infinity = 0;
+}
+
+inline void point_add_impl(JacobianPoint* r, const JacobianPoint* p, const JacobianPoint* q) {
+    if (point_is_infinity(p)) { *r = *q; return; }
+    if (point_is_infinity(q)) { *r = *p; return; }
+    FieldElement U1,U2,S1,S2,H,I,J,rr,V,X3,Y3,Z3,Z1Z1,Z2Z2,t1,t2;
+    field_sqr_impl(&Z1Z1, &p->z); field_sqr_impl(&Z2Z2, &q->z);
+    field_mul_impl(&U1, &p->x, &Z2Z2); field_mul_impl(&U2, &q->x, &Z1Z1);
+    field_mul_impl(&t1, &p->y, &q->z); field_mul_impl(&S1, &t1, &Z2Z2);
+    field_mul_impl(&t1, &q->y, &p->z); field_mul_impl(&S2, &t1, &Z1Z1);
+    field_sub_impl(&H, &U2, &U1);
+    if ((H.limbs[0]|H.limbs[1]|H.limbs[2]|H.limbs[3]) == 0) { field_sub_impl(&t1, &S2, &S1); if ((t1.limbs[0]|t1.limbs[1]|t1.limbs[2]|t1.limbs[3]) == 0) { point_double_impl(r, p); return; } point_set_infinity(r); return; }
+    field_add_impl(&I, &H, &H); field_sqr_impl(&I, &I); field_mul_impl(&J, &H, &I);
+    field_sub_impl(&rr, &S2, &S1); field_add_impl(&rr, &rr, &rr); field_mul_impl(&V, &U1, &I);
+    field_sqr_impl(&X3, &rr); field_sub_impl(&X3, &X3, &J); field_add_impl(&t1, &V, &V); field_sub_impl(&X3, &X3, &t1);
+    field_sub_impl(&t1, &V, &X3); field_mul_impl(&Y3, &rr, &t1); field_mul_impl(&t2, &S1, &J); field_add_impl(&t2, &t2, &t2); field_sub_impl(&Y3, &Y3, &t2);
+    field_add_impl(&t1, &p->z, &q->z); field_sqr_impl(&t1, &t1); field_sub_impl(&t1, &t1, &Z1Z1); field_sub_impl(&t1, &t1, &Z2Z2); field_mul_impl(&Z3, &t1, &H);
+    r->x = X3; r->y = Y3; r->z = Z3; r->infinity = 0;
+}
+
+// =============================================================================
+// Field negation: r = p - a (direct, avoids creating zero + field_sub overhead)
+// =============================================================================
+inline void field_neg_impl(FieldElement* r, const FieldElement* a) {
+    ulong a0=a->limbs[0],a1=a->limbs[1],a2=a->limbs[2],a3=a->limbs[3];
+    if ((a0|a1|a2|a3) == 0) { r->limbs[0]=0;r->limbs[1]=0;r->limbs[2]=0;r->limbs[3]=0; return; }
+#ifdef __NV_CL_C_VERSION
+    ulong d0,d1,d2,d3;
+    asm volatile("sub.cc.u64 %0,%4,%8;\n\t" "subc.cc.u64 %1,%5,%9;\n\t"
+        "subc.cc.u64 %2,%6,%10;\n\t" "subc.u64 %3,%7,%11;\n\t"
+        :"=l"(d0),"=l"(d1),"=l"(d2),"=l"(d3)
+        :"l"((ulong)SECP256K1_P0),"l"((ulong)SECP256K1_P1),"l"((ulong)SECP256K1_P2),"l"((ulong)SECP256K1_P3),
+         "l"(a0),"l"(a1),"l"(a2),"l"(a3));
+    r->limbs[0]=d0; r->limbs[1]=d1; r->limbs[2]=d2; r->limbs[3]=d3;
+#else
+    ulong borrow = 0;
+    r->limbs[0] = sub_with_borrow(SECP256K1_P0, a0, 0, &borrow);
+    r->limbs[1] = sub_with_borrow(SECP256K1_P1, a1, borrow, &borrow);
+    r->limbs[2] = sub_with_borrow(SECP256K1_P2, a2, borrow, &borrow);
+    r->limbs[3] = sub_with_borrow(SECP256K1_P3, a3, borrow, &borrow);
+#endif
+}
+
+inline int scalar_is_zero_cl(const Scalar* s) {
+    return (s->limbs[0] | s->limbs[1] | s->limbs[2] | s->limbs[3]) == 0;
+}
+
+// ============================================================================
+// GLV Endomorphism + Shamir's wNAF Scalar Multiplication
+// ============================================================================
+
+// Curve order n (LE 64-bit)
+#define ORDER_N0 0xBFD25E8CD0364141UL
+#define ORDER_N1 0xBAAEDCE6AF48A03BUL
+#define ORDER_N2 0xFFFFFFFFFFFFFFFEUL
+#define ORDER_N3 0xFFFFFFFFFFFFFFFFUL
+
+// NC = 2^256 - n (for scalar reduction)
+#define NC0 0x402DA1732FC9BEBFUL
+#define NC1 0x4551231950B75FC4UL
+#define NC2 0x1UL
+
+// GLV endomorphism: beta^3 = 1 mod p, lambda^3 = 1 mod n
+#define GLV_BETA0 0xC1396C28719501EEUL
+#define GLV_BETA1 0x9CF0497512F58995UL
+#define GLV_BETA2 0x6E64479EAC3434E9UL
+#define GLV_BETA3 0x7AE96A2B657C0710UL
+
+// Decomposition lattice vectors (LE)
+#define GLV_G1_0 0xE893209A45DBB031UL
+#define GLV_G1_1 0x3DAA8A1471E8CA7FUL
+#define GLV_G1_2 0xE86C90E49284EB15UL
+#define GLV_G1_3 0x3086D221A7D46BCDUL
+#define GLV_G2_0 0x1571B4AE8AC47F71UL
+#define GLV_G2_1 0x221208AC9DF506C6UL
+#define GLV_G2_2 0x6F547FA90ABFE4C4UL
+#define GLV_G2_3 0xE4437ED6010E8828UL
+#define GLV_MB1_0 0x6F547FA90ABFE4C3UL
+#define GLV_MB1_1 0xE4437ED6010E8828UL
+#define GLV_MB2_0 0xD765CDA83DB1562CUL
+#define GLV_MB2_1 0x8A280AC50774346DUL
+#define GLV_MB2_2 0xFFFFFFFFFFFFFFFEUL
+#define GLV_MB2_3 0xFFFFFFFFFFFFFFFFUL
+
+// Conditional subtract n (branchless)
+inline void scalar_cond_sub_n_cl(Scalar* r) {
+    ulong n[4] = { ORDER_N0, ORDER_N1, ORDER_N2, ORDER_N3 };
+    ulong borrow = 0, tmp[4];
+    for (int i = 0; i < 4; i++) tmp[i] = sub_with_borrow(r->limbs[i], n[i], borrow, &borrow);
+    ulong mask = (borrow == 0) ? ~0UL : 0UL;
+    for (int i = 0; i < 4; i++) r->limbs[i] = (tmp[i] & mask) | (r->limbs[i] & ~mask);
+}
+
+inline void scalar_add_mod_n_cl(const Scalar* a, const Scalar* b, Scalar* r) {
+    ulong carry = 0;
+    for (int i = 0; i < 4; i++) r->limbs[i] = add_with_carry(a->limbs[i], b->limbs[i], carry, &carry);
+    if (carry) {
+        ulong n[4] = { ORDER_N0, ORDER_N1, ORDER_N2, ORDER_N3 };
+        ulong borrow = 0;
+        for (int i = 0; i < 4; i++) r->limbs[i] = sub_with_borrow(r->limbs[i], n[i], borrow, &borrow);
+    } else { scalar_cond_sub_n_cl(r); }
+}
+
+inline void scalar_sub_mod_n_cl(const Scalar* a, const Scalar* b, Scalar* r) {
+    ulong borrow = 0;
+    for (int i = 0; i < 4; i++) r->limbs[i] = sub_with_borrow(a->limbs[i], b->limbs[i], borrow, &borrow);
+    if (borrow) {
+        ulong n[4] = { ORDER_N0, ORDER_N1, ORDER_N2, ORDER_N3 };
+        ulong carry = 0;
+        for (int i = 0; i < 4; i++) r->limbs[i] = add_with_carry(r->limbs[i], n[i], carry, &carry);
+    }
+}
+
+inline void scalar_negate_cl(const Scalar* a, Scalar* r) {
+    ulong n[4] = { ORDER_N0, ORDER_N1, ORDER_N2, ORDER_N3 };
+    int is_zero = scalar_is_zero_cl(a);
+    ulong borrow = 0;
+    for (int i = 0; i < 4; i++) r->limbs[i] = sub_with_borrow(n[i], a->limbs[i], borrow, &borrow);
+    if (is_zero) { r->limbs[0]=0; r->limbs[1]=0; r->limbs[2]=0; r->limbs[3]=0; }
+}
+
+// Scalar mul mod n (schoolbook 4x4 + NC reduction)
+inline void scalar_mul_mod_n_cl(const Scalar* a, const Scalar* b, Scalar* r) {
+    ulong NC[3] = { NC0, NC1, NC2 };
+    ulong prod[8] = {0,0,0,0,0,0,0,0};
+    for (int i = 0; i < 4; i++) {
+        ulong carry = 0;
+        for (int j = 0; j < 4; j++) {
+            ulong2 full = mul64_full(a->limbs[i], b->limbs[j]);
+            ulong s = prod[i+j] + full.x; ulong c1 = (s < prod[i+j]) ? 1UL : 0UL;
+            s += carry; ulong c2 = (s < carry) ? 1UL : 0UL;
+            prod[i+j] = s; carry = full.y + c1 + c2;
+        }
+        prod[i+4] = carry;
+    }
+    ulong acc[7] = {prod[0],prod[1],prod[2],prod[3],0,0,0};
+    for (int i = 0; i < 4; i++) {
+        if (prod[4+i] == 0) continue;
+        ulong carry = 0;
+        for (int j = 0; j < 3; j++) {
+            ulong2 full = mul64_full(prod[4+i], NC[j]);
+            ulong s = acc[i+j] + full.x; ulong c1 = (s < acc[i+j]) ? 1UL : 0UL;
+            s += carry; ulong c2 = (s < carry) ? 1UL : 0UL;
+            acc[i+j] = s; carry = full.y + c1 + c2;
+        }
+        for (int k = i+3; k < 7 && carry; k++) { ulong s = acc[k]+carry; carry=(s<acc[k])?1UL:0UL; acc[k]=s; }
+    }
+    ulong res[5] = {acc[0],acc[1],acc[2],acc[3],0};
+    for (int i = 0; i < 3; i++) {
+        if (acc[4+i] == 0) continue;
+        ulong carry = 0;
+        for (int j = 0; j < 3 && (i+j) < 5; j++) {
+            ulong2 full = mul64_full(acc[4+i], NC[j]);
+            ulong s = res[i+j]+full.x; ulong c1=(s<res[i+j])?1UL:0UL;
+            s += carry; ulong c2=(s<carry)?1UL:0UL;
+            res[i+j] = s; carry = full.y+c1+c2;
+        }
+        for (int k=i+3; k<5&&carry; k++) { ulong s=res[k]+carry; carry=(s<res[k])?1UL:0UL; res[k]=s; }
+    }
+    r->limbs[0]=res[0]; r->limbs[1]=res[1]; r->limbs[2]=res[2]; r->limbs[3]=res[3];
+    if (res[4]) {
+        ulong carry = 0;
+        for (int j = 0; j < 3; j++) {
+            ulong2 full = mul64_full(res[4], NC[j]);
+            ulong s = r->limbs[j]+full.x; ulong c1=(s<r->limbs[j])?1UL:0UL;
+            s += carry; ulong c2=(s<carry)?1UL:0UL;
+            r->limbs[j] = s; carry = full.y+c1+c2;
+        }
+        r->limbs[3] += carry;
+    }
+    scalar_cond_sub_n_cl(r); scalar_cond_sub_n_cl(r); scalar_cond_sub_n_cl(r);
+}
+
+)KERNEL",
+
+// ---- third segment (scalar utilities + GLV + point operations) ----
+R"KERNEL(
+
+// Scalar bit length (uses clz intrinsic -- single instruction on GPU)
+inline int scalar_bitlen_cl(const Scalar* s) {
+    for (int i = 3; i >= 0; i--) {
+        if (s->limbs[i] != 0) return i * 64 + 64 - (int)clz(s->limbs[i]);
+    }
+    return 0;
+}
+
+// (a * b) >> 384 with rounding (for GLV decomposition)
+#ifdef __NV_CL_C_VERSION
+// 32-bit Comba: avoids INT64 multiply (64x throughput gain on consumer NVIDIA)
+inline void mul_shift_384_cl(const ulong a[4], const ulong b[4], ulong result[4]) {
+    uint al[8], bl[8];
+    for (int i = 0; i < 4; i++) {
+        al[2*i]   = (uint)a[i];        al[2*i+1] = (uint)(a[i] >> 32);
+        bl[2*i]   = (uint)b[i];        bl[2*i+1] = (uint)(b[i] >> 32);
+    }
+    uint c0 = 0, c1 = 0, c2 = 0;
+#define GLV_MAC(i, j) do { uint _lo, _hi; \
+    __asm volatile("mul.lo.u32 %0, %2, %3;\n\t" "mul.hi.u32 %1, %2, %3;\n\t" \
+        : "=r"(_lo), "=r"(_hi) : "r"(al[i]), "r"(bl[j])); \
+    __asm volatile("add.cc.u32 %0, %0, %3;\n\t" "addc.cc.u32 %1, %1, %4;\n\t" "addc.u32 %2, %2, 0;\n\t" \
+        : "+r"(c0), "+r"(c1), "+r"(c2) : "r"(_lo), "r"(_hi)); } while(0)
+#define GLV_EXT(out) do { out = c0; c0 = c1; c1 = c2; c2 = 0; } while(0)
+    uint d;
+    /*  0 */ GLV_MAC(0,0); GLV_EXT(d);
+    /*  1 */ GLV_MAC(0,1); GLV_MAC(1,0); GLV_EXT(d);
+    /*  2 */ GLV_MAC(0,2); GLV_MAC(1,1); GLV_MAC(2,0); GLV_EXT(d);
+    /*  3 */ GLV_MAC(0,3); GLV_MAC(1,2); GLV_MAC(2,1); GLV_MAC(3,0); GLV_EXT(d);
+    /*  4 */ GLV_MAC(0,4); GLV_MAC(1,3); GLV_MAC(2,2); GLV_MAC(3,1); GLV_MAC(4,0); GLV_EXT(d);
+    /*  5 */ GLV_MAC(0,5); GLV_MAC(1,4); GLV_MAC(2,3); GLV_MAC(3,2); GLV_MAC(4,1); GLV_MAC(5,0); GLV_EXT(d);
+    /*  6 */ GLV_MAC(0,6); GLV_MAC(1,5); GLV_MAC(2,4); GLV_MAC(3,3); GLV_MAC(4,2); GLV_MAC(5,1); GLV_MAC(6,0); GLV_EXT(d);
+    /*  7 */ GLV_MAC(0,7); GLV_MAC(1,6); GLV_MAC(2,5); GLV_MAC(3,4); GLV_MAC(4,3); GLV_MAC(5,2); GLV_MAC(6,1); GLV_MAC(7,0); GLV_EXT(d);
+    /*  8 */ GLV_MAC(1,7); GLV_MAC(2,6); GLV_MAC(3,5); GLV_MAC(4,4); GLV_MAC(5,3); GLV_MAC(6,2); GLV_MAC(7,1); GLV_EXT(d);
+    /*  9 */ GLV_MAC(2,7); GLV_MAC(3,6); GLV_MAC(4,5); GLV_MAC(5,4); GLV_MAC(6,3); GLV_MAC(7,2); GLV_EXT(d);
+    /* 10 */ GLV_MAC(3,7); GLV_MAC(4,6); GLV_MAC(5,5); GLV_MAC(6,4); GLV_MAC(7,3); GLV_EXT(d);
+    (void)d;
+    uint p11;
+    /* 11 */ GLV_MAC(4,7); GLV_MAC(5,6); GLV_MAC(6,5); GLV_MAC(7,4); GLV_EXT(p11);
+    uint p12, p13, p14, p15;
+    /* 12 */ GLV_MAC(5,7); GLV_MAC(6,6); GLV_MAC(7,5); GLV_EXT(p12);
+    /* 13 */ GLV_MAC(6,7); GLV_MAC(7,6); GLV_EXT(p13);
+    /* 14 */ GLV_MAC(7,7); GLV_EXT(p14);
+    p15 = c0;
+#undef GLV_MAC
+#undef GLV_EXT
+    result[0] = ((ulong)p13 << 32) | p12;
+    result[1] = ((ulong)p15 << 32) | p14;
+    result[2] = 0; result[3] = 0;
+    if (p11 >> 31) { result[0]++; if (result[0] == 0) result[1]++; }
+}
+#else
+// Portable 64-bit version for non-NVIDIA OpenCL
+inline void mul_shift_384_cl(const ulong a[4], const ulong b[4], ulong result[4]) {
+    ulong prod[8] = {0,0,0,0,0,0,0,0};
+    for (int i = 0; i < 4; i++) {
+        ulong carry = 0;
+        for (int j = 0; j < 4; j++) {
+            ulong2 full = mul64_full(a[i], b[j]);
+            ulong s = prod[i+j]+full.x; ulong c1=(s<prod[i+j])?1UL:0UL;
+            s += carry; ulong c2=(s<carry)?1UL:0UL;
+            prod[i+j] = s; carry = full.y+c1+c2;
+        }
+        prod[i+4] = carry;
+    }
+    result[0] = prod[6]; result[1] = prod[7]; result[2] = 0; result[3] = 0;
+    if (prod[5] >> 63) { result[0]++; if (result[0] == 0) result[1]++; }
+}
+#endif
+
+// GLV decomposition: k = k1 + k2*lambda mod n, |k1|,|k2| ~ 128 bits
+inline void glv_decompose_cl(const Scalar* k, Scalar* k1, Scalar* k2, int* k1_neg, int* k2_neg) {
+    ulong g1[4] = { GLV_G1_0, GLV_G1_1, GLV_G1_2, GLV_G1_3 };
+    ulong g2[4] = { GLV_G2_0, GLV_G2_1, GLV_G2_2, GLV_G2_3 };
+    ulong c1_l[4], c2_l[4];
+    mul_shift_384_cl(k->limbs, g1, c1_l);
+    mul_shift_384_cl(k->limbs, g2, c2_l);
+    Scalar c1, c2;
+    for (int i=0;i<4;i++){c1.limbs[i]=c1_l[i]; c2.limbs[i]=c2_l[i];}
+
+    Scalar mb1, mb2;
+    mb1.limbs[0]=GLV_MB1_0; mb1.limbs[1]=GLV_MB1_1; mb1.limbs[2]=0; mb1.limbs[3]=0;
+    mb2.limbs[0]=GLV_MB2_0; mb2.limbs[1]=GLV_MB2_1; mb2.limbs[2]=GLV_MB2_2; mb2.limbs[3]=GLV_MB2_3;
+
+    Scalar t1, t2, k2_mod;
+    scalar_mul_mod_n_cl(&c1, &mb1, &t1);
+    scalar_mul_mod_n_cl(&c2, &mb2, &t2);
+    scalar_add_mod_n_cl(&t1, &t2, &k2_mod);
+
+    Scalar k2_neg_val;
+    scalar_negate_cl(&k2_mod, &k2_neg_val);
+    int k2_is_neg = (scalar_bitlen_cl(&k2_neg_val) < scalar_bitlen_cl(&k2_mod));
+    Scalar k2_abs = k2_is_neg ? k2_neg_val : k2_mod;
+
+    Scalar k2_signed;
+    if (k2_is_neg) scalar_negate_cl(&k2_abs, &k2_signed);
+    else k2_signed = k2_abs;
+
+    Scalar lambda_s;
+    lambda_s.limbs[0]=0xDF02967C1B23BD72UL; lambda_s.limbs[1]=0x122E22EA20816678UL;
+    lambda_s.limbs[2]=0xA5261C028812645AUL; lambda_s.limbs[3]=0x5363AD4CC05C30E0UL;
+    Scalar lk2;
+    scalar_mul_mod_n_cl(&lambda_s, &k2_signed, &lk2);
+    Scalar k1_mod;
+    scalar_sub_mod_n_cl(k, &lk2, &k1_mod);
+
+    Scalar k1_neg_val;
+    scalar_negate_cl(&k1_mod, &k1_neg_val);
+    int k1_is_neg = (scalar_bitlen_cl(&k1_neg_val) < scalar_bitlen_cl(&k1_mod));
+    Scalar k1_abs = k1_is_neg ? k1_neg_val : k1_mod;
+
+    *k1 = k1_abs; *k2 = k2_abs;
+    *k1_neg = k1_is_neg; *k2_neg = k2_is_neg;
+}
+
+inline void point_from_affine(JacobianPoint* j, const AffinePoint* a) {
+    j->x = a->x; j->y = a->y;
+    j->z.limbs[0] = 1UL; j->z.limbs[1] = 0UL; j->z.limbs[2] = 0UL; j->z.limbs[3] = 0UL;
+    j->infinity = 0;
+}
+
+inline void point_add_mixed_h_impl(JacobianPoint* r, const JacobianPoint* p,
+                                   const AffinePoint* q, FieldElement* h_out) {
+    h_out->limbs[0] = 1UL; h_out->limbs[1] = 0UL; h_out->limbs[2] = 0UL; h_out->limbs[3] = 0UL;
+    if (point_is_infinity(p)) { point_from_affine(r, q); return; }
+
+    FieldElement Z1Z1, U2, S2, H, HH, I, J, rr, V, X3, Y3, Z3, t1, t2;
+    field_sqr_impl(&Z1Z1, &p->z);
+    field_mul_impl(&U2, &q->x, &Z1Z1);
+    field_mul_impl(&t1, &q->y, &p->z);
+    field_mul_impl(&S2, &t1, &Z1Z1);
+    field_sub_impl(&H, &U2, &p->x);
+
+    if ((H.limbs[0] | H.limbs[1] | H.limbs[2] | H.limbs[3]) == 0) {
+        field_sub_impl(&t1, &S2, &p->y);
+        if ((t1.limbs[0] | t1.limbs[1] | t1.limbs[2] | t1.limbs[3]) == 0)
+            { point_double_impl(r, p); return; }
+        point_set_infinity(r); return;
+    }
+    field_add_impl(h_out, &H, &H);
+    field_sqr_impl(&HH, &H);
+    field_add_impl(&I, &HH, &HH); field_add_impl(&I, &I, &I);
+    field_mul_impl(&J, &H, &I);
+    field_sub_impl(&rr, &S2, &p->y); field_add_impl(&rr, &rr, &rr);
+    field_mul_impl(&V, &p->x, &I);
+    field_sqr_impl(&X3, &rr);
+    field_sub_impl(&X3, &X3, &J);
+    field_add_impl(&t1, &V, &V); field_sub_impl(&X3, &X3, &t1);
+    field_sub_impl(&t1, &V, &X3); field_mul_impl(&Y3, &rr, &t1);
+    field_mul_impl(&t2, &p->y, &J); field_add_impl(&t2, &t2, &t2);
+    field_sub_impl(&Y3, &Y3, &t2);
+    field_add_impl(&t1, &p->z, &H); field_sqr_impl(&Z3, &t1);
+    field_sub_impl(&Z3, &Z3, &Z1Z1); field_sub_impl(&Z3, &Z3, &HH);
+    r->x = X3; r->y = Y3; r->z = Z3; r->infinity = 0;
+}
+
+inline void build_wnaf_table_zr_cl(const AffinePoint* base, AffinePoint table[8], FieldElement* globalz) {
+    JacobianPoint base_jac;
+    point_from_affine(&base_jac, base);
+
+    JacobianPoint doubled;
+    point_double_impl(&doubled, &base_jac);
+
+    FieldElement c = doubled.z;
+    FieldElement c2, c3;
+    field_sqr_impl(&c2, &c);
+    field_mul_impl(&c3, &c2, &c);
+
+    AffinePoint doubled_affine;
+    doubled_affine.x = doubled.x;
+    doubled_affine.y = doubled.y;
+
+    JacobianPoint accum;
+    field_mul_impl(&accum.x, &base->x, &c2);
+    field_mul_impl(&accum.y, &base->y, &c3);
+    accum.z.limbs[0] = 1UL; accum.z.limbs[1] = 0UL; accum.z.limbs[2] = 0UL; accum.z.limbs[3] = 0UL;
+    accum.infinity = 0;
+
+    table[0].x = accum.x;
+    table[0].y = accum.y;
+
+    FieldElement zr[8];
+    zr[0] = c;
+
+    for (int i = 1; i < 8; ++i) {
+        FieldElement h;
+        point_add_mixed_h_impl(&accum, &accum, &doubled_affine, &h);
+        table[i].x = accum.x;
+        table[i].y = accum.y;
+        zr[i] = h;
+    }
+
+    field_mul_impl(globalz, &accum.z, &c);
+
+    FieldElement zs = zr[7];
+    for (int idx = 6; idx >= 0; --idx) {
+        if (idx != 6) {
+            FieldElement tmp;
+            field_mul_impl(&tmp, &zs, &zr[idx + 1]);
+            zs = tmp;
+        }
+
+        FieldElement zs2, zs3;
+        field_sqr_impl(&zs2, &zs);
+        field_mul_impl(&zs3, &zs2, &zs);
+
+        FieldElement tx, ty;
+        field_mul_impl(&tx, &table[idx].x, &zs2);
+        field_mul_impl(&ty, &table[idx].y, &zs3);
+        table[idx].x = tx;
+        table[idx].y = ty;
+    }
+}
+
+inline void derive_endo_table_cl(const AffinePoint table[8], AffinePoint endo_table[8], int negate_y) {
+    FieldElement beta;
+    beta.limbs[0]=GLV_BETA0; beta.limbs[1]=GLV_BETA1;
+    beta.limbs[2]=GLV_BETA2; beta.limbs[3]=GLV_BETA3;
+
+    for (int i = 0; i < 8; ++i) {
+        field_mul_impl(&endo_table[i].x, &table[i].x, &beta);
+        if (negate_y) field_neg_impl(&endo_table[i].y, &table[i].y);
+        else endo_table[i].y = table[i].y;
+    }
+}
+
+static inline void scalar_to_wnaf(const Scalar* k, int wnaf[130]) {
+    ulong s[4];
+    for (int i = 0; i < 4; i++) s[i] = k->limbs[i];
+    for (int i = 0; i < 130; i++) {
+        if (s[0] & 1UL) {
+            int d = (int)(s[0] & 0x1FUL);
+            if (d >= 16) {
+                d -= 32;
+                ulong add = (ulong)(-d);
+                ulong prev = s[0]; s[0] += add;
+                if (s[0] < prev) { for (int j=1;j<4;j++) if (++s[j]) break; }
+            } else {
+                ulong prev = s[0]; s[0] -= (ulong)d;
+                if (s[0] > prev) { for (int j=1;j<4;j++) if (s[j]--) break; }
+            }
+            wnaf[i] = d;
+        } else { wnaf[i] = 0; }
+        s[0] = (s[0] >> 1) | (s[1] << 63);
+        s[1] = (s[1] >> 1) | (s[2] << 63);
+        s[2] = (s[2] >> 1) | (s[3] << 63);
+        s[3] >>= 1;
+    }
+}
+
+/* GLV scalar mul — Shamir w=1 interleaved binary scan.
+ * Replaces the wNAF-5 path: no 8-point table, no Z-correction,
+ * ~same 130 doublings but only 2 affine operands → far lower register pressure. */
+inline void scalar_mul_glv_cl(JacobianPoint* r, const Scalar* k, const AffinePoint* base) {
+    if (scalar_is_zero_cl(k)) { point_set_infinity(r); return; }
+
+    Scalar k1, k2; int k1_neg, k2_neg;
+    glv_decompose_cl(k, &k1, &k2, &k1_neg, &k2_neg);
+
+    /* P = base, possibly negated for k1 sign */
+    AffinePoint P = *base;
+    if (k1_neg) field_neg_impl(&P.y, &P.y);
+
+    /* phi(P) = (beta*x, (+/-) y) per k2 sign */
+    AffinePoint phiP;
+    FieldElement beta;
+    beta.limbs[0]=GLV_BETA0; beta.limbs[1]=GLV_BETA1;
+    beta.limbs[2]=GLV_BETA2; beta.limbs[3]=GLV_BETA3;
+    field_mul_impl(&phiP.x, &P.x, &beta);
+    if (k1_neg != k2_neg) field_neg_impl(&phiP.y, &P.y);
+    else phiP.y = P.y;
+
+    point_set_infinity(r);
+
+    /* Scan 130 bits: limb 2 has only bits [1:0], limbs 1 and 0 are full 64-bit */
+    for (int limb = 2; limb >= 0; limb--) {
+        int start_bit = (limb == 2) ? 1 : 63;
+        ulong w1 = k1.limbs[limb];
+        ulong w2 = k2.limbs[limb];
+        for (int bit = start_bit; bit >= 0; bit--) {
+            if (!point_is_infinity(r)) point_double_impl(r, r);
+            int b1 = (int)((w1 >> bit) & 1UL);
+            int b2 = (int)((w2 >> bit) & 1UL);
+            if (b1 | b2) {
+                if (point_is_infinity(r)) {
+                    if (b1 && b2) {
+                        point_from_affine(r, &P);
+                        point_add_mixed_impl(r, r, &phiP);
+                    } else if (b1) {
+                        point_from_affine(r, &P);
+                    } else {
+                        point_from_affine(r, &phiP);
+                    }
+                } else {
+                    if (b1) point_add_mixed_impl(r, r, &P);
+                    if (b2) point_add_mixed_impl(r, r, &phiP);
+                }
+            }
+        }
+    }
+}
+
+#define GX0 0x59F2815B16F81798UL
+#define GX1 0x029BFCDB2DCE28D9UL
+#define GX2 0x55A06295CE870B07UL
+#define GX3 0x79BE667EF9DCBBACUL
+#define GY0 0x9C47D08FFB10D4B8UL
+#define GY1 0xFD17B448A6855419UL
+#define GY2 0x5DA4FBFC0E1108A8UL
+#define GY3 0x483ADA7726A3C465UL
+
+inline void get_generator(AffinePoint* g) { g->x.limbs[0]=GX0; g->x.limbs[1]=GX1; g->x.limbs[2]=GX2; g->x.limbs[3]=GX3; g->y.limbs[0]=GY0; g->y.limbs[1]=GY1; g->y.limbs[2]=GY2; g->y.limbs[3]=GY3; }
+
+// Precomputed generator multiples: get_gen_entry(pt, idx) returns (idx+1)*G
+// Using inline function instead of __constant array for OpenCL compiler compatibility
+inline void get_gen_entry(AffinePoint* pt, int idx) {
+    switch(idx) {
+    case 0: pt->x.limbs[0]=0x59f2815b16f81798UL;pt->x.limbs[1]=0x029bfcdb2dce28d9UL;pt->x.limbs[2]=0x55a06295ce870b07UL;pt->x.limbs[3]=0x79be667ef9dcbbacUL;pt->y.limbs[0]=0x9c47d08ffb10d4b8UL;pt->y.limbs[1]=0xfd17b448a6855419UL;pt->y.limbs[2]=0x5da4fbfc0e1108a8UL;pt->y.limbs[3]=0x483ada7726a3c465UL;break;
+    case 1: pt->x.limbs[0]=0xabac09b95c709ee5UL;pt->x.limbs[1]=0x5c778e4b8cef3ca7UL;pt->x.limbs[2]=0x3045406e95c07cd8UL;pt->x.limbs[3]=0xc6047f9441ed7d6dUL;pt->y.limbs[0]=0x236431a950cfe52aUL;pt->y.limbs[1]=0xf7f632653266d0e1UL;pt->y.limbs[2]=0xa3c58419466ceaeeUL;pt->y.limbs[3]=0x1ae168fea63dc339UL;break;
+    case 2: pt->x.limbs[0]=0x8601f113bce036f9UL;pt->x.limbs[1]=0xb531c845836f99b0UL;pt->x.limbs[2]=0x49344f85f89d5229UL;pt->x.limbs[3]=0xf9308a019258c310UL;pt->y.limbs[0]=0x6cb9fd7584b8e672UL;pt->y.limbs[1]=0x6500a99934c2231bUL;pt->y.limbs[2]=0x0fe337e62a37f356UL;pt->y.limbs[3]=0x388f7b0f632de814UL;break;
+    case 3: pt->x.limbs[0]=0x74fa94abe8c4cd13UL;pt->x.limbs[1]=0xcc6c13900ee07584UL;pt->x.limbs[2]=0x581e4904930b1404UL;pt->x.limbs[3]=0xe493dbf1c10d80f3UL;pt->y.limbs[0]=0xcfe97bdc47739922UL;pt->y.limbs[1]=0xd967ae33bfbdfe40UL;pt->y.limbs[2]=0x5642e2098ea51448UL;pt->y.limbs[3]=0x51ed993ea0d455b7UL;break;
+    case 4: pt->x.limbs[0]=0xcba8d569b240efe4UL;pt->x.limbs[1]=0xe88b84bddc619ab7UL;pt->x.limbs[2]=0x55b4a7250a5c5128UL;pt->x.limbs[3]=0x2f8bde4d1a072093UL;pt->y.limbs[0]=0xdca87d3aa6ac62d6UL;pt->y.limbs[1]=0xf788271bab0d6840UL;pt->y.limbs[2]=0xd4dba9dda6c9c426UL;pt->y.limbs[3]=0xd8ac222636e5e3d6UL;break;
+    case 5: pt->x.limbs[0]=0x2f057a1460297556UL;pt->x.limbs[1]=0x82f6472f8568a18bUL;pt->x.limbs[2]=0x20453a14355235d3UL;pt->x.limbs[3]=0xfff97bd5755eeea4UL;pt->y.limbs[0]=0x3c870c36b075f297UL;pt->y.limbs[1]=0xde80f0f6518fe4a0UL;pt->y.limbs[2]=0xf3be96017f45c560UL;pt->y.limbs[3]=0xae12777aacfbb620UL;break;
+    case 6: pt->x.limbs[0]=0xe92bddedcac4f9bcUL;pt->x.limbs[1]=0x3d419b7e0330e39cUL;pt->x.limbs[2]=0xa398f365f2ea7a0eUL;pt->x.limbs[3]=0x5cbdf0646e5db4eaUL;pt->y.limbs[0]=0xa5082628087264daUL;pt->y.limbs[1]=0xa813d0b813fde7b5UL;pt->y.limbs[2]=0xa3178d6d861a54dbUL;pt->y.limbs[3]=0x6aebca40ba255960UL;break;
+    case 7: pt->x.limbs[0]=0x67784ef3e10a2a01UL;pt->x.limbs[1]=0x0a1bdd05e5af888aUL;pt->x.limbs[2]=0xaff3843fb70f3c2fUL;pt->x.limbs[3]=0x2f01e5e15cca351dUL;pt->y.limbs[0]=0xb5da2cb76cbde904UL;pt->y.limbs[1]=0xc2e213d6ba5b7617UL;pt->y.limbs[2]=0x293d082a132d13b4UL;pt->y.limbs[3]=0x5c4da8a741539949UL;break;
+    case 8: pt->x.limbs[0]=0xc35f110dfc27ccbeUL;pt->x.limbs[1]=0xe09796974c57e714UL;pt->x.limbs[2]=0x09ad178a9f559abdUL;pt->x.limbs[3]=0xacd484e2f0c7f653UL;pt->y.limbs[0]=0x05cc262ac64f9c37UL;pt->y.limbs[1]=0xadd888a4375f8e0fUL;pt->y.limbs[2]=0x64380971763b61e9UL;pt->y.limbs[3]=0xcc338921b0a7d9fdUL;break;
+    case 9: pt->x.limbs[0]=0x52a68e2a47e247c7UL;pt->x.limbs[1]=0x3442d49b1943c2b7UL;pt->x.limbs[2]=0x35477c7b1ae6ae5dUL;pt->x.limbs[3]=0xa0434d9e47f3c862UL;pt->y.limbs[0]=0x3cbee53b037368d7UL;pt->y.limbs[1]=0x6f794c2ed877a159UL;pt->y.limbs[2]=0xa3b6c7e693a24c69UL;pt->y.limbs[3]=0x893aba425419bc27UL;break;
+    case 10: pt->x.limbs[0]=0xbbec17895da008cbUL;pt->x.limbs[1]=0x5649980be5c17891UL;pt->x.limbs[2]=0x5ef4246b70c65aacUL;pt->x.limbs[3]=0x774ae7f858a9411eUL;pt->y.limbs[0]=0x301d74c9c953c61bUL;pt->y.limbs[1]=0x372db1e2dff9d6a8UL;pt->y.limbs[2]=0x0243dd56d7b7b365UL;pt->y.limbs[3]=0xd984a032eb6b5e19UL;break;
+    case 11: pt->x.limbs[0]=0xc5b0f47070afe85aUL;pt->x.limbs[1]=0x687cf4419620095bUL;pt->x.limbs[2]=0x15c38f004d734633UL;pt->x.limbs[3]=0xd01115d548e7561bUL;pt->y.limbs[0]=0x6b051b13f4062327UL;pt->y.limbs[1]=0x79238c5dd9a86d52UL;pt->y.limbs[2]=0xa8b64537e17bd815UL;pt->y.limbs[3]=0xa9f34ffdc815e0d7UL;break;
+    case 12: pt->x.limbs[0]=0xdeeddf8f19405aa8UL;pt->x.limbs[1]=0xb075fbc6610e58cdUL;pt->x.limbs[2]=0xc7d1d205c3748651UL;pt->x.limbs[3]=0xf28773c2d975288bUL;pt->y.limbs[0]=0x29b5cb52db03ed81UL;pt->y.limbs[1]=0x3a1a06da521fa91fUL;pt->y.limbs[2]=0x758212eb65cdaf47UL;pt->y.limbs[3]=0x0ab0902e8d880a89UL;break;
+    case 13: pt->x.limbs[0]=0xe49b241a60e823e4UL;pt->x.limbs[1]=0x26aa7b63678949e6UL;pt->x.limbs[2]=0xfd64e67f07d38e32UL;pt->x.limbs[3]=0x499fdf9e895e719cUL;pt->y.limbs[0]=0xc65f40d403a13f5bUL;pt->y.limbs[1]=0x464279c27a3f95bcUL;pt->y.limbs[2]=0x90f044e4a7b3d464UL;pt->y.limbs[3]=0xcac2f6c4b54e8551UL;break;
+    default: pt->x.limbs[0]=0x44adbcf8e27e080eUL;pt->x.limbs[1]=0x31e5946f3c85f79eUL;pt->x.limbs[2]=0x5a465ae3095ff411UL;pt->x.limbs[3]=0xd7924d4f7d43ea96UL;pt->y.limbs[0]=0xc504dc9ff6a26b58UL;pt->y.limbs[1]=0xea40af2bd896d3a5UL;pt->y.limbs[2]=0x83842ec228cc6defUL;pt->y.limbs[3]=0x581e2872a86c72a6UL;break;
+    }
+}
+
+inline int get_window_4bit(const Scalar* s, int pos) {
+    int bp = pos * 4, li = bp >> 6, sh = bp & 63;
+    ulong v = s->limbs[li] >> sh;
+    if (sh > 60 && li < 3) v |= s->limbs[li+1] << (64 - sh);
+    return (int)(v & 0xFUL);
+}
+
+inline void scalar_mul_generator_glv_impl(JacobianPoint* r, const Scalar* k) {
+    if ((k->limbs[0]|k->limbs[1]|k->limbs[2]|k->limbs[3]) == 0) {
+        point_set_infinity(r);
+        return;
+    }
+
+    Scalar k1, k2; int k1_neg, k2_neg;
+    glv_decompose_cl(k, &k1, &k2, &k1_neg, &k2_neg);
+
+    FieldElement beta;
+    beta.limbs[0]=GLV_BETA0; beta.limbs[1]=GLV_BETA1;
+    beta.limbs[2]=GLV_BETA2; beta.limbs[3]=GLV_BETA3;
+
+    // Fixed constant iteration count: always 32 windows for 128-bit
+    // GLV-decomposed half-scalars. Prevents timing side-channel that
+    // would leak scalar magnitude via variable GPU kernel duration.
+    const int num_windows = 32;
+
+    point_set_infinity(r);
+    for (int w = num_windows - 1; w >= 0; --w) {
+        // Always quadruple-double; point_double_impl handles infinity correctly.
+        point_double_impl(r, r); point_double_impl(r, r);
+        point_double_impl(r, r); point_double_impl(r, r);
+        int w1 = get_window_4bit(&k1, w);
+        if (w1) {
+            AffinePoint pt; get_gen_entry(&pt, w1 - 1);
+            if (k1_neg) field_neg_impl(&pt.y, &pt.y);
+            point_add_mixed_impl(r, r, &pt);
+        }
+        int w2 = get_window_4bit(&k2, w);
+        if (w2) {
+            AffinePoint pt; get_gen_entry(&pt, w2 - 1);
+            field_mul_impl(&pt.x, &pt.x, &beta);
+            if (k2_neg) field_neg_impl(&pt.y, &pt.y);
+            point_add_mixed_impl(r, r, &pt);
+        }
+    }
+}
+
+__kernel void scalar_mul_generator(__global const Scalar* scalars, __global JacobianPoint* results, uint count) {
+    uint gid = get_global_id(0); if (gid >= count) return;
+    Scalar k = scalars[gid];
+    JacobianPoint R;
+    scalar_mul_generator_glv_impl(&R, &k);
+    results[gid] = R;
+}
+
+__kernel void point_double(__global const JacobianPoint* points, __global JacobianPoint* results, uint count) {
+    uint gid = get_global_id(0); if (gid >= count) return;
+    JacobianPoint p_local = points[gid];
+    JacobianPoint r; point_double_impl(&r, &p_local); results[gid] = r;
+}
+
+__kernel void point_add(__global const JacobianPoint* p, __global const JacobianPoint* q, __global JacobianPoint* results, uint count) {
+    uint gid = get_global_id(0); if (gid >= count) return;
+    JacobianPoint p_local = p[gid]; JacobianPoint q_local = q[gid];
+    JacobianPoint r; point_add_impl(&r, &p_local, &q_local); results[gid] = r;
+}
+
+inline void scalar_mul_impl(JacobianPoint* r, const Scalar* k, const AffinePoint* p) {
+    if ((k->limbs[0]|k->limbs[1]|k->limbs[2]|k->limbs[3]) == 0) { point_set_infinity(r); return; }
+    scalar_mul_glv_cl(r, k, p);
+}
+
+__kernel void scalar_mul(__global const Scalar* scalars, __global const AffinePoint* points, __global JacobianPoint* results, uint count) {
+    uint gid = get_global_id(0); if (gid >= count) return;
+    Scalar k = scalars[gid]; AffinePoint p = points[gid];
+    JacobianPoint r; scalar_mul_impl(&r, &k, &p); results[gid] = r;
+}
+
+__kernel void batch_jacobian_to_affine_kernel(
+    __global const JacobianPoint* jacobians,
+    __global AffinePoint* affines,
+    uint count
+) {
+    uint gid = get_global_id(0); if (gid >= count) return;
+    JacobianPoint p = jacobians[gid];
+    if (point_is_infinity(&p)) {
+        affines[gid].x.limbs[0]=0; affines[gid].x.limbs[1]=0; affines[gid].x.limbs[2]=0; affines[gid].x.limbs[3]=0;
+        affines[gid].y.limbs[0]=0; affines[gid].y.limbs[1]=0; affines[gid].y.limbs[2]=0; affines[gid].y.limbs[3]=0;
+        return;
+    }
+    if (p.z.limbs[0]==1 && p.z.limbs[1]==0 && p.z.limbs[2]==0 && p.z.limbs[3]==0) {
+        affines[gid].x = p.x; affines[gid].y = p.y; return;
+    }
+    FieldElement z_inv, z_inv2, z_inv3;
+    field_inv_impl(&z_inv, &p.z);
+    field_sqr_impl(&z_inv2, &z_inv);
+    field_mul_impl(&z_inv3, &z_inv2, &z_inv);
+    FieldElement ax, ay;
+    field_mul_impl(&ax, &p.x, &z_inv2);
+    field_mul_impl(&ay, &p.y, &z_inv3);
+    affines[gid].x = ax;
+    affines[gid].y = ay;
+}
+
+// MSM GPU block reduction — 256-thread work-groups, __local tree reduce.
+// Reduces n Jacobian partial-products → ceil(n/256) block sums.
+// Replaces the CPU affine summation loop (n field inverses) with a single
+// GPU pass, then only ceil(n/256) points are returned to CPU.
+__kernel void msm_block_reduce_kernel(
+    __global const JacobianPoint* partials,
+    int n,
+    __global JacobianPoint* block_results)
+{
+    __local JacobianPoint sdata[256];
+    int tid = (int)get_local_id(0);
+    int idx = (int)get_group_id(0) * 256 + tid;
+    if (idx < n) {
+        sdata[tid] = partials[idx];
+    } else {
+        JacobianPoint zero;
+        point_set_infinity(&zero);
+        sdata[tid] = zero;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            JacobianPoint a = sdata[tid];
+            JacobianPoint b = sdata[tid + stride];
+            if (point_is_infinity(&a)) {
+                sdata[tid] = b;
+            } else if (!point_is_infinity(&b)) {
+                JacobianPoint tmp;
+                point_add_impl(&tmp, &a, &b);
+                sdata[tid] = tmp;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (tid == 0) block_results[get_group_id(0)] = sdata[0];
+}
+
+)KERNEL",
+
+// ---- fourth segment (affine batch ops + jacobian_to_affine) ----
+R"KERNEL(
+
+// ---- Affine point addition kernels ----
+
+// affine_add_impl: P + Q -> R, all affine (2M + 1S + inv)
+// OCL-H-03: branchlessly handles H == 0 (P.x == Q.x degenerate case);
+// returns (0,0) identity sentinel when H == 0 instead of wrong garbage values.
+inline void affine_add_impl(AffinePoint* r,
+                             const FieldElement* px, const FieldElement* py,
+                             const FieldElement* qx, const FieldElement* qy) {
+    FieldElement h, rr, t, lam;
+    field_sub_impl(&h, qx, px);
+    field_sub_impl(&rr, qy, py);
+
+    // OCL-H-03: detect H == 0 (P.x == Q.x); field_inv(0) = 0 via Fermat LT,
+    // which produces wrong X3/Y3.  Mask out the result to (0,0) when degenerate.
+    ulong h_all = h.limbs[0] | h.limbs[1] | h.limbs[2] | h.limbs[3];
+    ulong h_nonzero_mask = (h_all != 0UL) ? ~0UL : 0UL;
+
+    field_inv_impl(&t, &h);
+    field_mul_impl(&lam, &rr, &t);
+    field_sqr_impl(&r->x, &lam);
+    field_sub_impl(&r->x, &r->x, px);
+    field_sub_impl(&r->x, &r->x, qx);
+    field_sub_impl(&r->y, px, &r->x);
+    field_mul_impl(&r->y, &lam, &r->y);
+    field_sub_impl(&r->y, &r->y, py);
+
+    // Zero out result when H was 0 (identity sentinel)
+    r->x.limbs[0] &= h_nonzero_mask; r->x.limbs[1] &= h_nonzero_mask;
+    r->x.limbs[2] &= h_nonzero_mask; r->x.limbs[3] &= h_nonzero_mask;
+    r->y.limbs[0] &= h_nonzero_mask; r->y.limbs[1] &= h_nonzero_mask;
+    r->y.limbs[2] &= h_nonzero_mask; r->y.limbs[3] &= h_nonzero_mask;
+}
+
+// affine_add_lambda_impl: with pre-inverted H (2M + 1S)
+inline void affine_add_lambda_impl(AffinePoint* r,
+                                    const FieldElement* px, const FieldElement* py,
+                                    const FieldElement* qx, const FieldElement* qy,
+                                    const FieldElement* h_inv) {
+    FieldElement rr, lam;
+    field_sub_impl(&rr, qy, py);
+    field_mul_impl(&lam, &rr, h_inv);
+    field_sqr_impl(&r->x, &lam);
+    field_sub_impl(&r->x, &r->x, px);
+    field_sub_impl(&r->x, &r->x, qx);
+    field_sub_impl(&r->y, px, &r->x);
+    field_mul_impl(&r->y, &lam, &r->y);
+    field_sub_impl(&r->y, &r->y, py);
+}
+
+// affine_add_x_only_impl: X-only with pre-inverted H (1M + 1S)
+inline void affine_add_x_only_impl(FieldElement* rx,
+                                    const FieldElement* px, const FieldElement* py,
+                                    const FieldElement* qx, const FieldElement* qy,
+                                    const FieldElement* h_inv) {
+    FieldElement rr, lam;
+    field_sub_impl(&rr, qy, py);
+    field_mul_impl(&lam, &rr, h_inv);
+    field_sqr_impl(rx, &lam);
+    field_sub_impl(rx, rx, px);
+    field_sub_impl(rx, rx, qx);
+}
+
+// jacobian_to_affine_convert_impl: single point
+inline void jacobian_to_affine_convert_impl(AffinePoint* r,
+                                             const FieldElement* x,
+                                             const FieldElement* y,
+                                             const FieldElement* z) {
+    FieldElement z_inv, z_inv2, z_inv3;
+    field_inv_impl(&z_inv, z);
+    field_sqr_impl(&z_inv2, &z_inv);
+    field_mul_impl(&z_inv3, &z_inv, &z_inv2);
+    field_mul_impl(&r->x, x, &z_inv2);
+    field_mul_impl(&r->y, y, &z_inv3);
+}
+
+__kernel void affine_add(
+    __global const FieldElement* px, __global const FieldElement* py,
+    __global const FieldElement* qx, __global const FieldElement* qy,
+    __global FieldElement* rx, __global FieldElement* ry,
+    const uint count
+) {
+    #define BATCH_INV_LOCAL_MAX 256
+    __local FieldElement local_h[BATCH_INV_LOCAL_MAX];
+    __local FieldElement local_prefix[BATCH_INV_LOCAL_MAX];
+    __local FieldElement local_h_inv[BATCH_INV_LOCAL_MAX];
+    __local uint local_nonzero[BATCH_INV_LOCAL_MAX];
+
+    uint gid = get_global_id(0);
+    uint lid = get_local_id(0);
+    uint lsize = get_local_size(0);
+    uint group_start = get_group_id(0) * lsize;
+    uint active = (group_start < count) ? min(lsize, count - group_start) : 0;
+    if (gid >= count) return;
+
+    FieldElement lpx = px[gid], lpy = py[gid];
+    FieldElement lqx = qx[gid], lqy = qy[gid];
+
+    if (lsize > BATCH_INV_LOCAL_MAX) {
+        AffinePoint r;
+        affine_add_impl(&r, &lpx, &lpy, &lqx, &lqy);
+        rx[gid] = r.x;
+        ry[gid] = r.y;
+        return;
+    }
+
+    { FieldElement _t; field_sub_impl(&_t, &lqx, &lpx); local_h[lid] = _t; }
+    { FieldElement _t = local_h[lid]; local_nonzero[lid] = field_is_zero_impl(&_t) ? 0U : 1U; }
+    if (!local_nonzero[lid]) { FieldElement _t; field_set_one_impl(&_t); local_h[lid] = _t; }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (lid == 0) {
+        FieldElement acc;
+        field_set_one_impl(&acc);
+
+        for (uint i = 0; i < active; ++i) {
+            local_prefix[i] = acc;
+            if (local_nonzero[i]) { FieldElement _t = local_h[i]; field_mul_impl(&acc, &acc, &_t); }
+        }
+
+        field_inv_impl(&acc, &acc);
+
+        for (int i = (int)active - 1; i >= 0; --i) {
+            if (local_nonzero[i]) {
+                FieldElement inv_i;
+                { FieldElement _t = local_prefix[i]; field_mul_impl(&inv_i, &acc, &_t); }
+                local_h_inv[i] = inv_i;
+                { FieldElement _t = local_h[i]; field_mul_impl(&acc, &acc, &_t); }
+            } else {
+                FieldElement _t; field_set_zero_impl(&_t); local_h_inv[i] = _t;
+            }
+        }
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    AffinePoint r;
+    { FieldElement _hinv = local_h_inv[lid]; affine_add_lambda_impl(&r, &lpx, &lpy, &lqx, &lqy, &_hinv); }
+    rx[gid] = r.x;
+    ry[gid] = r.y;
+}
+
+__kernel void affine_add_lambda(
+    __global const FieldElement* px, __global const FieldElement* py,
+    __global const FieldElement* qx, __global const FieldElement* qy,
+    __global const FieldElement* h_inv,
+    __global FieldElement* rx, __global FieldElement* ry,
+    const uint count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+    FieldElement lpx = px[gid], lpy = py[gid];
+    FieldElement lqx = qx[gid], lqy = qy[gid];
+    FieldElement lhinv = h_inv[gid];
+    AffinePoint r;
+    affine_add_lambda_impl(&r, &lpx, &lpy, &lqx, &lqy, &lhinv);
+    rx[gid] = r.x;
+    ry[gid] = r.y;
+}
+
+__kernel void affine_add_x_only(
+    __global const FieldElement* px, __global const FieldElement* py,
+    __global const FieldElement* qx, __global const FieldElement* qy,
+    __global const FieldElement* h_inv,
+    __global FieldElement* rx,
+    const uint count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+    FieldElement lpx = px[gid], lpy = py[gid];
+    FieldElement lqx = qx[gid], lqy = qy[gid];
+    FieldElement lhinv = h_inv[gid];
+    FieldElement lrx;
+    affine_add_x_only_impl(&lrx, &lpx, &lpy, &lqx, &lqy, &lhinv);
+    rx[gid] = lrx;
+}
+
+__kernel void jacobian_to_affine(
+    __global const FieldElement* jx,
+    __global const FieldElement* jy,
+    __global const FieldElement* jz,
+    __global FieldElement* ax, __global FieldElement* ay,
+    const uint count
+) {
+    #define BATCH_INV_LOCAL_MAX 256
+    __local FieldElement local_z[BATCH_INV_LOCAL_MAX];
+    __local FieldElement local_prefix[BATCH_INV_LOCAL_MAX];
+    __local FieldElement local_z_inv[BATCH_INV_LOCAL_MAX];
+    __local uint local_nonzero[BATCH_INV_LOCAL_MAX];
+
+    uint gid = get_global_id(0);
+    uint lid = get_local_id(0);
+    uint lsize = get_local_size(0);
+    uint group_start = get_group_id(0) * lsize;
+    uint active = (group_start < count) ? min(lsize, count - group_start) : 0;
+    if (gid >= count) return;
+
+    FieldElement lx = jx[gid], ly = jy[gid], lz = jz[gid];
+
+    if (lsize > BATCH_INV_LOCAL_MAX) {
+        AffinePoint r;
+        jacobian_to_affine_convert_impl(&r, &lx, &ly, &lz);
+        ax[gid] = r.x;
+        ay[gid] = r.y;
+        return;
+    }
+
+    local_z[lid] = lz;
+    { FieldElement _t = local_z[lid]; local_nonzero[lid] = field_is_zero_impl(&_t) ? 0U : 1U; }
+    if (!local_nonzero[lid]) { FieldElement _t; field_set_one_impl(&_t); local_z[lid] = _t; }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (lid == 0) {
+        FieldElement acc;
+        field_set_one_impl(&acc);
+
+        for (uint i = 0; i < active; ++i) {
+            local_prefix[i] = acc;
+            if (local_nonzero[i]) { FieldElement _t = local_z[i]; field_mul_impl(&acc, &acc, &_t); }
+        }
+
+        field_inv_impl(&acc, &acc);
+
+        for (int i = (int)active - 1; i >= 0; --i) {
+            if (local_nonzero[i]) {
+                FieldElement inv_i;
+                { FieldElement _t = local_prefix[i]; field_mul_impl(&inv_i, &acc, &_t); }
+                local_z_inv[i] = inv_i;
+                { FieldElement _t = local_z[i]; field_mul_impl(&acc, &acc, &_t); }
+            } else {
+                FieldElement _t; field_set_zero_impl(&_t); local_z_inv[i] = _t;
+            }
+        }
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    FieldElement z_inv2, z_inv3;
+    { FieldElement _t = local_z_inv[lid]; field_sqr_impl(&z_inv2, &_t); }
+    { FieldElement _t = local_z_inv[lid]; field_mul_impl(&z_inv3, &z_inv2, &_t); }
+    { FieldElement _ax; field_mul_impl(&_ax, &lx, &z_inv2); ax[gid] = _ax; }
+    { FieldElement _ay; field_mul_impl(&_ay, &ly, &z_inv3); ay[gid] = _ay; }
+}
+)KERNEL" };
+
+bool Context::Impl::build_program() {
+    cl_int err;
+
+    // Create program from source (multiple parts avoid MSVC C2026 limit)
+    constexpr cl_uint num_parts = sizeof(kernel_parts) / sizeof(kernel_parts[0]);
+    const char* sources[num_parts];
+    std::size_t lengths[num_parts];
+    for (cl_uint i = 0; i < num_parts; ++i) {
+        sources[i] = kernel_parts[i];
+        lengths[i] = std::strlen(kernel_parts[i]);
+    }
+
+    program = clCreateProgramWithSource(context, num_parts, sources, lengths, &err);
+    if (err != CL_SUCCESS) {
+        last_error = std::string("Failed to create program: ") + cl_error_string(err);
+        return false;
+    }
+
+    // Build options
+    std::string build_options = "-cl-std=CL1.2 -cl-mad-enable";
+
+    // NVIDIA-specific optimization flags
+    if (device_info.is_nvidia) {
+        build_options += " -cl-nv-opt-level=3";
+        // Force-define __NV_CL_C_VERSION so our PTX inline-asm blocks compile.
+        // NVIDIA OpenCL 3.0 CUDA drivers (>=525) may not predefine this macro
+        // even though they support the same PTX inline-asm as CUDA (same PTXAS backend).
+        build_options += " -D__NV_CL_C_VERSION=200";
+    }
+
+    // Build program
+    err = clBuildProgram(program, 1, &device, build_options.c_str(), nullptr, nullptr);
+
+    if (err != CL_SUCCESS) {
+        // Get build log
+        std::size_t log_size;
+        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
+
+        std::vector<char> build_log(log_size);
+        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log_size, build_log.data(), nullptr);
+
+        last_error = std::string("Build failed: ") + build_log.data();
+        return false;
+    }
+
+    return true;
+}
+
+bool Context::Impl::create_kernels() {
+    cl_int err;
+
+    kernel_field_add = clCreateKernel(program, "field_add", &err);
+    if (err != CL_SUCCESS) { last_error = "Failed to create field_add kernel"; return false; }
+
+    kernel_field_sub = clCreateKernel(program, "field_sub", &err);
+    if (err != CL_SUCCESS) { last_error = "Failed to create field_sub kernel"; return false; }
+
+    kernel_field_mul = clCreateKernel(program, "field_mul", &err);
+    if (err != CL_SUCCESS) { last_error = "Failed to create field_mul kernel"; return false; }
+
+    kernel_field_sqr = clCreateKernel(program, "field_sqr", &err);
+    if (err != CL_SUCCESS) { last_error = "Failed to create field_sqr kernel"; return false; }
+
+    kernel_field_inv = clCreateKernel(program, "field_inv", &err);
+    if (err != CL_SUCCESS) { last_error = "Failed to create field_inv kernel"; return false; }
+
+    kernel_point_double = clCreateKernel(program, "point_double", &err);
+    if (err != CL_SUCCESS) { last_error = "Failed to create point_double kernel"; return false; }
+
+    kernel_point_add = clCreateKernel(program, "point_add", &err);
+    if (err != CL_SUCCESS) { last_error = "Failed to create point_add kernel"; return false; }
+
+    kernel_scalar_mul_generator = clCreateKernel(program, "scalar_mul_generator", &err);
+    if (err != CL_SUCCESS) { last_error = "Failed to create scalar_mul_generator kernel"; return false; }
+
+    kernel_scalar_mul = clCreateKernel(program, "scalar_mul", &err);
+    if (err != CL_SUCCESS) { last_error = "Failed to create scalar_mul kernel"; return false; }
+
+    kernel_batch_jacobian_to_affine = clCreateKernel(program, "batch_jacobian_to_affine_kernel", &err);
+    if (err != CL_SUCCESS) {
+        // Non-fatal -- kernel may not exist in older builds
+        kernel_batch_jacobian_to_affine = nullptr;
+    }
+
+    // Affine point addition kernels (optional -- benchmark/utility)
+    err = CL_SUCCESS;
+    kernel_affine_add = clCreateKernel(program, "affine_add", &err);
+    if (err != CL_SUCCESS) {
+        if (config.verbose) std::cerr << "[DEBUG] affine_add kernel: err=" << err << "\n";
+        kernel_affine_add = nullptr;
+    }
+    kernel_affine_add_lambda = clCreateKernel(program, "affine_add_lambda", &err);
+    if (err != CL_SUCCESS) {
+        if (config.verbose) std::cerr << "[DEBUG] affine_add_lambda kernel: err=" << err << "\n";
+        kernel_affine_add_lambda = nullptr;
+    }
+    kernel_affine_add_x_only = clCreateKernel(program, "affine_add_x_only", &err);
+    if (err != CL_SUCCESS) {
+        if (config.verbose) std::cerr << "[DEBUG] affine_add_x_only kernel: err=" << err << "\n";
+        kernel_affine_add_x_only = nullptr;
+    }
+    kernel_jacobian_to_affine = clCreateKernel(program, "jacobian_to_affine", &err);
+    if (err != CL_SUCCESS) {
+        if (config.verbose) std::cerr << "[DEBUG] jacobian_to_affine kernel: err=" << err << "\n";
+        kernel_jacobian_to_affine = nullptr;
+    }
+    kernel_msm_block_reduce = clCreateKernel(program, "msm_block_reduce_kernel", &err);
+    if (err != CL_SUCCESS) kernel_msm_block_reduce = nullptr; // non-fatal
+
+    return true;
+}
+
+// =============================================================================
+// Context Public Interface
+// =============================================================================
+
+Context::Context() : impl_(std::make_unique<Impl>()) {}
+Context::~Context() = default;
+Context::Context(Context&&) noexcept = default;
+Context& Context::operator=(Context&&) noexcept = default;
+
+std::unique_ptr<Context> Context::create(const DeviceConfig& config) {
+    auto ctx = std::unique_ptr<Context>(new Context());
+    if (!ctx->impl_->init(config)) {
+        return nullptr;
+    }
+    return ctx;
+}
+
+const DeviceInfo& Context::device_info() const noexcept {
+    return impl_->device_info;
+}
+
+bool Context::is_valid() const noexcept {
+    return impl_ && impl_->context != nullptr;
+}
+
+const std::string& Context::last_error() const noexcept {
+    return impl_->last_error;
+}
+
+// =============================================================================
+// Single Field Operations
+// =============================================================================
+
+FieldElement Context::field_add(const FieldElement& a, const FieldElement& b) {
+    FieldElement result;
+    cl_int err;
+
+    // Create buffers
+    cl_mem buf_a = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   sizeof(FieldElement), (void*)&a, &err);
+    cl_mem buf_b = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   sizeof(FieldElement), (void*)&b, &err);
+    cl_mem buf_r = clCreateBuffer(impl_->context, CL_MEM_WRITE_ONLY,
+                                   sizeof(FieldElement), nullptr, &err);
+
+    // Set kernel args
+    cl_uint count = 1;
+    clSetKernelArg(impl_->kernel_field_add, 0, sizeof(cl_mem), &buf_a);
+    clSetKernelArg(impl_->kernel_field_add, 1, sizeof(cl_mem), &buf_b);
+    clSetKernelArg(impl_->kernel_field_add, 2, sizeof(cl_mem), &buf_r);
+    clSetKernelArg(impl_->kernel_field_add, 3, sizeof(cl_uint), &count);
+
+    // Execute
+    std::size_t global_size = 1;
+    clEnqueueNDRangeKernel(impl_->queue, impl_->kernel_field_add, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
+
+    // Read result
+    clEnqueueReadBuffer(impl_->queue, buf_r, CL_TRUE, 0, sizeof(FieldElement), &result, 0, nullptr, nullptr);
+
+    // Cleanup
+    clReleaseMemObject(buf_a);
+    clReleaseMemObject(buf_b);
+    clReleaseMemObject(buf_r);
+
+    return result;
+}
+
+FieldElement Context::field_sub(const FieldElement& a, const FieldElement& b) {
+    FieldElement result;
+    cl_int err;
+
+    cl_mem buf_a = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   sizeof(FieldElement), (void*)&a, &err);
+    cl_mem buf_b = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   sizeof(FieldElement), (void*)&b, &err);
+    cl_mem buf_r = clCreateBuffer(impl_->context, CL_MEM_WRITE_ONLY,
+                                   sizeof(FieldElement), nullptr, &err);
+
+    cl_uint count = 1;
+    clSetKernelArg(impl_->kernel_field_sub, 0, sizeof(cl_mem), &buf_a);
+    clSetKernelArg(impl_->kernel_field_sub, 1, sizeof(cl_mem), &buf_b);
+    clSetKernelArg(impl_->kernel_field_sub, 2, sizeof(cl_mem), &buf_r);
+    clSetKernelArg(impl_->kernel_field_sub, 3, sizeof(cl_uint), &count);
+
+    std::size_t global_size = 1;
+    clEnqueueNDRangeKernel(impl_->queue, impl_->kernel_field_sub, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
+    clEnqueueReadBuffer(impl_->queue, buf_r, CL_TRUE, 0, sizeof(FieldElement), &result, 0, nullptr, nullptr);
+
+    clReleaseMemObject(buf_a);
+    clReleaseMemObject(buf_b);
+    clReleaseMemObject(buf_r);
+
+    return result;
+}
+
+FieldElement Context::field_mul(const FieldElement& a, const FieldElement& b) {
+    FieldElement result;
+    cl_int err;
+
+    cl_mem buf_a = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   sizeof(FieldElement), (void*)&a, &err);
+    cl_mem buf_b = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   sizeof(FieldElement), (void*)&b, &err);
+    cl_mem buf_r = clCreateBuffer(impl_->context, CL_MEM_WRITE_ONLY,
+                                   sizeof(FieldElement), nullptr, &err);
+
+    cl_uint count = 1;
+    clSetKernelArg(impl_->kernel_field_mul, 0, sizeof(cl_mem), &buf_a);
+    clSetKernelArg(impl_->kernel_field_mul, 1, sizeof(cl_mem), &buf_b);
+    clSetKernelArg(impl_->kernel_field_mul, 2, sizeof(cl_mem), &buf_r);
+    clSetKernelArg(impl_->kernel_field_mul, 3, sizeof(cl_uint), &count);
+
+    std::size_t global_size = 1;
+    clEnqueueNDRangeKernel(impl_->queue, impl_->kernel_field_mul, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
+    clEnqueueReadBuffer(impl_->queue, buf_r, CL_TRUE, 0, sizeof(FieldElement), &result, 0, nullptr, nullptr);
+
+    clReleaseMemObject(buf_a);
+    clReleaseMemObject(buf_b);
+    clReleaseMemObject(buf_r);
+
+    return result;
+}
+
+FieldElement Context::field_sqr(const FieldElement& a) {
+    FieldElement result;
+    cl_int err;
+
+    cl_mem buf_a = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   sizeof(FieldElement), (void*)&a, &err);
+    cl_mem buf_r = clCreateBuffer(impl_->context, CL_MEM_WRITE_ONLY,
+                                   sizeof(FieldElement), nullptr, &err);
+
+    cl_uint count = 1;
+    clSetKernelArg(impl_->kernel_field_sqr, 0, sizeof(cl_mem), &buf_a);
+    clSetKernelArg(impl_->kernel_field_sqr, 1, sizeof(cl_mem), &buf_r);
+    clSetKernelArg(impl_->kernel_field_sqr, 2, sizeof(cl_uint), &count);
+
+    std::size_t global_size = 1;
+    clEnqueueNDRangeKernel(impl_->queue, impl_->kernel_field_sqr, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
+    clEnqueueReadBuffer(impl_->queue, buf_r, CL_TRUE, 0, sizeof(FieldElement), &result, 0, nullptr, nullptr);
+
+    clReleaseMemObject(buf_a);
+    clReleaseMemObject(buf_r);
+
+    return result;
+}
+
+FieldElement Context::field_inv(const FieldElement& a) {
+    FieldElement result;
+    cl_int err;
+
+    cl_mem buf_a = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   sizeof(FieldElement), (void*)&a, &err);
+    cl_mem buf_r = clCreateBuffer(impl_->context, CL_MEM_WRITE_ONLY,
+                                   sizeof(FieldElement), nullptr, &err);
+
+    cl_uint count = 1;
+    clSetKernelArg(impl_->kernel_field_inv, 0, sizeof(cl_mem), &buf_a);
+    clSetKernelArg(impl_->kernel_field_inv, 1, sizeof(cl_mem), &buf_r);
+    clSetKernelArg(impl_->kernel_field_inv, 2, sizeof(cl_uint), &count);
+
+    std::size_t global_size = 1;
+    clEnqueueNDRangeKernel(impl_->queue, impl_->kernel_field_inv, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
+    clEnqueueReadBuffer(impl_->queue, buf_r, CL_TRUE, 0, sizeof(FieldElement), &result, 0, nullptr, nullptr);
+
+    clReleaseMemObject(buf_a);
+    clReleaseMemObject(buf_r);
+
+    return result;
+}
+
+// =============================================================================
+// Point Operations
+// =============================================================================
+
+JacobianPoint Context::point_double(const JacobianPoint& p) {
+    JacobianPoint result;
+    cl_int err;
+
+    cl_mem buf_p = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   sizeof(JacobianPoint), (void*)&p, &err);
+    cl_mem buf_r = clCreateBuffer(impl_->context, CL_MEM_WRITE_ONLY,
+                                   sizeof(JacobianPoint), nullptr, &err);
+
+    cl_uint count = 1;
+    clSetKernelArg(impl_->kernel_point_double, 0, sizeof(cl_mem), &buf_p);
+    clSetKernelArg(impl_->kernel_point_double, 1, sizeof(cl_mem), &buf_r);
+    clSetKernelArg(impl_->kernel_point_double, 2, sizeof(cl_uint), &count);
+
+    std::size_t global_size = 1;
+    clEnqueueNDRangeKernel(impl_->queue, impl_->kernel_point_double, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
+    clEnqueueReadBuffer(impl_->queue, buf_r, CL_TRUE, 0, sizeof(JacobianPoint), &result, 0, nullptr, nullptr);
+
+    clReleaseMemObject(buf_p);
+    clReleaseMemObject(buf_r);
+
+    return result;
+}
+
+JacobianPoint Context::point_add(const JacobianPoint& p, const JacobianPoint& q) {
+    JacobianPoint result;
+    cl_int err;
+
+    cl_mem buf_p = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   sizeof(JacobianPoint), (void*)&p, &err);
+    cl_mem buf_q = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   sizeof(JacobianPoint), (void*)&q, &err);
+    cl_mem buf_r = clCreateBuffer(impl_->context, CL_MEM_WRITE_ONLY,
+                                   sizeof(JacobianPoint), nullptr, &err);
+
+    cl_uint count = 1;
+    clSetKernelArg(impl_->kernel_point_add, 0, sizeof(cl_mem), &buf_p);
+    clSetKernelArg(impl_->kernel_point_add, 1, sizeof(cl_mem), &buf_q);
+    clSetKernelArg(impl_->kernel_point_add, 2, sizeof(cl_mem), &buf_r);
+    clSetKernelArg(impl_->kernel_point_add, 3, sizeof(cl_uint), &count);
+
+    std::size_t global_size = 1;
+    clEnqueueNDRangeKernel(impl_->queue, impl_->kernel_point_add, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
+    clEnqueueReadBuffer(impl_->queue, buf_r, CL_TRUE, 0, sizeof(JacobianPoint), &result, 0, nullptr, nullptr);
+
+    clReleaseMemObject(buf_p);
+    clReleaseMemObject(buf_q);
+    clReleaseMemObject(buf_r);
+
+    return result;
+}
+
+JacobianPoint Context::scalar_mul(const Scalar& k, const AffinePoint& p) {
+    JacobianPoint result;
+    cl_int err;
+
+    cl_mem buf_k = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   sizeof(Scalar), (void*)&k, &err);
+    cl_mem buf_p = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   sizeof(AffinePoint), (void*)&p, &err);
+    cl_mem buf_r = clCreateBuffer(impl_->context, CL_MEM_WRITE_ONLY,
+                                   sizeof(JacobianPoint), nullptr, &err);
+
+    cl_uint count = 1;
+    clSetKernelArg(impl_->kernel_scalar_mul, 0, sizeof(cl_mem), &buf_k);
+    clSetKernelArg(impl_->kernel_scalar_mul, 1, sizeof(cl_mem), &buf_p);
+    clSetKernelArg(impl_->kernel_scalar_mul, 2, sizeof(cl_mem), &buf_r);
+    clSetKernelArg(impl_->kernel_scalar_mul, 3, sizeof(cl_uint), &count);
+
+    std::size_t global_size = 1;
+    clEnqueueNDRangeKernel(impl_->queue, impl_->kernel_scalar_mul, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
+    clEnqueueReadBuffer(impl_->queue, buf_r, CL_TRUE, 0, sizeof(JacobianPoint), &result, 0, nullptr, nullptr);
+
+    clReleaseMemObject(buf_k);
+    clReleaseMemObject(buf_p);
+    clReleaseMemObject(buf_r);
+
+    return result;
+}
+
+JacobianPoint Context::scalar_mul_generator(const Scalar& k) {
+    JacobianPoint result;
+    cl_int err;
+
+    cl_mem buf_k = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   sizeof(Scalar), (void*)&k, &err);
+    cl_mem buf_r = clCreateBuffer(impl_->context, CL_MEM_WRITE_ONLY,
+                                   sizeof(JacobianPoint), nullptr, &err);
+
+    cl_uint count = 1;
+    clSetKernelArg(impl_->kernel_scalar_mul_generator, 0, sizeof(cl_mem), &buf_k);
+    clSetKernelArg(impl_->kernel_scalar_mul_generator, 1, sizeof(cl_mem), &buf_r);
+    clSetKernelArg(impl_->kernel_scalar_mul_generator, 2, sizeof(cl_uint), &count);
+
+    std::size_t global_size = 1;
+    clEnqueueNDRangeKernel(impl_->queue, impl_->kernel_scalar_mul_generator, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
+    clEnqueueReadBuffer(impl_->queue, buf_r, CL_TRUE, 0, sizeof(JacobianPoint), &result, 0, nullptr, nullptr);
+
+    clReleaseMemObject(buf_k);
+    clReleaseMemObject(buf_r);
+
+    return result;
+}
+
+// =============================================================================
+// Batch Operations
+// =============================================================================
+
+// GPU-3: Per-kernel work-group size selection.
+// Queries CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE and
+// CL_KERNEL_WORK_GROUP_SIZE from the driver, then picks the largest power-of-2
+// multiple of the preferred size that fits within both the kernel's reported
+// max and a hardcoded ceiling (512) to avoid over-subscription on small counts.
+// Falls back to min(256, device_max_wg) if the query fails.
+static void compute_work_sizes(std::size_t count, std::size_t max_wg,
+                               std::size_t& local, std::size_t& global,
+                               cl_kernel kernel = nullptr, cl_device_id device = nullptr) {
+    if (kernel && device) {
+        size_t preferred_wg = 0;
+        size_t kernel_max_wg = 0;
+        cl_int r1 = clGetKernelWorkGroupInfo(kernel, device,
+            CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
+            sizeof(preferred_wg), &preferred_wg, nullptr);
+        cl_int r2 = clGetKernelWorkGroupInfo(kernel, device,
+            CL_KERNEL_WORK_GROUP_SIZE,
+            sizeof(kernel_max_wg), &kernel_max_wg, nullptr);
+        if (r1 == CL_SUCCESS && r2 == CL_SUCCESS && preferred_wg > 0) {
+            // Grow by doublings while the next step fits within limits
+            size_t cap = std::min({kernel_max_wg, max_wg, static_cast<size_t>(512)});
+            size_t wg = preferred_wg;
+            while (wg * 2 <= cap) wg *= 2;
+            local = std::max(wg, static_cast<size_t>(64));
+            global = ((count + local - 1) / local) * local;
+            return;
+        }
+    }
+    // Fallback: original behaviour
+    local = std::min(static_cast<std::size_t>(256), max_wg);
+    global = ((count + local - 1) / local) * local;
+}
+
+static void compute_scalar_mul_work_sizes(std::size_t count, std::size_t requested_local,
+                                          std::size_t auto_local, std::size_t max_wg, std::size_t& local,
+                                          std::size_t& global,
+                                          cl_kernel kernel = nullptr, cl_device_id device = nullptr) {
+    // If caller has not overridden and we have a kernel handle, use the
+    // per-kernel preferred size instead of the compile-time constant.
+    if (requested_local == 0 && kernel && device) {
+        std::size_t preferred_wg = 0, kernel_max_wg = 0;
+        cl_int r1 = clGetKernelWorkGroupInfo(kernel, device,
+            CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
+            sizeof(preferred_wg), &preferred_wg, nullptr);
+        cl_int r2 = clGetKernelWorkGroupInfo(kernel, device,
+            CL_KERNEL_WORK_GROUP_SIZE,
+            sizeof(kernel_max_wg), &kernel_max_wg, nullptr);
+        if (r1 == CL_SUCCESS && r2 == CL_SUCCESS && preferred_wg > 0) {
+            size_t cap = std::min({kernel_max_wg, max_wg, static_cast<size_t>(512)});
+            size_t wg = preferred_wg;
+            while (wg * 2 <= cap) wg *= 2;
+            local = std::max(wg, static_cast<size_t>(64));
+            global = ((count + local - 1) / local) * local;
+            return;
+        }
+    }
+    const std::size_t tuned_auto_local = std::min(auto_local, max_wg);
+    local = requested_local == 0 ? tuned_auto_local : std::min(requested_local, max_wg);
+    global = ((count + local - 1) / local) * local;
+}
+
+void Context::batch_field_add(const FieldElement* a, const FieldElement* b,
+                               FieldElement* results, std::size_t count) {
+    if (count == 0) return;
+    cl_int err;
+    cl_mem buf_a = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   count * sizeof(FieldElement), (void*)a, &err);
+    cl_mem buf_b = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   count * sizeof(FieldElement), (void*)b, &err);
+    cl_mem buf_r = clCreateBuffer(impl_->context, CL_MEM_WRITE_ONLY,
+                                   count * sizeof(FieldElement), nullptr, &err);
+    cl_uint cnt = static_cast<cl_uint>(count);
+    clSetKernelArg(impl_->kernel_field_add, 0, sizeof(cl_mem), &buf_a);
+    clSetKernelArg(impl_->kernel_field_add, 1, sizeof(cl_mem), &buf_b);
+    clSetKernelArg(impl_->kernel_field_add, 2, sizeof(cl_mem), &buf_r);
+    clSetKernelArg(impl_->kernel_field_add, 3, sizeof(cl_uint), &cnt);
+    std::size_t local_size, global_size;
+    compute_work_sizes(count, impl_->device_info.max_work_group_size, local_size, global_size,
+                       impl_->kernel_field_add, impl_->device);
+    clEnqueueNDRangeKernel(impl_->queue, impl_->kernel_field_add, 1, nullptr,
+                           &global_size, &local_size, 0, nullptr, nullptr);
+    clEnqueueReadBuffer(impl_->queue, buf_r, CL_TRUE, 0,
+                        count * sizeof(FieldElement), results, 0, nullptr, nullptr);
+    clReleaseMemObject(buf_a); clReleaseMemObject(buf_b); clReleaseMemObject(buf_r);
+}
+
+void Context::batch_field_sub(const FieldElement* a, const FieldElement* b,
+                               FieldElement* results, std::size_t count) {
+    if (count == 0) return;
+    cl_int err;
+    cl_mem buf_a = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   count * sizeof(FieldElement), (void*)a, &err);
+    cl_mem buf_b = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   count * sizeof(FieldElement), (void*)b, &err);
+    cl_mem buf_r = clCreateBuffer(impl_->context, CL_MEM_WRITE_ONLY,
+                                   count * sizeof(FieldElement), nullptr, &err);
+    cl_uint cnt = static_cast<cl_uint>(count);
+    clSetKernelArg(impl_->kernel_field_sub, 0, sizeof(cl_mem), &buf_a);
+    clSetKernelArg(impl_->kernel_field_sub, 1, sizeof(cl_mem), &buf_b);
+    clSetKernelArg(impl_->kernel_field_sub, 2, sizeof(cl_mem), &buf_r);
+    clSetKernelArg(impl_->kernel_field_sub, 3, sizeof(cl_uint), &cnt);
+    std::size_t local_size, global_size;
+    compute_work_sizes(count, impl_->device_info.max_work_group_size, local_size, global_size,
+                       impl_->kernel_field_sub, impl_->device);
+    clEnqueueNDRangeKernel(impl_->queue, impl_->kernel_field_sub, 1, nullptr,
+                           &global_size, &local_size, 0, nullptr, nullptr);
+    clEnqueueReadBuffer(impl_->queue, buf_r, CL_TRUE, 0,
+                        count * sizeof(FieldElement), results, 0, nullptr, nullptr);
+    clReleaseMemObject(buf_a); clReleaseMemObject(buf_b); clReleaseMemObject(buf_r);
+}
+
+void Context::batch_field_mul(const FieldElement* a, const FieldElement* b,
+                               FieldElement* results, std::size_t count) {
+    if (count == 0) return;
+    cl_int err;
+    cl_mem buf_a = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   count * sizeof(FieldElement), (void*)a, &err);
+    cl_mem buf_b = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   count * sizeof(FieldElement), (void*)b, &err);
+    cl_mem buf_r = clCreateBuffer(impl_->context, CL_MEM_WRITE_ONLY,
+                                   count * sizeof(FieldElement), nullptr, &err);
+    cl_uint cnt = static_cast<cl_uint>(count);
+    clSetKernelArg(impl_->kernel_field_mul, 0, sizeof(cl_mem), &buf_a);
+    clSetKernelArg(impl_->kernel_field_mul, 1, sizeof(cl_mem), &buf_b);
+    clSetKernelArg(impl_->kernel_field_mul, 2, sizeof(cl_mem), &buf_r);
+    clSetKernelArg(impl_->kernel_field_mul, 3, sizeof(cl_uint), &cnt);
+    std::size_t local_size, global_size;
+    compute_work_sizes(count, impl_->device_info.max_work_group_size, local_size, global_size,
+                       impl_->kernel_field_mul, impl_->device);
+    clEnqueueNDRangeKernel(impl_->queue, impl_->kernel_field_mul, 1, nullptr,
+                           &global_size, &local_size, 0, nullptr, nullptr);
+    clEnqueueReadBuffer(impl_->queue, buf_r, CL_TRUE, 0,
+                        count * sizeof(FieldElement), results, 0, nullptr, nullptr);
+    clReleaseMemObject(buf_a); clReleaseMemObject(buf_b); clReleaseMemObject(buf_r);
+}
+
+void Context::batch_field_sqr(const FieldElement* inputs, FieldElement* results, std::size_t count) {
+    if (count == 0) return;
+    cl_int err;
+    cl_mem buf_a = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   count * sizeof(FieldElement), (void*)inputs, &err);
+    cl_mem buf_r = clCreateBuffer(impl_->context, CL_MEM_WRITE_ONLY,
+                                   count * sizeof(FieldElement), nullptr, &err);
+    cl_uint cnt = static_cast<cl_uint>(count);
+    clSetKernelArg(impl_->kernel_field_sqr, 0, sizeof(cl_mem), &buf_a);
+    clSetKernelArg(impl_->kernel_field_sqr, 1, sizeof(cl_mem), &buf_r);
+    clSetKernelArg(impl_->kernel_field_sqr, 2, sizeof(cl_uint), &cnt);
+    std::size_t local_size, global_size;
+    compute_work_sizes(count, impl_->device_info.max_work_group_size, local_size, global_size,
+                       impl_->kernel_field_sqr, impl_->device);
+    clEnqueueNDRangeKernel(impl_->queue, impl_->kernel_field_sqr, 1, nullptr,
+                           &global_size, &local_size, 0, nullptr, nullptr);
+    clEnqueueReadBuffer(impl_->queue, buf_r, CL_TRUE, 0,
+                        count * sizeof(FieldElement), results, 0, nullptr, nullptr);
+    clReleaseMemObject(buf_a); clReleaseMemObject(buf_r);
+}
+
+void Context::batch_point_double(const JacobianPoint* inputs, JacobianPoint* results, std::size_t count) {
+    if (count == 0) return;
+    cl_int err;
+    cl_mem buf_a = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   count * sizeof(JacobianPoint), (void*)inputs, &err);
+    cl_mem buf_r = clCreateBuffer(impl_->context, CL_MEM_WRITE_ONLY,
+                                   count * sizeof(JacobianPoint), nullptr, &err);
+    cl_uint cnt = static_cast<cl_uint>(count);
+    clSetKernelArg(impl_->kernel_point_double, 0, sizeof(cl_mem), &buf_a);
+    clSetKernelArg(impl_->kernel_point_double, 1, sizeof(cl_mem), &buf_r);
+    clSetKernelArg(impl_->kernel_point_double, 2, sizeof(cl_uint), &cnt);
+    std::size_t local_size, global_size;
+    compute_work_sizes(count, impl_->device_info.max_work_group_size, local_size, global_size,
+                       impl_->kernel_point_double, impl_->device);
+    clEnqueueNDRangeKernel(impl_->queue, impl_->kernel_point_double, 1, nullptr,
+                           &global_size, &local_size, 0, nullptr, nullptr);
+    clEnqueueReadBuffer(impl_->queue, buf_r, CL_TRUE, 0,
+                        count * sizeof(JacobianPoint), results, 0, nullptr, nullptr);
+    clReleaseMemObject(buf_a); clReleaseMemObject(buf_r);
+}
+
+void Context::batch_point_add(const JacobianPoint* p, const JacobianPoint* q,
+                               JacobianPoint* results, std::size_t count) {
+    if (count == 0) return;
+    cl_int err;
+    cl_mem buf_p = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   count * sizeof(JacobianPoint), (void*)p, &err);
+    cl_mem buf_q = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   count * sizeof(JacobianPoint), (void*)q, &err);
+    cl_mem buf_r = clCreateBuffer(impl_->context, CL_MEM_WRITE_ONLY,
+                                   count * sizeof(JacobianPoint), nullptr, &err);
+    cl_uint cnt = static_cast<cl_uint>(count);
+    clSetKernelArg(impl_->kernel_point_add, 0, sizeof(cl_mem), &buf_p);
+    clSetKernelArg(impl_->kernel_point_add, 1, sizeof(cl_mem), &buf_q);
+    clSetKernelArg(impl_->kernel_point_add, 2, sizeof(cl_mem), &buf_r);
+    clSetKernelArg(impl_->kernel_point_add, 3, sizeof(cl_uint), &cnt);
+    std::size_t local_size, global_size;
+    compute_work_sizes(count, impl_->device_info.max_work_group_size, local_size, global_size,
+                       impl_->kernel_point_add, impl_->device);
+    clEnqueueNDRangeKernel(impl_->queue, impl_->kernel_point_add, 1, nullptr,
+                           &global_size, &local_size, 0, nullptr, nullptr);
+    clEnqueueReadBuffer(impl_->queue, buf_r, CL_TRUE, 0,
+                        count * sizeof(JacobianPoint), results, 0, nullptr, nullptr);
+    clReleaseMemObject(buf_p); clReleaseMemObject(buf_q); clReleaseMemObject(buf_r);
+}
+
+void Context::batch_scalar_mul_generator(const Scalar* scalars, JacobianPoint* results, std::size_t count) {
+    if (count == 0) return;
+
+    cl_int err;
+
+    // Grow-only cached buffers: reuse if capacity is sufficient, else reallocate
+    if (count > impl_->cache_smg_count) {
+        // Rule 10: zero scalar buffer before release (may hold private keys)
+        if (impl_->cache_smg_scalars && impl_->queue && impl_->cache_smg_count > 0) {
+            cl_uchar zero = 0;
+            clEnqueueFillBuffer(impl_->queue, impl_->cache_smg_scalars, &zero, 1, 0,
+                                impl_->cache_smg_count * sizeof(Scalar), 0, nullptr, nullptr);
+            clFinish(impl_->queue);
+        }
+        if (impl_->cache_smg_scalars) clReleaseMemObject(impl_->cache_smg_scalars);
+        if (impl_->cache_smg_results) clReleaseMemObject(impl_->cache_smg_results);
+        impl_->cache_smg_scalars = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY,
+                                                   count * sizeof(Scalar), nullptr, &err);
+        if (!impl_->cache_smg_scalars) {
+            impl_->cache_smg_results = nullptr; impl_->cache_smg_count = 0; return;
+        }
+        impl_->cache_smg_results = clCreateBuffer(impl_->context, CL_MEM_WRITE_ONLY,
+                                                   count * sizeof(JacobianPoint), nullptr, &err);
+        if (!impl_->cache_smg_results) {
+            clReleaseMemObject(impl_->cache_smg_scalars);
+            impl_->cache_smg_scalars = nullptr; impl_->cache_smg_count = 0; return;
+        }
+        impl_->cache_smg_count = count;
+    }
+
+    if (clEnqueueWriteBuffer(impl_->queue, impl_->cache_smg_scalars, CL_FALSE, 0,
+                             count * sizeof(Scalar), scalars, 0, nullptr, nullptr) != CL_SUCCESS)
+        return;
+
+    cl_uint cnt = static_cast<cl_uint>(count);
+    clSetKernelArg(impl_->kernel_scalar_mul_generator, 0, sizeof(cl_mem), &impl_->cache_smg_scalars);
+    clSetKernelArg(impl_->kernel_scalar_mul_generator, 1, sizeof(cl_mem), &impl_->cache_smg_results);
+    clSetKernelArg(impl_->kernel_scalar_mul_generator, 2, sizeof(cl_uint), &cnt);
+
+    std::size_t local_size, global_size;
+    compute_scalar_mul_work_sizes(count, impl_->config.local_work_size,
+                                  128,
+                                  impl_->device_info.max_work_group_size,
+                                  local_size, global_size,
+                                  impl_->kernel_scalar_mul_generator, impl_->device);
+
+    if (clEnqueueNDRangeKernel(impl_->queue, impl_->kernel_scalar_mul_generator, 1, nullptr,
+                               &global_size, &local_size, 0, nullptr, nullptr) != CL_SUCCESS)
+        return;
+    clEnqueueReadBuffer(impl_->queue, impl_->cache_smg_results, CL_TRUE, 0,
+                        count * sizeof(JacobianPoint), results, 0, nullptr, nullptr);
+}
+
+void Context::batch_scalar_mul(const Scalar* scalars, const AffinePoint* points,
+                                JacobianPoint* results, std::size_t count) {
+    if (count == 0) return;
+
+    cl_int err;
+
+    // Grow-only cached buffers
+    if (count > impl_->cache_sm_count) {
+        // Rule 10: zero scalar buffer before release (may hold private keys from ECDH)
+        if (impl_->cache_sm_scalars && impl_->queue && impl_->cache_sm_count > 0) {
+            cl_uchar zero = 0;
+            clEnqueueFillBuffer(impl_->queue, impl_->cache_sm_scalars, &zero, 1, 0,
+                                impl_->cache_sm_count * sizeof(Scalar), 0, nullptr, nullptr);
+            clFinish(impl_->queue);
+        }
+        if (impl_->cache_sm_scalars) clReleaseMemObject(impl_->cache_sm_scalars);
+        if (impl_->cache_sm_points)  clReleaseMemObject(impl_->cache_sm_points);
+        if (impl_->cache_sm_results) clReleaseMemObject(impl_->cache_sm_results);
+        impl_->cache_sm_scalars = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY,
+                                                  count * sizeof(Scalar), nullptr, &err);
+        impl_->cache_sm_points  = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY,
+                                                  count * sizeof(AffinePoint), nullptr, &err);
+        impl_->cache_sm_results = clCreateBuffer(impl_->context, CL_MEM_WRITE_ONLY,
+                                                  count * sizeof(JacobianPoint), nullptr, &err);
+        if (!impl_->cache_sm_scalars || !impl_->cache_sm_points || !impl_->cache_sm_results) {
+            if (impl_->cache_sm_scalars)  { clReleaseMemObject(impl_->cache_sm_scalars);  impl_->cache_sm_scalars  = nullptr; }
+            if (impl_->cache_sm_points)   { clReleaseMemObject(impl_->cache_sm_points);   impl_->cache_sm_points   = nullptr; }
+            if (impl_->cache_sm_results)  { clReleaseMemObject(impl_->cache_sm_results);  impl_->cache_sm_results  = nullptr; }
+            impl_->cache_sm_count = 0; return;
+        }
+        impl_->cache_sm_count = count;
+    }
+
+    if (clEnqueueWriteBuffer(impl_->queue, impl_->cache_sm_points, CL_TRUE, 0,
+                             count * sizeof(AffinePoint), points, 0, nullptr, nullptr) != CL_SUCCESS)
+        return;
+    if (clEnqueueWriteBuffer(impl_->queue, impl_->cache_sm_scalars, CL_FALSE, 0,
+                             count * sizeof(Scalar), scalars, 0, nullptr, nullptr) != CL_SUCCESS)
+        return;
+    clFlush(impl_->queue);
+
+    cl_uint cnt = static_cast<cl_uint>(count);
+    clSetKernelArg(impl_->kernel_scalar_mul, 0, sizeof(cl_mem), &impl_->cache_sm_scalars);
+    clSetKernelArg(impl_->kernel_scalar_mul, 1, sizeof(cl_mem), &impl_->cache_sm_points);
+    clSetKernelArg(impl_->kernel_scalar_mul, 2, sizeof(cl_mem), &impl_->cache_sm_results);
+    clSetKernelArg(impl_->kernel_scalar_mul, 3, sizeof(cl_uint), &cnt);
+
+    std::size_t local_size, global_size;
+    compute_scalar_mul_work_sizes(count, impl_->config.local_work_size,
+                                  128,
+                                  impl_->device_info.max_work_group_size,
+                                  local_size, global_size,
+                                  impl_->kernel_scalar_mul, impl_->device);
+
+    if (clEnqueueNDRangeKernel(impl_->queue, impl_->kernel_scalar_mul, 1, nullptr,
+                               &global_size, &local_size, 0, nullptr, nullptr) != CL_SUCCESS)
+        return;
+    clEnqueueReadBuffer(impl_->queue, impl_->cache_sm_results, CL_TRUE, 0,
+                        count * sizeof(JacobianPoint), results, 0, nullptr, nullptr);
+
+    // Rule 10: zero scalar buffer after every use — may hold private key material
+    // from ecdh_batch. Zeroing every call (not only on realloc) prevents residue
+    // from persisting across calls on shared GPU hardware.
+    cl_uchar zero = 0;
+    clEnqueueFillBuffer(impl_->queue, impl_->cache_sm_scalars, &zero, 1, 0,
+                        count * sizeof(Scalar), 0, nullptr, nullptr);
+    clFinish(impl_->queue);
+}
+
+void Context::batch_field_inv(const FieldElement* inputs, FieldElement* outputs, std::size_t count) {
+    if (count == 0) return;
+
+    cl_int err;
+
+    // Grow-only cached buffers
+    if (count > impl_->cache_fi_count) {
+        if (impl_->cache_fi_input)  clReleaseMemObject(impl_->cache_fi_input);
+        if (impl_->cache_fi_output) clReleaseMemObject(impl_->cache_fi_output);
+        impl_->cache_fi_input = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY,
+                                                count * sizeof(FieldElement), nullptr, &err);
+        impl_->cache_fi_output = clCreateBuffer(impl_->context, CL_MEM_WRITE_ONLY,
+                                                 count * sizeof(FieldElement), nullptr, &err);
+        if (!impl_->cache_fi_input || !impl_->cache_fi_output) {
+            if (impl_->cache_fi_input)  { clReleaseMemObject(impl_->cache_fi_input);  impl_->cache_fi_input  = nullptr; }
+            if (impl_->cache_fi_output) { clReleaseMemObject(impl_->cache_fi_output); impl_->cache_fi_output = nullptr; }
+            impl_->cache_fi_count = 0; return;
+        }
+        impl_->cache_fi_count = count;
+    }
+
+    if (clEnqueueWriteBuffer(impl_->queue, impl_->cache_fi_input, CL_FALSE, 0,
+                             count * sizeof(FieldElement), inputs, 0, nullptr, nullptr) != CL_SUCCESS)
+        return;
+
+    cl_uint cnt = static_cast<cl_uint>(count);
+    clSetKernelArg(impl_->kernel_field_inv, 0, sizeof(cl_mem), &impl_->cache_fi_input);
+    clSetKernelArg(impl_->kernel_field_inv, 1, sizeof(cl_mem), &impl_->cache_fi_output);
+    clSetKernelArg(impl_->kernel_field_inv, 2, sizeof(cl_uint), &cnt);
+
+    std::size_t local_size, global_size;
+    compute_work_sizes(count, impl_->device_info.max_work_group_size, local_size, global_size,
+                       impl_->kernel_field_inv, impl_->device);
+
+    if (clEnqueueNDRangeKernel(impl_->queue, impl_->kernel_field_inv, 1, nullptr,
+                               &global_size, &local_size, 0, nullptr, nullptr) != CL_SUCCESS)
+        return;
+    clEnqueueReadBuffer(impl_->queue, impl_->cache_fi_output, CL_TRUE, 0,
+                        count * sizeof(FieldElement), outputs, 0, nullptr, nullptr);
+}
+
+void Context::batch_jacobian_to_affine(const JacobianPoint* jacobians, AffinePoint* affines, std::size_t count) {
+    if (count == 0) return;
+    if (!impl_->kernel_batch_jacobian_to_affine) return;
+
+    cl_int err;
+
+    // Grow-only cached buffers
+    if (count > impl_->cache_j2a_count) {
+        if (impl_->cache_j2a_input)  clReleaseMemObject(impl_->cache_j2a_input);
+        if (impl_->cache_j2a_output) clReleaseMemObject(impl_->cache_j2a_output);
+        impl_->cache_j2a_input = clCreateBuffer(impl_->context, CL_MEM_READ_ONLY,
+                                                  count * sizeof(JacobianPoint), nullptr, &err);
+        impl_->cache_j2a_output = clCreateBuffer(impl_->context, CL_MEM_WRITE_ONLY,
+                                                   count * sizeof(AffinePoint), nullptr, &err);
+        if (!impl_->cache_j2a_input || !impl_->cache_j2a_output) {
+            if (impl_->cache_j2a_input)  { clReleaseMemObject(impl_->cache_j2a_input);  impl_->cache_j2a_input  = nullptr; }
+            if (impl_->cache_j2a_output) { clReleaseMemObject(impl_->cache_j2a_output); impl_->cache_j2a_output = nullptr; }
+            impl_->cache_j2a_count = 0; return;
+        }
+        impl_->cache_j2a_count = count;
+    }
+
+    if (clEnqueueWriteBuffer(impl_->queue, impl_->cache_j2a_input, CL_FALSE, 0,
+                             count * sizeof(JacobianPoint), jacobians, 0, nullptr, nullptr) != CL_SUCCESS)
+        return;
+
+    cl_uint cnt = static_cast<cl_uint>(count);
+    clSetKernelArg(impl_->kernel_batch_jacobian_to_affine, 0, sizeof(cl_mem), &impl_->cache_j2a_input);
+    clSetKernelArg(impl_->kernel_batch_jacobian_to_affine, 1, sizeof(cl_mem), &impl_->cache_j2a_output);
+    clSetKernelArg(impl_->kernel_batch_jacobian_to_affine, 2, sizeof(cl_uint), &cnt);
+
+    std::size_t local_size, global_size;
+    compute_work_sizes(count, impl_->device_info.max_work_group_size, local_size, global_size,
+                       impl_->kernel_batch_jacobian_to_affine, impl_->device);
+
+    if (clEnqueueNDRangeKernel(impl_->queue, impl_->kernel_batch_jacobian_to_affine, 1, nullptr,
+                               &global_size, &local_size, 0, nullptr, nullptr) != CL_SUCCESS)
+        return;
+    clEnqueueReadBuffer(impl_->queue, impl_->cache_j2a_output, CL_TRUE, 0,
+                        count * sizeof(AffinePoint), affines, 0, nullptr, nullptr);
+}
+
+void Context::async_batch_scalar_mul_generator(const Scalar* scalars, JacobianPoint* results, std::size_t count) {
+    // For now, just call sync version
+    batch_scalar_mul_generator(scalars, results, count);
+}
+
+void Context::sync() {
+    clFinish(impl_->queue);
+}
+
+void Context::flush() {
+    clFinish(impl_->queue);
+}
+
+void* Context::native_context() const {
+    return impl_->context;
+}
+
+void* Context::native_queue() const {
+    return impl_->queue;
+}
+
+void* Context::native_kernel(const char* name) const {
+    std::string n(name);
+    if (n == "field_add") return impl_->kernel_field_add;
+    if (n == "field_sub") return impl_->kernel_field_sub;
+    if (n == "field_mul") return impl_->kernel_field_mul;
+    if (n == "field_sqr") return impl_->kernel_field_sqr;
+    if (n == "field_inv") return impl_->kernel_field_inv;
+    if (n == "point_double") return impl_->kernel_point_double;
+    if (n == "point_add") return impl_->kernel_point_add;
+    if (n == "scalar_mul") return impl_->kernel_scalar_mul;
+    if (n == "scalar_mul_generator") return impl_->kernel_scalar_mul_generator;
+    if (n == "batch_jacobian_to_affine") return impl_->kernel_batch_jacobian_to_affine;
+    if (n == "batch_jacobian_to_affine_kernel") return impl_->kernel_batch_jacobian_to_affine;
+    if (n == "msm_block_reduce_kernel") return impl_->kernel_msm_block_reduce;
+    if (n == "affine_add") return impl_->kernel_affine_add;
+    if (n == "affine_add_lambda") return impl_->kernel_affine_add_lambda;
+    if (n == "affine_add_x_only") return impl_->kernel_affine_add_x_only;
+    if (n == "jacobian_to_affine") return impl_->kernel_jacobian_to_affine;
+    return nullptr;
+}
+
+std::unique_ptr<Buffer> Context::allocate(std::size_t size) {
+    auto buffer = std::unique_ptr<Buffer>(new Buffer());
+    cl_int err;
+    buffer->impl_->buffer = clCreateBuffer(impl_->context, CL_MEM_READ_WRITE, size, nullptr, &err);
+    buffer->impl_->size = size;
+    return buffer;
+}
+
+void Context::upload(Buffer& buffer, const void* data, std::size_t size) {
+    clEnqueueWriteBuffer(impl_->queue, static_cast<cl_mem>(buffer.native_handle()),
+                         CL_TRUE, 0, size, data, 0, nullptr, nullptr);
+}
+
+void Context::download(const Buffer& buffer, void* data, std::size_t size) {
+    clEnqueueReadBuffer(impl_->queue, static_cast<cl_mem>(buffer.native_handle()),
+                        CL_TRUE, 0, size, data, 0, nullptr, nullptr);
+}
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+std::vector<std::pair<std::string, std::vector<DeviceInfo>>> enumerate_devices() {
+    std::vector<std::pair<std::string, std::vector<DeviceInfo>>> result;
+
+    cl_uint num_platforms = 0;
+    clGetPlatformIDs(0, nullptr, &num_platforms);
+    if (num_platforms == 0) return result;
+
+    std::vector<cl_platform_id> platforms(num_platforms);
+    clGetPlatformIDs(num_platforms, platforms.data(), nullptr);
+
+    for (cl_uint i = 0; i < num_platforms; i++) {
+        char platform_name[256];
+        clGetPlatformInfo(platforms[i], CL_PLATFORM_NAME, sizeof(platform_name), platform_name, nullptr);
+
+        std::vector<DeviceInfo> devices;
+
+        cl_uint num_devices = 0;
+        clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_ALL, 0, nullptr, &num_devices);
+
+        if (num_devices > 0) {
+            std::vector<cl_device_id> device_ids(num_devices);
+            clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_ALL, num_devices, device_ids.data(), nullptr);
+
+            for (cl_uint j = 0; j < num_devices; j++) {
+                DeviceInfo info;
+                char buffer[256];
+
+                clGetDeviceInfo(device_ids[j], CL_DEVICE_NAME, sizeof(buffer), buffer, nullptr);
+                info.name = buffer;
+
+                clGetDeviceInfo(device_ids[j], CL_DEVICE_VENDOR, sizeof(buffer), buffer, nullptr);
+                info.vendor = buffer;
+
+                clGetDeviceInfo(device_ids[j], CL_DEVICE_VERSION, sizeof(buffer), buffer, nullptr);
+                info.version = buffer;
+
+                clGetDeviceInfo(device_ids[j], CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(info.global_mem_size), &info.global_mem_size, nullptr);
+                clGetDeviceInfo(device_ids[j], CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(info.compute_units), &info.compute_units, nullptr);
+
+                info.is_intel = (info.vendor.find("Intel") != std::string::npos);
+                info.is_amd = (info.vendor.find("AMD") != std::string::npos);
+                info.is_nvidia = (info.vendor.find("NVIDIA") != std::string::npos);
+
+                devices.push_back(info);
+            }
+        }
+
+        result.emplace_back(platform_name, devices);
+    }
+
+    return result;
+}
+
+AffinePoint get_generator() {
+    AffinePoint g;
+    g.x.limbs[0] = 0x59F2815B16F81798ULL;
+    g.x.limbs[1] = 0x029BFCDB2DCE28D9ULL;
+    g.x.limbs[2] = 0x55A06295CE870B07ULL;
+    g.x.limbs[3] = 0x79BE667EF9DCBBACULL;
+    g.y.limbs[0] = 0x9C47D08FFB10D4B8ULL;
+    g.y.limbs[1] = 0xFD17B448A6855419ULL;
+    g.y.limbs[2] = 0x5DA4FBFC0E1108A8ULL;
+    g.y.limbs[3] = 0x483ADA7726A3C465ULL;
+    return g;
+}
+
+// Field prime p = 2^256 - 0x1000003D1
+static const std::uint64_t SECP256K1_P[4] = {
+    0xFFFFFFFEFFFFFC2FULL,
+    0xFFFFFFFFFFFFFFFFULL,
+    0xFFFFFFFFFFFFFFFFULL,
+    0xFFFFFFFFFFFFFFFFULL
+};
+
+// MSVC-compatible 128-bit multiplication helpers
+#ifdef _MSC_VER
+#include <intrin.h>
+
+static inline void mul64_host(std::uint64_t a, std::uint64_t b, std::uint64_t& lo, std::uint64_t& hi) {
+    lo = _umul128(a, b, &hi);
+}
+
+static inline std::uint64_t add64_host(std::uint64_t a, std::uint64_t b, std::uint64_t carry_in, std::uint64_t& carry_out) {
+    std::uint64_t sum = a + b;
+    std::uint64_t c1 = (sum < a) ? 1 : 0;
+    sum += carry_in;
+    std::uint64_t c2 = (sum < carry_in) ? 1 : 0;
+    carry_out = c1 + c2;
+    return sum;
+}
+
+#else
+// GCC/Clang with __int128
+static inline void mul64_host(std::uint64_t a, std::uint64_t b, std::uint64_t& lo, std::uint64_t& hi) {
+    unsigned __int128 r = static_cast<unsigned __int128>(a) * b;
+    lo = static_cast<std::uint64_t>(r);
+    hi = static_cast<std::uint64_t>(r >> 64);
+}
+
+static inline std::uint64_t add64_host(std::uint64_t a, std::uint64_t b, std::uint64_t carry_in, std::uint64_t& carry_out) {
+    unsigned __int128 sum = static_cast<unsigned __int128>(a) + b + carry_in;
+    carry_out = static_cast<std::uint64_t>(sum >> 64);
+    return static_cast<std::uint64_t>(sum);
+}
+#endif
+
+// Helper: field multiplication (host-side) - MSVC compatible
+static void field_mul_host(FieldElement& r, const FieldElement& a, const FieldElement& b) {
+    // Schoolbook multiplication with reduction
+    std::uint64_t product[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+    for (int i = 0; i < 4; i++) {
+        std::uint64_t carry = 0;
+        for (int j = 0; j < 4; j++) {
+            std::uint64_t lo, hi;
+            mul64_host(a.limbs[i], b.limbs[j], lo, hi);
+
+            // Accumulate: product[i+j] += lo + carry, propagate overflow
+            std::uint64_t c1 = 0, c2 = 0;
+            product[i + j] = add64_host(product[i + j], lo, 0, c1);
+            product[i + j] = add64_host(product[i + j], carry, 0, c2);
+            carry = hi + c1 + c2;
+        }
+        product[i + 4] += carry;
+    }
+
+    // Reduction using secp256k1's special form: 2^256 = K (mod p), K = 0x1000003D1
+    const std::uint64_t K = 0x1000003D1ULL;
+
+    // First pass: fold high limbs [4..7] into [0..3] via K multiplication
+    std::uint64_t temp[5];
+    temp[0] = product[0]; temp[1] = product[1]; temp[2] = product[2]; temp[3] = product[3]; temp[4] = 0;
+
+    for (int i = 4; i < 8; i++) {
+        if (product[i] == 0) continue;
+        std::uint64_t mul_lo, mul_hi;
+        mul64_host(product[i], K, mul_lo, mul_hi);
+        std::uint64_t c = 0;
+        temp[i - 4] = add64_host(temp[i - 4], mul_lo, 0, c);
+        if (i - 3 < 5) temp[i - 3] = add64_host(temp[i - 3], mul_hi, c, c);
+        // Propagate remaining carry
+        for (int k = i - 2; k < 5 && c != 0; k++) {
+            std::uint64_t old = temp[k];
+            temp[k] += c;
+            c = (temp[k] < old) ? 1 : 0;
+        }
+    }
+
+    // Second reduction if temp[4] > 0 (result overflowed 256 bits)
+    while (temp[4] > 0) {
+        std::uint64_t overflow = temp[4];
+        temp[4] = 0;
+        std::uint64_t mul_lo, mul_hi;
+        mul64_host(overflow, K, mul_lo, mul_hi);
+        std::uint64_t c = 0;
+        temp[0] = add64_host(temp[0], mul_lo, 0, c);
+        temp[1] = add64_host(temp[1], mul_hi, c, c);
+        temp[2] = add64_host(temp[2], 0, c, c);
+        temp[3] = add64_host(temp[3], 0, c, c);
+        temp[4] += c;
+    }
+
+    r.limbs[0] = temp[0];
+    r.limbs[1] = temp[1];
+    r.limbs[2] = temp[2];
+    r.limbs[3] = temp[3];
+
+    // Final reduction: branchless subtract p if result >= p
+    std::uint64_t borrow = 0;
+    std::uint64_t diff[4];
+    for (int i = 0; i < 4; i++) {
+        std::uint64_t d = r.limbs[i] - SECP256K1_P[i] - borrow;
+        borrow = (r.limbs[i] < SECP256K1_P[i] + borrow || (borrow && SECP256K1_P[i] == 0xFFFFFFFFFFFFFFFFULL)) ? 1 : 0;
+        diff[i] = d;
+    }
+    // Branchless: if no borrow, use diff (result was >= p)
+    std::uint64_t mask = borrow ? 0 : ~static_cast<std::uint64_t>(0);
+    r.limbs[0] = (diff[0] & mask) | (r.limbs[0] & ~mask);
+    r.limbs[1] = (diff[1] & mask) | (r.limbs[1] & ~mask);
+    r.limbs[2] = (diff[2] & mask) | (r.limbs[2] & ~mask);
+    r.limbs[3] = (diff[3] & mask) | (r.limbs[3] & ~mask);
+}
+
+// Helper: field squaring (host-side)
+static void field_sqr_host(FieldElement& r, const FieldElement& a) {
+    field_mul_host(r, a, a);
+}
+
+// Helper: field inversion using Fermat (a^(p-2) mod p)
+static void field_inv_host(FieldElement& r, const FieldElement& a) {
+    // p-2 = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2D
+    FieldElement result = FieldElement::one();
+    FieldElement base = a;
+
+    const std::uint64_t exp[4] = {
+        0xFFFFFFFEFFFFFC2DULL,
+        0xFFFFFFFFFFFFFFFFULL,
+        0xFFFFFFFFFFFFFFFFULL,
+        0xFFFFFFFFFFFFFFFFULL
+    };
+
+    for (int limb = 0; limb < 4; limb++) {
+        for (int bit = 0; bit < 64; bit++) {
+            if ((exp[limb] >> bit) & 1) {
+                field_mul_host(result, result, base);
+            }
+            field_sqr_host(base, base);
+        }
+    }
+    r = result;
+}
+
+AffinePoint jacobian_to_affine(const JacobianPoint& p) {
+    AffinePoint result;
+
+    // Check for infinity
+    if (p.infinity ||
+        (p.z.limbs[0] == 0 && p.z.limbs[1] == 0 &&
+         p.z.limbs[2] == 0 && p.z.limbs[3] == 0)) {
+        result.x = FieldElement::zero();
+        result.y = FieldElement::zero();
+        return result;
+    }
+
+    // If Z = 1, just copy X and Y
+    if (p.z.limbs[0] == 1 && p.z.limbs[1] == 0 &&
+        p.z.limbs[2] == 0 && p.z.limbs[3] == 0) {
+        result.x = p.x;
+        result.y = p.y;
+        return result;
+    }
+
+    // Compute Z^(-1)
+    FieldElement z_inv;
+    field_inv_host(z_inv, p.z);
+
+    // z_inv_2 = Z^(-2)
+    FieldElement z_inv_2;
+    field_sqr_host(z_inv_2, z_inv);
+
+    // z_inv_3 = Z^(-3)
+    FieldElement z_inv_3;
+    field_mul_host(z_inv_3, z_inv_2, z_inv);
+
+    // x = X * Z^(-2)
+    field_mul_host(result.x, p.x, z_inv_2);
+
+    // y = Y * Z^(-3)
+    field_mul_host(result.y, p.y, z_inv_3);
+
+    return result;
+}
+
+JacobianPoint affine_to_jacobian(const AffinePoint& p) {
+    JacobianPoint result;
+    result.x = p.x;
+    result.y = p.y;
+    result.z = FieldElement::one();
+    result.infinity = 0;
+    return result;
+}
+
+Scalar scalar_from_u64(std::uint64_t value) {
+    return Scalar{{value, 0, 0, 0}};
+}
+
+FieldElement field_from_u64(std::uint64_t value) {
+    return FieldElement{{value, 0, 0, 0}};
+}
+
+} // namespace opencl
+} // namespace secp256k1
+

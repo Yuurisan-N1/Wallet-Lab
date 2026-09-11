@@ -1,0 +1,4 @@
+# CT-prover LLVM IR analysis dependencies
+# Used by: ct-prover.yml
+lit==18.1.8 --hash=sha256:47c174a186941ae830f04ded76a3444600be67d5e5fb8282c3783fba671c4edb
+filecheck==0.0.24 --hash=sha256:3a0ab9c80c507cb141706e9dcb6d05fa978c4960cf472edf873b211e9397a038

@@ -1,0 +1,5 @@
+module CUltrafastSecp256k1 [system] {
+    header "../../c_api/ultrafast_secp256k1.h"
+    link "ultrafast_secp256k1"
+    export *
+}

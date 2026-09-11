@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<!--
+  UltrafastSecp256k1 — Node Activator Dashboard
+  =============================================
+  Open this file in a browser (Chrome/Firefox) on the machine where MetaMask
+  is installed.  Point the "Backend URL" field at your Linux node server:
+
+    http://<linux-ip>:8765
+
+  Flow:
+    1. Click "Get Challenge"   — server returns a one-time nonce message
+    2. Click "Sign with MetaMask" — MetaMask popup; user approves
+    3. Signature is sent to the Linux backend
+    4. Backend calls ufsecp_eth_ecrecover and confirms the wallet address
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>UltrafastSecp256k1 — Node Activator</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --panel: #1a1d27;
+      --border: #2e3245;
+      --accent: #6c63ff;
+      --blue: #58a6ff;
+      --green: #22c55e;
+      --red: #ef4444;
+      --text: #e2e8f0;
+      --muted: #64748b;
+      --mono: 'Courier New', monospace;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 2rem;
+      width: 100%;
+      max-width: 580px;
+    }
+    h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
+    .subtitle { color: var(--muted); font-size: 0.85rem; margin-bottom: 2rem; }
+    label { display: block; font-size: 0.8rem; color: var(--muted); margin-bottom: 0.35rem; }
+    input[type=text] {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      padding: 0.6rem 0.8rem;
+      font-size: 0.9rem;
+      margin-bottom: 1.25rem;
+    }
+    .row { display: flex; gap: 0.75rem; margin-bottom: 1.25rem; }
+    button {
+      flex: 1;
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 0.7rem 1rem;
+      font-size: 0.9rem;
+      cursor: pointer;
+      transition: opacity .2s;
+    }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    button:not(:disabled):hover { opacity: 0.85; }
+    button.secondary {
+      background: #1c2330;
+      border: 1px solid var(--blue);
+      color: var(--blue);
+    }
+    button.secondary:not(:disabled):hover {
+      background: #1f3050;
+      opacity: 1;
+    }
+    .mono-box {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+      font-family: var(--mono);
+      font-size: 0.78rem;
+      word-break: break-all;
+      min-height: 2.5rem;
+      color: var(--muted);
+      margin-bottom: 1rem;
+    }
+    .mono-box.filled { color: var(--text); }
+    .status {
+      text-align: center;
+      padding: 1rem;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 1rem;
+      display: none;
+    }
+    .status.ok  { background: #14532d55; color: var(--green); border: 1px solid #22c55e44; }
+    .status.err { background: #7f1d1d55; color: var(--red);   border: 1px solid #ef444444; }
+    .step {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      font-size: 0.82rem;
+      color: var(--muted);
+      margin-bottom: 0.4rem;
+    }
+    .step .dot {
+      width: 20px; height: 20px;
+      border-radius: 50%;
+      background: var(--border);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 0.7rem;
+      flex-shrink: 0;
+    }
+    .step.done .dot    { background: var(--green); color: #000; }
+    .step.active .dot  { background: var(--accent); color: #fff; }
+    .step.pending .dot { background: var(--border); color: var(--muted); }
+    .section-title {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: var(--muted);
+      margin-bottom: 0.5rem;
+    }
+    hr { border: none; border-top: 1px solid var(--border); margin: 1.25rem 0; }
+  </style>
+</head>
+<body>
+<div class="card">
+  <h1>⚡ Node Activator Dashboard</h1>
+  <p class="subtitle">UltrafastSecp256k1 ZK-Layer — wallet authentication</p>
+
+  <!-- Server URL -->
+  <label>Linux Node Backend URL</label>
+  <input type="text" id="serverUrl" value="http://192.168.1.35:8765"
+         placeholder="http://192.168.1.x:8765">
+
+  <!-- Steps indicator -->
+  <div id="step1" class="step active"><div class="dot">1</div> Request challenge from backend</div>
+  <div id="step2" class="step pending"><div class="dot">2</div> Sign with MetaMask</div>
+  <div id="step3" class="step pending"><div class="dot">3</div> Backend verifies (ecrecover)</div>
+  <hr>
+
+  <!-- Challenge -->
+  <div class="section-title">Challenge message (from backend)</div>
+  <div class="mono-box" id="challengeBox">—</div>
+
+  <div class="row">
+    <button id="btnChallenge" onclick="getChallenge()">1. Get Challenge</button>
+    <button id="btnSign" onclick="signAndActivate()" disabled>2. Sign &amp; Activate</button>
+  </div>
+
+  <!-- Wallet address -->
+  <div class="section-title">Connected Wallet</div>
+  <div class="mono-box" id="walletBox">—</div>
+
+  <!-- Signature -->
+  <div class="section-title">Signature (v, r, s)</div>
+  <div class="mono-box" id="sigBox">—</div>
+
+  <!-- Result -->
+  <div id="statusOk"  class="status ok" >✓ Node Activated — wallet identity confirmed</div>
+  <div id="statusErr" class="status err" id="statusErr">✗ Verification failed</div>
+
+  <hr>
+  <p style="font-size:0.75rem;color:var(--muted)">
+    Backend must be running on Linux: <code>python3 node_server.py</code><br>
+    Opens CORS for this page automatically. Works cross-machine on LAN.
+  </p>
+
+  <hr>
+  <div class="section-title">Library Benchmark — Live Pipeline Throughput</div>
+  <p style="font-size:0.78rem;color:var(--muted);margin-bottom:0.8rem">
+    Runs real <code>ecrecover</code> + <code>eth_sign</code> cycles on the server
+    via the same <code>libufsecp.so</code> used for wallet auth above.
+    No wallet needed.
+  </p>
+  <div class="row">
+    <button class="secondary" id="btnBench500" onclick="runBench(500)">▶ Bench 500 ops</button>
+    <button class="secondary" id="btnBench2000" onclick="runBench(2000)">▶ Bench 2000 ops</button>
+  </div>
+
+  <!-- Bench results panel (hidden until run) -->
+  <div id="benchPanel" style="display:none;margin-top:0.5rem">
+    <div id="benchSpinner" style="text-align:center;color:var(--muted);padding:1rem;display:none">
+      ⏳ Running benchmark…
+    </div>
+    <div id="benchResults" style="display:none">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.6rem;margin-bottom:0.8rem" id="benchCards"></div>
+      <table id="benchTable" style="width:100%;border-collapse:collapse;font-size:0.78rem">
+        <thead>
+          <tr style="color:var(--muted);font-size:0.7rem;text-transform:uppercase">
+            <th style="text-align:left;padding:0.4rem 0.5rem;border-bottom:1px solid var(--border)">Operation</th>
+            <th style="text-align:right;padding:0.4rem 0.5rem;border-bottom:1px solid var(--border)">ns / call</th>
+            <th style="text-align:right;padding:0.4rem 0.5rem;border-bottom:1px solid var(--border)">k / sec</th>
+          </tr>
+        </thead>
+        <tbody id="benchTableBody"></tbody>
+      </table>
+      <div id="benchGpu" style="margin-top:0.8rem"></div>
+      <div id="benchZk"  style="margin-top:0.8rem"></div>
+      <div id="benchCmp" style="margin-top:0.8rem"></div>
+      <p id="benchMeta" style="font-size:0.7rem;color:var(--muted);margin-top:0.6rem"></p>
+    </div>
+    <div id="benchError" style="display:none;color:var(--red);font-size:0.82rem;padding:0.6rem"></div>
+  </div>
+</div>
+
+<script>
+// ── state ───────────────────────────────────────────────────────────────────
+let currentNonce = null;
+let currentAddress = null;
+
+async function runBench(n) {
+  const url = document.getElementById('serverUrl').value.trim().replace(/\/$/, '');
+  const panel   = document.getElementById('benchPanel');
+  const spinner = document.getElementById('benchSpinner');
+  const results = document.getElementById('benchResults');
+  const errBox  = document.getElementById('benchError');
+
+  panel.style.display   = 'block';
+  spinner.style.display = 'block';
+  results.style.display = 'none';
+  errBox.style.display  = 'none';
+  document.getElementById('btnBench500').disabled  = true;
+  document.getElementById('btnBench2000').disabled = true;
+
+  try {
+    const resp = await fetch(url + '/bench?json=1&n=' + n);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const d = await resp.json();
+    if (d.error) throw new Error(d.error);
+
+    const p  = d.primitives;
+    const tp = d.throughput_1core;
+    const sc = d.throughput_scaled;
+    const fk = v => (v/1000).toFixed(1) + ' k/s';
+
+    // Cards
+    document.getElementById('benchCards').innerHTML = `
+      <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:1rem">
+        <div style="font-size:1.5rem;font-weight:700;color:var(--green)">${p.eth_ecrecover_ns.toFixed(0)} ns</div>
+        <div style="font-size:0.73rem;color:var(--muted);margin-top:0.2rem">eth_ecrecover / call</div>
+      </div>
+      <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:1rem">
+        <div style="font-size:1.5rem;font-weight:700;color:var(--green)">${fk(tp.ecrecover_per_sec)}</div>
+        <div style="font-size:0.73rem;color:var(--muted);margin-top:0.2rem">ecrecover / sec (1 core)</div>
+      </div>
+      <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:1rem">
+        <div style="font-size:1.5rem;font-weight:700;color:var(--green)">${p.eth_sign_ns.toFixed(0)} ns</div>
+        <div style="font-size:0.73rem;color:var(--muted);margin-top:0.2rem">eth_sign / call</div>
+      </div>
+      <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:1rem">
+        <div style="font-size:1.5rem;font-weight:700;color:var(--green)">${fk(tp.eth_sign_per_sec)}</div>
+        <div style="font-size:0.73rem;color:var(--muted);margin-top:0.2rem">eth_sign / sec (1 core)</div>
+      </div>`;
+
+    // Table rows
+    const rows = [
+      ['eth_personal_hash (EIP-191)', p.eth_personal_hash_ns, 1e9/p.eth_personal_hash_ns],
+      ['eth_ecrecover ← hot path',   p.eth_ecrecover_ns,     tp.ecrecover_per_sec],
+      ['eth_sign (v,r,s EIP-155)',    p.eth_sign_ns,          tp.eth_sign_per_sec],
+      ['wallet_auth pipeline',        p.wallet_auth_pipeline_ns, tp.wallet_auth_per_sec],
+      ['ctypes boundary overhead',    p.ctypes_overhead_ns,   null],
+      ['ecrecover (est. native C)',   p.ecrecover_pure_c_estimated_ns, tp.ecrecover_native_c_estimated],
+    ];
+    document.getElementById('benchTableBody').innerHTML = rows.map(([name, ns, ops]) => `
+      <tr>
+        <td style="padding:0.35rem 0.5rem;border-bottom:1px solid var(--border);color:${name.includes('ctypes')?'var(--muted)':'var(--text)'}">${name}</td>
+        <td style="padding:0.35rem 0.5rem;border-bottom:1px solid var(--border);text-align:right;font-family:var(--mono)">${ns.toFixed(1)}</td>
+        <td style="padding:0.35rem 0.5rem;border-bottom:1px solid var(--border);text-align:right;color:var(--green);font-weight:600">${ops ? fk(ops) : '—'}</td>
+      </tr>`).join('');
+
+    // ── GPU section ──────────────────────────────────────────────────────────
+    const gpuData = d.gpu || {};
+    let gpuHtml = '';
+    const gpuBackends = Object.entries(gpuData).filter(([k]) => !k.startsWith('_'));
+    if (!gpuData._available && gpuData._reason) {
+      gpuHtml = `<div style="font-size:0.73rem;color:var(--muted);padding:0.4rem 0">
+        ⚠ GPU: ${gpuData._reason}</div>`;
+    } else if (gpuBackends.length > 0) {
+      const opMeta = {
+        ecrecover_batch:            ['ecrecover_batch',            'Ethereum tx recovery',   '⚡'],
+        generator_mul_batch:        ['generator_mul_batch',        'scalar × G (keygen)',    '·'],
+        ecdsa_verify_batch:         ['ecdsa_verify_batch',         'ECDSA verify',           '·'],
+        schnorr_verify_batch:       ['schnorr_verify_batch',       'Schnorr/BIP-340 verify', '·'],
+        ecdh_batch:                 ['ecdh_batch',                 'ECDH key exchange',      '·'],
+        hash160_pubkey_batch:       ['hash160_pubkey_batch',       'Hash160 (BTC address)',  '·'],
+        msm:                        ['msm',                        'Multi-Scalar Mul',       '·'],
+        frost_verify_partial_batch: ['frost_verify_partial_batch', 'FROST partial verify',   '·'],
+      };
+      const fps = v => v >= 1e9 ? (v/1e9).toFixed(2)+' G/s'
+                     : v >= 1e6 ? (v/1e6).toFixed(2)+' M/s'
+                     : (v/1e3).toFixed(1)+' k/s';
+      const fns = ns => ns >= 1e6 ? (ns/1e6).toFixed(1)+' ms'
+                      : ns >= 1e3 ? (ns/1e3).toFixed(1)+' µs'
+                      : ns.toFixed(2)+' ns';
+      gpuHtml += `<div style="font-size:0.7rem;text-transform:uppercase;color:var(--muted);margin-bottom:0.5rem;letter-spacing:.07em">GPU Batch Operations — measured on this machine</div>`;
+      for (const [bname, bdata] of gpuBackends) {
+        if (!bdata.available) {
+          gpuHtml += `<div style="font-size:0.75rem;color:var(--muted);margin-bottom:0.4rem">${bname}: ${bdata.reason||'unavailable'}</div>`;
+          continue;
+        }
+        const ops = bdata.ops || {};
+        let opRows = '';
+        for (const [opKey, meta] of Object.entries(opMeta)) {
+          const opData = ops[opKey];
+          if (!opData || !opData.peak_ops) continue;
+          const peakOps = opData.peak_ops;
+          const peakBs  = opData.peak_batch_size || 0;
+          const latNs   = peakOps > 0 ? 1e9 / peakOps : 0;
+          const isMain  = opKey === 'ecrecover_batch';
+          const noteSpan = opData.note ? ` <span style="font-size:0.59rem;color:var(--muted)">(${opData.note})</span>` : '';
+          opRows += `<tr style="${isMain?'background:rgba(63,185,80,.06)':''}"><td style="padding:0.27rem 0.5rem;color:${isMain?'var(--green)':'var(--text)'}">
+              <span style="margin-right:0.25rem${isMain?'':';color:var(--muted)'}">${meta[2]}</span>
+              <strong>${meta[0]}</strong>
+              <span style="font-size:0.6rem;color:var(--muted);margin-left:0.3rem">${meta[1]}</span></td>
+            <td style="padding:0.27rem 0.5rem;text-align:right;color:var(--green);font-weight:600">${fps(peakOps)}${noteSpan}</td>
+            <td style="padding:0.27rem 0.5rem;text-align:right;color:var(--green)">${fns(latNs)}</td>
+            <td style="padding:0.27rem 0.5rem;text-align:right;color:var(--muted);font-size:0.69rem">${peakBs?Number(peakBs).toLocaleString():'—'}</td></tr>`;
+        }
+        const ecrec  = ops['ecrecover_batch'] || {};
+        const ecBest = String(ecrec.peak_batch_size || 0);
+        let ecGrid = '';
+        for (const [sz, info] of Object.entries(ecrec.batches||{})) {
+          if (info.skipped || info.error) {
+            ecGrid += `<div style="text-align:center;padding:0.3rem;border:1px dashed var(--border);border-radius:6px;opacity:0.35"><div style="font-size:0.62rem;color:var(--muted)">${Number(sz).toLocaleString()}</div><div style="font-size:0.6rem;color:var(--muted)">${info.skipped||'err'}</div></div>`;
+            continue;
+          }
+          const isPeak = sz === ecBest;
+          ecGrid += `<div style="text-align:center;padding:0.3rem;border:1px solid ${isPeak?'var(--green)':'var(--border)'};border-radius:6px;${isPeak?'box-shadow:0 0 6px rgba(63,185,80,.3)':''}"><div style="font-size:${isPeak?'1.02':'0.88'}rem;font-weight:${isPeak?'700':'500'};color:var(--green)">${fps(info.ops_per_sec)}</div><div style="font-size:0.62rem;color:${isPeak?'var(--text)':'var(--muted)'}">${Number(sz).toLocaleString()}</div><div style="font-size:0.6rem;color:var(--muted)">${info.per_op_ns}ns</div></div>`;
+        }
+        const ecPeakOps = ecrec.peak_ops || 0;
+        const ecPeakBs  = ecrec.peak_batch_size || 0;
+        gpuHtml += `
+          <div style="background:var(--bg);border:1px solid var(--green);border-radius:8px;padding:0.75rem;margin-bottom:0.4rem">
+            <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:0.3rem;margin-bottom:0.45rem">
+              <span style="font-weight:600;color:var(--green)">${bname}</span>
+              <span style="font-size:0.72rem;color:var(--muted)">${bdata.device} · ${bdata.compute_units} CUs · ${bdata.global_mem_gb} GB · ${bdata.max_clock_mhz} MHz</span>
+            </div>
+            <table style="width:100%;border-collapse:collapse;font-size:0.77rem;margin-bottom:${ecGrid?'0.45rem':'0'}">
+              <tr style="color:var(--muted);font-size:0.63rem;background:rgba(13,17,23,.7)">
+                <th style="text-align:left;padding:0.24rem 0.5rem;font-weight:500">Operation</th>
+                <th style="text-align:right;padding:0.24rem 0.5rem;font-weight:500">Peak throughput</th>
+                <th style="text-align:right;padding:0.24rem 0.5rem;font-weight:500">Latency/op</th>
+                <th style="text-align:right;padding:0.24rem 0.5rem;font-weight:500">Best batch</th>
+              </tr>${opRows}
+            </table>
+            ${ecGrid ? `<div style="font-size:0.62rem;color:var(--muted);letter-spacing:.04em;margin-bottom:0.25rem">ecrecover_batch curve →</div><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(80px,1fr));gap:0.3rem">${ecGrid}</div>` : ''}
+            ${ecPeakOps ? `<div style="font-size:0.67rem;color:var(--muted);margin-top:0.35rem">▲ ecrecover peak: <span style="color:var(--green);font-weight:600">${fps(ecPeakOps)}</span> at batch ${Number(ecPeakBs).toLocaleString()} · ${(ecPeakOps/tp.ecrecover_per_sec).toFixed(0)}× single-core CPU</div>` : ''}
+          </div>`;
+      }
+    }
+    document.getElementById('benchGpu').innerHTML = gpuHtml;
+
+    // ── ZK / Pedersen section ────────────────────────────────────────────────
+    const zkData = d.zk || {};
+    let zkHtml = '';
+    if (zkData._available === false) {
+      zkHtml = `<div style="font-size:0.73rem;color:var(--muted);padding:0.2rem 0">⚠ ZK: ${zkData._reason||'unavailable'}</div>`;
+    } else if (Object.keys(zkData).filter(k => !k.startsWith('_')).length > 0) {
+      const fn = v => v >= 1e6 ? (v/1e6).toFixed(2)+' ms' : v >= 1000 ? (v/1000).toFixed(1)+' µs' : v.toFixed(0)+' ns';
+      const fmps = v => v >= 1e6 ? (v/1e6).toFixed(2)+' M/s' : v >= 1000 ? (v/1000).toFixed(1)+' k/s' : v.toFixed(0)+'/s';
+      const zkOps = [
+        { key: 'pedersen_commit',      label: 'Pedersen commit',         note: 'C = v·H + r·G' },
+        { key: 'zk_knowledge_prove',   label: 'Knowledge proof — prove', note: 'Σ-protocol dlog' },
+        { key: 'zk_knowledge_verify',  label: 'Knowledge proof — verify',note: '' },
+        { key: 'zk_dleq_prove',        label: 'DLEQ proof — prove',      note: 'P/G = Q/H same exp' },
+        { key: 'zk_dleq_verify',       label: 'DLEQ proof — verify',     note: '' },
+        { key: 'zk_range_prove',       label: 'Bulletproof range — prove',note: 'value ∈ [0, 2⁶⁴)' },
+        { key: 'zk_range_verify',      label: 'Bulletproof range — verify',note: '' },
+      ];
+      const rows = zkOps.filter(o => zkData[o.key]).map(o => {
+        const info = zkData[o.key];
+        const extra = info.proof_bytes ? ` <span style="font-size:0.62rem;color:var(--muted)">(${info.proof_bytes}B proof)</span>` : '';
+        return `<tr>
+          <td style="padding:0.3rem 0.5rem;border-bottom:1px solid var(--border)">${o.label}${o.note?` <span style="font-size:0.62rem;color:var(--muted)">${o.note}</span>`:''}</td>
+          <td style="padding:0.3rem 0.5rem;border-bottom:1px solid var(--border);text-align:right;font-family:var(--mono);color:var(--green);font-weight:600">${fn(info.ns)}${extra}</td>
+          <td style="padding:0.3rem 0.5rem;border-bottom:1px solid var(--border);text-align:right;color:var(--green)">${fmps(info.ops_per_sec)}</td>
+        </tr>`;
+      }).join('');
+      zkHtml = `
+        <div style="font-size:0.7rem;text-transform:uppercase;color:var(--muted);margin-bottom:0.5rem;letter-spacing:.07em">ZK Primitives — CPU (secp256k1, constant-time)</div>
+        <table style="width:100%;border-collapse:collapse;font-size:0.78rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;overflow:hidden">
+          <tr style="color:var(--muted);font-size:0.68rem;background:#161b22">
+            <th style="text-align:left;padding:0.3rem 0.5rem;font-weight:500">Operation</th>
+            <th style="text-align:right;padding:0.3rem 0.5rem;font-weight:500">Latency</th>
+            <th style="text-align:right;padding:0.3rem 0.5rem;font-weight:500">Throughput (1 core)</th>
+          </tr>
+          ${rows}
+        </table>
+        <div style="font-size:0.66rem;color:var(--muted);margin-top:0.3rem;line-height:1.6">
+          All proofs are on secp256k1 · constant-time prove paths · measured live via ctypes → libufsecp.so
+        </div>`;
+      if (zkData._error) {
+        zkHtml += `<div style="font-size:0.68rem;color:orange;margin-top:0.2rem">⚠ partial error: ${zkData._error}</div>`;
+      }
+    }
+    document.getElementById('benchZk').innerHTML = zkHtml;
+
+    // ── Comparison table ────────────────────────────────────────────────────
+    const our = tp.ecrecover_per_sec;
+    const ref = d.reference_ecrecover_per_sec;
+    const noteText = d.reference_note || '⚠ External reference numbers — measured on different hardware (possibly faster). Not apples-to-apples.';
+    // best GPU ecrecover ops/sec across all backends
+    let bestGpuOps = 0;
+    let bestGpuLabel = '';
+    for (const [bname, bdata] of gpuBackends) {
+      if (!bdata.available) continue;
+      const ecrec = (bdata.ops || {}).ecrecover_batch || {};
+      const ops   = ecrec.peak_ops || 0;
+      if (ops > bestGpuOps) { bestGpuOps = ops; bestGpuLabel = bname; }
+    }
+    document.getElementById('benchCmp').innerHTML = `
+      <div style="font-size:0.68rem;color:#e3b341;background:rgba(227,179,65,.1);border:1px solid rgba(227,179,65,.3);border-radius:5px;padding:0.35rem 0.5rem;margin-bottom:0.5rem">
+        ⚠ ${noteText}
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:0.76rem">
+        <tr style="color:var(--muted);font-size:0.68rem">
+          <th style="text-align:left;padding:0.3rem 0.4rem">Stack</th>
+          <th style="text-align:right;padding:0.3rem 0.4rem">ecrecover/sec</th>
+          <th style="text-align:right;padding:0.3rem 0.4rem">vs UltraFast CPU</th>
+        </tr>
+        <tr><td style="padding:0.3rem 0.4rem;color:var(--green);font-weight:600">UltrafastSecp256k1 CPU 1-core (this machine)</td>
+            <td style="text-align:right;padding:0.3rem 0.4rem;color:var(--green)">${fk(our)}</td>
+            <td style="text-align:right;padding:0.3rem 0.4rem;color:var(--green)">baseline</td></tr>
+        ${bestGpuOps > 0 ? `<tr><td style="padding:0.3rem 0.4rem;color:var(--green);font-weight:600">UltrafastSecp256k1 GPU (${bestGpuLabel}, this machine)</td>
+            <td style="text-align:right;padding:0.3rem 0.4rem;color:var(--green)">${fk(bestGpuOps)}</td>
+            <td style="text-align:right;padding:0.3rem 0.4rem;color:var(--green)">${(bestGpuOps/our).toFixed(0)}× CPU</td></tr>` : ''}
+        <tr><td style="padding:0.3rem 0.4rem;border-top:1px solid var(--border)">libsecp256k1 (bitcoin-core) ⚠ ext</td>
+            <td style="text-align:right;padding:0.3rem 0.4rem;border-top:1px solid var(--border)">~39.4 k/s</td>
+            <td style="text-align:right;padding:0.3rem 0.4rem;border-top:1px solid var(--border);color:var(--muted)">${(39400/our).toFixed(1)}× our CPU</td></tr>
+        <tr><td style="padding:0.3rem 0.4rem;border-top:1px solid var(--border)">go-ethereum (cgo) ⚠ ext</td>
+            <td style="text-align:right;padding:0.3rem 0.4rem;border-top:1px solid var(--border)">~55 k/s</td>
+            <td style="text-align:right;padding:0.3rem 0.4rem;border-top:1px solid var(--border);color:var(--muted)">${(55000/our).toFixed(1)}× our CPU</td></tr>
+        <tr><td style="padding:0.3rem 0.4rem;border-top:1px solid var(--border)">ethers.js (WASM) ⚠ ext</td>
+            <td style="text-align:right;padding:0.3rem 0.4rem;border-top:1px solid var(--border)">~17.5 k/s</td>
+            <td style="text-align:right;padding:0.3rem 0.4rem;border-top:1px solid var(--border);color:var(--green)">${(our/17500).toFixed(1)}× faster</td></tr>
+        <tr><td style="padding:0.3rem 0.4rem;border-top:1px solid var(--border)">web3.py (CFFI) ⚠ ext</td>
+            <td style="text-align:right;padding:0.3rem 0.4rem;border-top:1px solid var(--border)">~10 k/s</td>
+            <td style="text-align:right;padding:0.3rem 0.4rem;border-top:1px solid var(--border);color:var(--green)">${(our/10000).toFixed(1)}× faster</td></tr>
+      </table>`;
+
+    document.getElementById('benchMeta').textContent =
+      `CPU: ${d.cpu} · n=${d.n} · pool=${d.pool} · warmup=${d.warmup}×`;
+
+    spinner.style.display = 'none';
+    results.style.display = 'block';
+  } catch(e) {
+    spinner.style.display = 'none';
+    errBox.style.display  = 'block';
+    errBox.textContent    = '✗ Benchmark failed: ' + e.message;
+  } finally {
+    document.getElementById('btnBench500').disabled  = false;
+    document.getElementById('btnBench2000').disabled = false;
+  }
+}
+
+function setStep(n) {
+  for (let i = 1; i <= 3; i++) {
+    const el = document.getElementById('step' + i);
+    if (i < n)       { el.className = 'step done';    el.querySelector('.dot').textContent = '✓'; }
+    else if (i === n) { el.className = 'step active';  el.querySelector('.dot').textContent = String(i); }
+    else              { el.className = 'step pending'; el.querySelector('.dot').textContent = String(i); }
+  }
+}
+
+function setMono(id, text, filled = true) {
+  const el = document.getElementById(id);
+  el.textContent = text;
+  el.className = 'mono-box' + (filled ? ' filled' : '');
+}
+
+function showStatus(ok, msg) {
+  document.getElementById('statusOk').style.display  = ok  ? 'block' : 'none';
+  document.getElementById('statusErr').style.display = !ok ? 'block' : 'none';
+  if (!ok && msg) document.getElementById('statusErr').textContent = '✗ ' + msg;
+}
+
+function hideStatus() {
+  document.getElementById('statusOk').style.display  = 'none';
+  document.getElementById('statusErr').style.display = 'none';
+}
+
+// ── 1. Get Challenge ─────────────────────────────────────────────────────────
+async function getChallenge() {
+  hideStatus();
+  const url = document.getElementById('serverUrl').value.trim().replace(/\/$/, '');
+  setMono('challengeBox', 'Requesting…', false);
+  setMono('walletBox', '—', false);
+  setMono('sigBox', '—', false);
+  document.getElementById('btnSign').disabled = true;
+
+  try {
+    const resp = await fetch(url + '/challenge', { method: 'GET' });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    currentNonce = data.nonce;
+    setMono('challengeBox', data.message);
+    document.getElementById('btnSign').disabled = false;
+    setStep(2);
+  } catch (e) {
+    setMono('challengeBox', 'Error: ' + e.message, false);
+    showStatus(false, 'Cannot reach backend: ' + e.message);
+  }
+}
+
+// ── 2. Sign with MetaMask & Send to Backend ───────────────────────────────────
+async function signAndActivate() {
+  hideStatus();
+  const url = document.getElementById('serverUrl').value.trim().replace(/\/$/, '');
+  document.getElementById('btnSign').disabled = true;
+
+  try {
+    // Request MetaMask
+    if (!window.ethereum) throw new Error('MetaMask not found — install it first');
+    const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+    currentAddress = accounts[0];
+    setMono('walletBox', currentAddress);
+
+    // personal_sign — MetaMask popup
+    const challengeBox = document.getElementById('challengeBox').textContent;
+    const hexMsg = '0x' + Array.from(new TextEncoder().encode(challengeBox))
+                              .map(b => b.toString(16).padStart(2,'0')).join('');
+    const sig = await window.ethereum.request({
+      method: 'personal_sign',
+      params: [hexMsg, currentAddress]
+    });
+
+    // sig = 0x{r 64hex}{s 64hex}{v 2hex} = 132 hex chars
+    const r = sig.slice(2, 66);
+    const s = sig.slice(66, 130);
+    const v = parseInt(sig.slice(130, 132), 16);
+    setMono('sigBox', `v=${v}  r=0x${r}  s=0x${s}`);
+    setStep(3);
+
+    // Send to backend
+    const resp = await fetch(url + '/activate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ address: currentAddress, nonce: currentNonce, r, s, v })
+    });
+    const result = await resp.json();
+    if (result.ok) {
+      showStatus(true);
+      setStep(4); // all done
+      // mark step3 done manually
+      const el = document.getElementById('step3');
+      el.className = 'step done';
+      el.querySelector('.dot').textContent = '✓';
+    } else {
+      showStatus(false, result.error || 'ecrecover mismatch');
+      document.getElementById('btnSign').disabled = false;
+    }
+  } catch (e) {
+    if (e.code === 4001) {
+      showStatus(false, 'User rejected the signature request');
+    } else {
+      showStatus(false, e.message);
+    }
+    document.getElementById('btnSign').disabled = false;
+  }
+}
+</script>
+</body>
+</html>

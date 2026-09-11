@@ -1,0 +1,201 @@
+# ultrafast-secp256k1
+
+High-performance Node.js native addon for secp256k1 elliptic curve cryptography, powered by [UltrafastSecp256k1](https://github.com/shrec/UltrafastSecp256k1).
+
+## Features
+
+- **ECDSA** -- sign, verify, recover, DER serialization (RFC 6979)
+- **Schnorr** -- BIP-340 sign/verify
+- **ECDH** -- compressed, x-only, raw shared secret
+- **BIP-32** -- HD key derivation
+- **Taproot** -- output key tweaking (BIP-341)
+- **Addresses** -- P2PKH, P2WPKH, P2TR
+- **WIF** -- encode/decode
+- **Hashing** -- SHA-256 (hardware-accelerated), HASH160, tagged hash
+- **Key tweaking** -- negate, add, multiply
+- **Ethereum** -- Keccak-256, EIP-55 addresses, EIP-155 sign, ecrecover
+- **BIP-39** -- mnemonic generation, validation, seed derivation
+- **Multi-coin wallet** -- 7-coin address dispatch (BTC/LTC/DOGE/DASH/ETH/BCH/TRX)
+- **Batch verification** -- ECDSA + Schnorr batch verify with invalid identification
+- **MuSig2** -- BIP-327 multi-signatures (key agg, nonce gen, partial sign, aggregate)
+- **FROST** -- threshold signatures (keygen, sign, aggregate, verify)
+- **Adaptor signatures** -- Schnorr + ECDSA adaptor pre-sign, adapt, extract
+- **Pedersen commitments** -- commit, verify, sum balance, switch commitments
+- **ZK proofs** -- knowledge proof, DLEQ proof, Bulletproof range proof
+- **Multi-scalar multiplication** -- Shamir's trick, MSM
+- **Pubkey arithmetic** -- add, negate, combine N keys
+- **SHA-512** -- full SHA-512 hash
+- **Message signing** -- BIP-137 Bitcoin message sign/verify
+
+## Install
+
+```bash
+npm install ultrafast-secp256k1
+```
+
+Requires a C++ compiler and `node-gyp` (the native addon is built on install).
+
+## Quick Start
+
+```js
+const { Secp256k1 } = require('ultrafast-secp256k1');
+const crypto = require('crypto');
+
+const secp = new Secp256k1();
+
+// Generate a random private key
+const privkey = crypto.randomBytes(32);
+
+// Derive compressed public key (33 bytes)
+const pubkey = secp.ecPubkeyCreate(privkey);
+console.log('pubkey:', pubkey.toString('hex'));
+```
+
+## ECDSA Sign & Verify
+
+```js
+const msgHash = secp.sha256(Buffer.from('hello world'));
+
+// Sign (RFC 6979 deterministic nonce, low-S)
+const sig = secp.ecdsaSign(msgHash, privkey);
+
+// Verify
+const valid = secp.ecdsaVerify(msgHash, sig, pubkey);
+console.log('ECDSA valid:', valid); // true
+
+// DER-encode for transmission
+const der = secp.ecdsaSerializeDer(sig);
+```
+
+## Schnorr (BIP-340)
+
+```js
+const xOnlyPub = secp.schnorrPubkey(privkey);
+const auxRand = crypto.randomBytes(32);
+const msg = secp.sha256(Buffer.from('schnorr message'));
+
+const schnorrSig = secp.schnorrSign(msg, privkey, auxRand);
+const ok = secp.schnorrVerify(msg, schnorrSig, xOnlyPub);
+console.log('Schnorr valid:', ok); // true
+```
+
+## ECDH
+
+```js
+const otherPriv = crypto.randomBytes(32);
+const otherPub = secp.ecPubkeyCreate(otherPriv);
+
+const shared = secp.ecdh(privkey, otherPub);       // SHA-256 of compressed point
+const xonly = secp.ecdhXonly(privkey, otherPub);    // SHA-256 of x-coordinate
+const raw = secp.ecdhRaw(privkey, otherPub);        // raw 32-byte x-coordinate
+```
+
+## Bitcoin Addresses
+
+```js
+const { NETWORK_MAINNET, NETWORK_TESTNET } = require('ultrafast-secp256k1');
+
+const p2pkh = secp.addressP2PKH(pubkey, NETWORK_MAINNET);   // 1...
+const p2wpkh = secp.addressP2WPKH(pubkey, NETWORK_MAINNET); // bc1q...
+const p2tr = secp.addressP2TR(xOnlyPub, NETWORK_MAINNET);   // bc1p...
+```
+
+## BIP-32 HD Derivation
+
+```js
+const seed = crypto.randomBytes(64);
+const master = secp.bip32MasterKey(seed);
+const child = secp.bip32DerivePath(master, "m/44'/0'/0'/0/0");
+const childPriv = secp.bip32GetPrivkey(child);
+const childPub = secp.bip32GetPubkey(child);
+```
+
+## WIF
+
+```js
+const wif = secp.wifEncode(privkey, true, NETWORK_MAINNET);
+const { privkey: decoded, compressed, network } = secp.wifDecode(wif);
+```
+
+## Taproot
+
+```js
+const { outputKeyX, parity } = secp.taprootOutputKey(xOnlyPub);
+const tweakedPriv = secp.taprootTweakPrivkey(privkey);
+```
+
+## Security Notes
+
+- Secret-bearing operations in the stable `ufsecp_*` C ABI route through the
+	native constant-time CPU paths. Public verification and serialization routes
+	stay on the native fast paths.
+- JavaScript cannot guarantee full secret erasure. V8/Node may keep Buffer
+	copies alive longer than expected, and helper methods may create additional
+	copies in JS memory.
+- Treat caller-owned `Buffer` and `Uint8Array` objects as sensitive material:
+	minimize copies, overwrite them after use, and avoid long-lived references.
+- If you use the lower-level context-based wrapper in `lib/ufsecp.js`, destroy
+	each context explicitly and do not share one context across worker threads
+	without external synchronization.
+- To minimize human error, the Node bindings now support `autoZeroInputs: true`
+	and `SensitiveBytes.take(...)`. In secure mode, secret-bearing input buffers
+	are wiped in a `finally` block after the native call returns, even on error.
+- This is still best-effort hygiene, not a formal guarantee against all JS/V8
+	copies. It reduces operational mistakes, but it cannot erase unknown aliases
+	or already-copied data elsewhere in the process.
+
+### Secure Usage
+
+```js
+const { Secp256k1, SensitiveBytes } = require('ultrafast-secp256k1');
+const crypto = require('crypto');
+
+const secp = new Secp256k1({ autoZeroInputs: true });
+const privkey = SensitiveBytes.take(crypto.randomBytes(32));
+const msgHash = crypto.randomBytes(32);
+
+const sig = secp.ecdsaSign(msgHash, privkey);
+// privkey is wiped automatically in the finally path
+```
+
+## Architecture Note
+
+Built on hand-optimized C/C++ with platform-specific acceleration (AVX2, SHA-NI, BMI2 on x86; NEON on ARM). The native library contains both fast and constant-time (CT) paths. In the stable `ufsecp_*` C ABI, secret-bearing CPU operations are routed through CT internals, while public verification/serialization operations stay on the optimized fast paths. This improves native-side timing safety, but it does not eliminate caller-side secret-copy risks in JavaScript memory.
+
+| Operation | x86-64 | ARM64 | RISC-V |
+|-----------|--------|-------|--------|
+| ECDSA Sign | 8 us | 30 us | -- |
+| kG (generator mul) | 5 us | 14 us | 33 us |
+| kP (arbitrary mul) | 25 us | 131 us | 154 us |
+
+## Performance Tuning
+
+When building the native addon from source, you can tune scalar multiplication (k*P) performance via the GLV window width:
+
+```bash
+cmake -S . -B build -DSECP256K1_GLV_WINDOW_WIDTH=6
+```
+
+| Window | Default On | Tradeoff |
+|--------|-----------|----------|
+| w=4 | ESP32, WASM | Smaller tables, more point additions |
+| w=5 | x86-64, ARM64, RISC-V | Balanced (default) |
+| w=6 | -- | Larger tables, fewer additions |
+
+See [docs/PERFORMANCE_GUIDE.md](../../docs/PERFORMANCE_GUIDE.md) for detailed benchmarks and per-platform tuning advice.
+
+## Smoke Validation
+
+```bash
+bash libs/UltrafastSecp256k1/scripts/validate_bindings.sh
+```
+
+## License
+
+MIT
+
+## Links
+
+- [GitHub](https://github.com/shrec/UltrafastSecp256k1)
+- [Benchmarks](https://github.com/shrec/UltrafastSecp256k1/blob/main/docs/BENCHMARKS.md)
+- [Changelog](https://github.com/shrec/UltrafastSecp256k1/blob/main/CHANGELOG.md)

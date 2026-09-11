@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""
+Formal verification runner for UltrafastSecp256k1.
+
+BLOCKING gate: ALL three tools MUST be present and pass.
+  Z3 SMT   — proves SafeGCD divstep algebraic invariants
+  Lean 4   — machine-checks SafeGCD theorems via native_decide
+  Cryptol  — proves GF(p) field + EC group + ECDSA + Schnorr arithmetic
+
+Z3 or Lean absent or failing → exit 1 (hard failure).
+Cryptol present: each audit/formal/cryptol/*.icry runner `:load`s its spec
+(parse + type-check) and `:check`s the curated properties; a type error or a
+property counterexample → exit 1 (blocking). Cryptol absent → advisory skip (77)
+per CAAS guardrail #16 (CI runners may lack it) — provision cryptol to make it
+unconditionally blocking. The full sign/verify equivalences are SAW :prove targets.
+
+Tools:
+  Z3 SMT    — audit/formal/safegcd_z3_proof.py   (~2s, pip install z3-solver)
+  Lean 4    — audit/formal/lean/  (lake build)    (~5min after elan install)
+  Cryptol   — audit/formal/cryptol/ (.cry files)  (apt-get install cryptol)
+
+Exit codes:
+  0   all tools passed
+  1   any tool missing OR any proof failed
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+FORMAL_DIR = REPO_ROOT / "audit" / "formal"
+
+g_pass = 0
+g_fail = 0
+g_skip = 0
+
+
+def run_tool(label: str, cmd: list[str], cwd: Path | None = None) -> int:
+    """Run a command. Returns 0 on pass, 1 on fail/timeout."""
+    global g_pass, g_fail
+    print(f"  [{label}]", end=" ", flush=True)
+    try:
+        result = subprocess.run(
+            cmd, cwd=cwd or REPO_ROOT,
+            capture_output=True, text=True, timeout=600
+        )
+        if result.returncode == 0:
+            print("PROVED")
+            g_pass += 1
+            return 0
+        else:
+            print("FAILED")
+            for line in (result.stdout + result.stderr).splitlines()[-15:]:
+                print(f"    {line}")
+            g_fail += 1
+            return 1
+    except subprocess.TimeoutExpired:
+        print("TIMEOUT")
+        g_fail += 1
+        return 1
+
+
+def tool_available(name: str) -> bool:
+    try:
+        subprocess.run([name, "--version"], capture_output=True, timeout=5)
+        return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def z3_available() -> bool:
+    try:
+        import z3  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def main() -> int:
+    global g_pass, g_fail, g_skip
+    rc = 0
+
+    print("Formal Verification — UltrafastSecp256k1")
+    print(f"  Formal dir: {FORMAL_DIR.relative_to(REPO_ROOT)}")
+    print()
+
+    # ── Z3 SMT proofs (REQUIRED) ─────────────────────────────────────────────
+    print("[Z3 SMT] SafeGCD / Bernstein-Yang divstep proofs  [REQUIRED]")
+    z3_script = FORMAL_DIR / "safegcd_z3_proof.py"
+    if not z3_available():
+        print("  [z3] MISSING — z3-solver not installed (pip install z3-solver)")
+        g_fail += 1
+        rc = 1
+    elif not z3_script.exists():
+        print(f"  [z3] MISSING — {z3_script} not found")
+        g_fail += 1
+        rc = 1
+    else:
+        if run_tool("z3", [sys.executable, str(z3_script)]) != 0:
+            rc = 1
+
+    # ── Lean 4 proofs (REQUIRED) ─────────────────────────────────────────────
+    print("[Lean 4] SafeGCD formal proofs  [REQUIRED]")
+    lean_dir = FORMAL_DIR / "lean"
+    if not tool_available("lake"):
+        print("  [lean] MISSING — lake/elan not installed (see audit/formal/lean/lean-toolchain)")
+        g_fail += 1
+        rc = 1
+    elif not lean_dir.exists():
+        print(f"  [lean] MISSING — {lean_dir} not found")
+        g_fail += 1
+        rc = 1
+    else:
+        if run_tool("lean", ["lake", "build"], cwd=lean_dir) != 0:
+            rc = 1
+
+    # ── Cryptol property checks (REQUIRED) ───────────────────────────────────
+    print("[Cryptol] GF(p) + EC + ECDSA + Schnorr arithmetic properties  [REQUIRED]")
+    cryptol_dir = FORMAL_DIR / "cryptol"
+    if not tool_available("cryptol"):
+        # ADVISORY_SKIP_CODE (77) per guardrail #16: when infrastructure is absent
+        # (Cryptol not installed) the check skips — it must not return 0 (false PASS)
+        # nor 1 (false FAIL). The blocking gate in ci_local.sh treats 77 as skip.
+        print("  [cryptol] MISSING — cryptol not installed (apt-get install cryptol)")
+        g_skip += 1
+        if rc == 0:
+            rc = 77  # advisory skip only if no other failure
+    elif not cryptol_dir.exists():
+        print(f"  [cryptol] MISSING — {cryptol_dir} not found")
+        g_skip += 1
+        if rc == 0:
+            rc = 77
+    else:
+        # Run each .icry runner: it `:load`s the module (parse + type-check) and then
+        # `:check`s the curated, tractable properties. `cryptol -b` exits non-zero on any
+        # parse/type error OR a property counterexample, so the process exit code IS the
+        # verdict (no output parsing needed). `:check` is randomized property testing — it
+        # evaluates the spec, so no SMT solver is required here; the heavy full sign/verify
+        # equivalences (256-bit scalar mul, abstract SHA-256) are SAW :prove targets.
+        # cwd = cryptol_dir so the bare `:load Name.cry` and inter-module imports resolve.
+        #
+        # NOTE: running the raw `cryptol -b Name.cry` (the previous behaviour) executes the
+        # file as a REPL command batch — top-level definitions do NOT persist and NO property
+        # is ever checked (it silently "passed"). The .icry runners are what actually exercise
+        # the properties, turning this into a real blocking gate when cryptol is present.
+        runners = sorted(cryptol_dir.glob("*.icry"))
+        if not runners:
+            print("  [cryptol] no .icry runners found — falling back to type-check only")
+            for cry_file in sorted(cryptol_dir.glob("*.cry")):
+                if run_tool(f"cryptol/{cry_file.name}",
+                            ["cryptol", "-b", cry_file.name], cwd=cryptol_dir) != 0:
+                    rc = 1
+        else:
+            for runner in runners:
+                if run_tool(f"cryptol/{runner.name}",
+                            ["cryptol", "-b", runner.name], cwd=cryptol_dir) != 0:
+                    rc = 1
+
+    print()
+    print(f"Result: {g_pass} proved, {g_fail} failed, {g_skip} skipped")
+    # Resolve final exit code:
+    #   exit 0  — all required tools proved (skips are advisory-OK)
+    #   exit 77 — no failures but ≥1 required tool missing (infrastructure skip)
+    #   exit 1  — at least one tool was present and its proof FAILED
+    if g_fail > 0:
+        final_rc = 1
+    elif rc == 77 and g_fail == 0:
+        final_rc = 77   # advisory: missing tools, no failures
+    else:
+        final_rc = 0    # all present tools proved
+    if final_rc != 0:
+        msg = "ADVISORY-SKIP (missing tools)" if final_rc == 77 else "FORMAL VERIFICATION FAILED"
+        print(msg + " — see errors above")
+    else:
+        print("FORMAL VERIFICATION PASSED")
+    return final_rc
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

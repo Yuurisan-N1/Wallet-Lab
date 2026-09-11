@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ufsecp"
+version = "0.0.0.dev0"
+description = "Python ctypes bindings for UltrafastSecp256k1 — high-performance secp256k1 ECDSA, Schnorr, FROST, MuSig2, BIP-352, GPU-accelerated elliptic curve cryptography (ufsecp C ABI v1)"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+authors = [
+    {name = "UltrafastSecp256k1 Contributors"}
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: C++",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+keywords = [
+    "secp256k1", "ecdsa", "schnorr", "bitcoin", "ethereum", "cryptography",
+    "ufsecp", "taproot", "bip32", "bip340", "bip352", "frost", "musig2",
+    "gpu", "cuda", "opencl", "metal", "signing", "verification", "wallet",
+    "elliptic-curve", "threshold-signatures", "constant-time", "silent-payments",
+]
+
+[project.urls]
+Homepage = "https://github.com/shrec/UltrafastSecp256k1"
+Repository = "https://github.com/shrec/UltrafastSecp256k1"
+Documentation = "https://github.com/shrec/UltrafastSecp256k1/tree/main/bindings/python"
+Changelog = "https://github.com/shrec/UltrafastSecp256k1/blob/main/CHANGELOG.md"
+Issues = "https://github.com/shrec/UltrafastSecp256k1/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ufsecp*"]
+
+[tool.setuptools.package-data]
+ufsecp = ["*.so", "*.so.*", "*.dll", "*.dylib"]

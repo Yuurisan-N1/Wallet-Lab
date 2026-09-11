@@ -1,0 +1,16 @@
+cmake_minimum_required(VERSION 3.16)
+project(ufsecp_jni C)
+
+find_package(JNI REQUIRED)
+
+add_library(ufsecp_jni SHARED jni/ufsecp_jni.c)
+target_include_directories(ufsecp_jni PRIVATE
+    ${JNI_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include/ufsecp
+    ${CMAKE_CURRENT_SOURCE_DIR}/jni
+)
+target_link_libraries(ufsecp_jni PRIVATE ufsecp)
+
+install(TARGETS ufsecp_jni
+    LIBRARY DESTINATION lib
+    RUNTIME DESTINATION bin)

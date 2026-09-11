@@ -1,0 +1,38 @@
+# Maintainer: shrec <shrec@users.noreply.github.com>
+pkgname=libufsecp
+pkgver=4.5.0
+pkgrel=1
+pkgdesc="High-performance secp256k1 elliptic curve cryptography library"
+arch=('x86_64' 'aarch64')
+url="https://github.com/shrec/UltrafastSecp256k1"
+license=('MIT')
+depends=('gcc-libs')
+makedepends=('cmake' 'ninja' 'gcc')
+provides=('libufsecp')
+source=("$url/archive/v$pkgver/UltrafastSecp256k1-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+    cmake -S "UltrafastSecp256k1-$pkgver" -B build \
+        -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DSECP256K1_BUILD_TESTS=ON \
+        -DSECP256K1_BUILD_BENCH=OFF \
+        -DSECP256K1_BUILD_EXAMPLES=OFF \
+        -DSECP256K1_BUILD_SHARED=ON \
+        -DSECP256K1_INSTALL=ON \
+        -DSECP256K1_INSTALL_PKGCONFIG=ON \
+        -DSECP256K1_USE_ASM=ON
+    cmake --build build
+}
+
+check() {
+    ctest --test-dir build --output-on-failure
+}
+
+package() {
+    DESTDIR="$pkgdir" cmake --install build
+    install -Dm644 "UltrafastSecp256k1-$pkgver/LICENSE" \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

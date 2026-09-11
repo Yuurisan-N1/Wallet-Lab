@@ -1,0 +1,41 @@
+libbitcoin bridge — GPU vs CPU batch signature verification
+============================================================
+Date:        2026-05-30
+GPU:         NVIDIA GeForce RTX 5060 Ti (SM 12.0, 36 SMs, ~2602 MHz), CUDA 12.0
+CPU:         Intel(R) Core(TM) i5-14400F, Ubuntu 24.04, GCC 14.2.0, Release
+Turbo:       disabled (intel_pstate/no_turbo=1, governor=performance, sudo-pinned)
+Pinning:     taskset -c 0, nice -20 (host thread)
+Binary:      bench_lbtc_batch (central-source libbitcoin profile, ufsecp_lbtc bridge)
+Harness:     batch = 1048576 rows, 10 timed iterations per backend, best-of-10,
+             pool = 4096 distinct key/msg/sig sets, correctness checked each run
+             (all-valid accepted + injected corruption rejected).
+Throughput is kernel+dispatch wall time over the whole batch (incl. host->device
+copy of the packed record table and device->host copy of the per-row verdicts).
+
+  == libbitcoin batch sig-verify benchmark ==
+  batch=1048576  iters=10  pool=4096
+
+  [GPU] bound=CUDA device=NVIDIA GeForce RTX 5060 Ti
+     correctness: PASS (all-valid + corruption detected)
+     ECDSA        3.56 M sig/s   (0.2945 s for 1048576, best of 10)
+     Schnorr      4.53 M sig/s   (0.2315 s for 1048576, best of 10)
+
+  [CPU] bound=CPU device=CPU
+     correctness: PASS (all-valid + corruption detected)
+     ECDSA        0.02 M sig/s   (52.2006 s for 1048576, best of 10)
+     Schnorr      0.04 M sig/s   (24.1893 s for 1048576, best of 10)
+
+Derived
+-------
+  ECDSA   : GPU 3.56 M/s = 281 ns/sig ;  CPU 49.8 us/sig ;  GPU speedup 177x
+  Schnorr : GPU 4.53 M/s = 221 ns/sig ;  CPU 23.1 us/sig ;  GPU speedup 104x
+
+Notes
+-----
+- libsecp256k1 has NO GPU batch-verify path; the CPU column is the libbitcoin
+  bridge CPU fallback (ufsecp_*_batch_verify, per-row), which is the consensus
+  reference and is itself gated bit-for-bit against libsecp256k1.
+- The GPU verdict matches the CPU reference bit-for-bit (test_lbtc_consensus_diff,
+  CONSENSUS-GPU-01); this benchmark only adds throughput, not a new correctness claim.
+- Single-call CPU verify (bench_unified, warm) is ~40 us/sig; the bridge CPU path
+  is per-row n=1 so it is slightly slower than the amortized batch path.

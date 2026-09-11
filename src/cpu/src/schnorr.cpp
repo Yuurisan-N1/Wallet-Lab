@@ -1,0 +1,865 @@
+#include "secp256k1/schnorr.hpp"
+#include "secp256k1/sha256.hpp"
+#include "secp256k1/tagged_hash.hpp"
+#include "secp256k1/multiscalar.hpp"
+#include "secp256k1/config.hpp"    // SECP256K1_FAST_52BIT
+#include "secp256k1/field_52.hpp"
+#include "secp256k1/debug_invariants.hpp"
+#include "secp256k1/detail/secure_erase.hpp"
+#include "secp256k1/ct/point.hpp"  // ct::generator_mul for secret-bearing paths
+#include "secp256k1/ct/scalar.hpp" // ct::scalar_cneg, ct::bool_to_mask
+#include "secp256k1/ct/sign.hpp"   // ct::schnorr_sign for schnorr_sign_verified
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <string_view>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
+namespace secp256k1 {
+
+using fast::Scalar;
+using fast::Point;
+using fast::FieldElement;
+#if defined(SECP256K1_FAST_52BIT)
+using FE52 = fast::FieldElement52;
+#endif
+
+// -- FE52 sqrt() and inverse() available as FieldElement52 class methods ------
+// sqrt() uses FE52 ops (~4us, faster than 4x64 ~6.8us).
+// inverse() uses FE52 Fermat (~4us) -- but SafeGCD (~2-3us) is faster for
+// variable-time paths (point.cpp batch inverse, verify Y-parity).
+
+// -- Precomputed curve constants (file scope: no per-call static-init guard) --
+#if defined(SECP256K1_FAST_52BIT)
+static const FE52 kSeven52 = FE52::from_fe(FieldElement::from_uint64(7));
+#endif
+
+static bool bytes_all_zero(const std::array<uint8_t, 32>& bytes) noexcept {
+    uint8_t acc = 0;
+    for (uint8_t byte : bytes) {
+        acc |= byte;
+    }
+    return acc == 0;
+}
+
+// -- lift_x: shared BIP-340 x-only -> affine Point ----------------------------
+// Input must be strict x in [0, p), represented as 4x64 LE limbs.
+// Returns Point::infinity() if x is not on the curve.
+static Point lift_x_from_limbs(const std::uint64_t* px_limb_le) {
+#if defined(SECP256K1_FAST_52BIT)
+#if defined(__aarch64__)
+    // On current ARM64 targets, 4x64 sqrt path benchmarks faster than FE52
+    // for lift_x; use it for raw Schnorr verify input decoding.
+    FieldElement const px_fe = FieldElement::from_limbs_raw({
+        px_limb_le[0], px_limb_le[1], px_limb_le[2], px_limb_le[3]});
+    auto x3 = px_fe * px_fe * px_fe;
+    auto y2 = x3 + FieldElement::from_uint64(7);
+    auto y_fe = y2.sqrt();
+    auto chk = y_fe * y_fe;
+    if (!(chk == y2)) return Point::infinity();
+    if (y_fe.limbs()[0] & 1) y_fe = y_fe.negate();
+    return Point::from_affine(px_fe, y_fe);
+#else
+    FE52 const px52 = FE52::from_4x64_limbs(px_limb_le);
+
+    // y^2 = x^3 + 7  (kSeven52 is file-scope: no per-call init guard — B-7)
+    FE52 const x3 = px52.square() * px52;
+    FE52 const y2 = x3 + kSeven52;
+
+    // Fast QR rejection via Jacobi (~900 ns) before sqrt (~3.8 µs).
+    // Jacobi is correct for 256-bit inputs (= normalized field elements close to p).
+    // Signature R.x and pubkey x-values are 256-bit, so this is safe.
+    if (y2.jacobi_var() != 1) return Point::infinity();
+
+    // sqrt + verify (defense-in-depth: jacobi_var has a known bug for inputs < 2^33
+    // where it may return an incorrect QR result. Secp256k1 field values from valid
+    // signatures/pubkeys are never this small (x >= 1 for any real key), but the
+    // sqrt+verify confirms correctness unconditionally. SEC-008: no code fix needed;
+    // the defense already catches any jacobi_var misclassification.)
+    FE52 y52 = y2.sqrt();
+    FE52 check = y52.square();
+    check.negate_assign(1);
+    check.add_assign(y2);
+    if (!check.normalizes_to_zero_var()) return Point::infinity();
+
+    // Ensure even Y (BIP-340 convention): check parity of normalized y
+    FE52 y_norm = y52;
+    y_norm.normalize();
+    if (y_norm.n[0] & 1) {
+        // Negate: y = p - y
+        y52 = y52.negate(1);
+        y52.normalize_weak();
+    }
+
+    // Zero-conversion: construct Point directly from FE52 affine coordinates
+    return Point::from_affine52(px52, y52);
+#endif
+#else
+    FieldElement const px_fe = FieldElement::from_limbs_raw({
+        px_limb_le[0], px_limb_le[1], px_limb_le[2], px_limb_le[3]});
+    auto x3 = px_fe * px_fe * px_fe;
+    auto y2 = x3 + FieldElement::from_uint64(7);
+    auto y_fe = y2.sqrt();
+    auto chk = y_fe * y_fe;
+    if (!(chk == y2)) return Point::infinity();
+    // 4x64 mul_impl Barrett-reduces to [0, p), so limbs()[0] & 1 is
+    // the true parity -- no serialization needed.
+    if (y_fe.limbs()[0] & 1) y_fe = y_fe.negate();
+    return Point::from_affine(px_fe, y_fe);
+#endif
+}
+
+static inline std::uint64_t load_be64_unaligned(const uint8_t* p) {
+    std::uint64_t v = 0;
+    std::memcpy(&v, p, sizeof(v));
+#if defined(_MSC_VER)
+    return _byteswap_uint64(v);
+#elif defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+    return __builtin_bswap64(v);
+#else
+    return v;
+#endif
+}
+
+static inline void parse_be32_to_le64(const uint8_t* in32, std::uint64_t* out4) {
+    out4[3] = load_be64_unaligned(in32 + 0);
+    out4[2] = load_be64_unaligned(in32 + 8);
+    out4[1] = load_be64_unaligned(in32 + 16);
+    out4[0] = load_be64_unaligned(in32 + 24);
+}
+
+static inline bool limbs_lt_p(const std::uint64_t* x4) {
+    constexpr std::uint64_t P0 = 0xFFFFFFFEFFFFFC2FULL;
+    return x4[3] != 0xFFFFFFFFFFFFFFFFULL ||
+           x4[2] != 0xFFFFFFFFFFFFFFFFULL ||
+           x4[1] != 0xFFFFFFFFFFFFFFFFULL ||
+           x4[0] < P0;
+}
+
+static inline bool parse_and_check_lt_p(const uint8_t* in32, std::uint64_t* out4) {
+    parse_be32_to_le64(in32, out4);
+    return limbs_lt_p(out4);
+}
+
+static inline bool parse2_and_check_lt_p(const uint8_t* a32,
+                                         const uint8_t* b32,
+                                         std::uint64_t* out_a4,
+                                         std::uint64_t* out_b4) {
+    out_a4[3] = load_be64_unaligned(a32 + 0);
+    out_a4[2] = load_be64_unaligned(a32 + 8);
+    out_a4[1] = load_be64_unaligned(a32 + 16);
+    out_a4[0] = load_be64_unaligned(a32 + 24);
+
+    out_b4[3] = load_be64_unaligned(b32 + 0);
+    out_b4[2] = load_be64_unaligned(b32 + 8);
+    out_b4[1] = load_be64_unaligned(b32 + 16);
+    out_b4[0] = load_be64_unaligned(b32 + 24);
+
+    return limbs_lt_p(out_a4) && limbs_lt_p(out_b4);
+}
+
+// Tiny thread-local cache for raw BIP-340 verification path.
+// Public-key input is non-secret, so memoizing lifted x-only pubkeys is safe.
+struct XOnlyLiftCacheEntry {
+    std::array<uint8_t, 32> x{};
+    Point p = Point::infinity();
+    bool valid = false;
+};
+
+#if defined(SECP256K1_FAST_52BIT) && !defined(SECP256K1_USE_4X64_POINT_OPS)
+// Secondary cache: pre-built GLV Z-ratio tables for schnorr_verify hot path.
+// Eliminates ~1,954 ns Z-ratio rebuild per unique pubkey on cache hit.
+// 64 slots × ~1.3 KB/slot = ~85 KB/thread. Covers bench_unified's 64-key pool.
+// Stored separately from the Point cache to keep XOnlyLiftCacheEntry small.
+// Table size 8 = kDualMulPTableSize (w=5 → 2^(5-2) = 8 entries; mirrored from schnorr.hpp).
+static constexpr std::size_t kSchnorrGLVTableSize = 8;
+struct XOnlyGLVCacheEntry {
+    std::array<uint8_t, 32> x{};
+    std::array<fast::AffinePoint52, kSchnorrGLVTableSize> tbl_P{};
+    std::array<fast::AffinePoint52, kSchnorrGLVTableSize> tbl_phi_base{};
+    fast::FieldElement52 Z_shared{};
+    bool valid      = false;  // true = prebuilt tables usable
+    bool seen_once  = false;  // true = pubkey seen once but table not yet built
+};
+static constexpr std::size_t kGLVCacheSlots = 64;
+static thread_local std::array<XOnlyGLVCacheEntry, kGLVCacheSlots> g_glv_cache{};
+#endif // SECP256K1_FAST_52BIT && !4X64
+
+static inline Scalar schnorr_challenge_scalar(const uint8_t* r32,
+                                              const uint8_t* pubkey_x32,
+                                              const uint8_t* msg32) {
+    alignas(16) uint8_t challenge_input[96];
+    std::memcpy(challenge_input + 0, r32, 32);
+    std::memcpy(challenge_input + 32, pubkey_x32, 32);
+    std::memcpy(challenge_input + 64, msg32, 32);
+    return Scalar::from_bytes(detail::cached_tagged_hash(detail::g_challenge_midstate,
+                                                         challenge_input,
+                                                         sizeof(challenge_input)));
+}
+
+// Variable-length variant for arbitrary-length messages (BIP-340 extension,
+// matches libsecp256k1 secp256k1_schnorrsig_verify which accepts any msglen).
+// PERF-03: reuse the precomputed g_challenge_midstate (same as the fixed-32 path)
+// instead of re-deriving the "BIP0340/challenge" tag prefix on every call. The
+// midstate already encodes SHA256(tag)||SHA256(tag), so the result is byte-identical
+// to tagged_hash("BIP0340/challenge", input, len) for any input length.
+static Scalar schnorr_challenge_scalar_varlen(const uint8_t* r32,
+                                              const uint8_t* pubkey_x32,
+                                              const uint8_t* msg,
+                                              std::size_t msglen) {
+    // PERF-001: SBO — avoid heap alloc for messages up to 512 bytes (covers
+    // typical Tapscript leaf hashes and other short messages without malloc).
+    // Functionally identical to the vector-based variant on main (same tagged
+    // hash input bytes); the SBO version was added on dev after the varlen
+    // feature landed on main.
+    static constexpr std::size_t kSBOMax = 512;
+    uint8_t stack_buf[64 + kSBOMax];
+    std::unique_ptr<uint8_t[]> heap_buf;
+    uint8_t* input = (msglen <= kSBOMax)
+        ? stack_buf
+        : (heap_buf.reset(new uint8_t[64 + msglen]), heap_buf.get());
+    std::memcpy(input +  0, r32,        32);
+    std::memcpy(input + 32, pubkey_x32, 32);
+    if (msglen > 0) std::memcpy(input + 64, msg, msglen);
+    return Scalar::from_bytes(detail::cached_tagged_hash(detail::g_challenge_midstate,
+                                                         input, 64 + msglen));
+}
+
+#if !defined(SECP256K1_PLATFORM_ESP32) && !defined(SECP256K1_PLATFORM_STM32)
+
+static constexpr std::size_t kLiftXCacheSlots = 1024;
+
+// Single file-scope thread_local cache shared by both lookup and store.
+// Bug fix: previously each function had its own function-scope thread_local
+// array — C++ function-scope thread_locals are independent symbols, so
+// store wrote to array B while lookup read from array A (always empty).
+// The cache was completely dead. Moving to file scope fixes the sharing.
+static thread_local std::array<XOnlyLiftCacheEntry, kLiftXCacheSlots> g_lift_x_cache{};
+
+static inline std::size_t lift_x_cache_index(const uint8_t* pubkey_x32) {
+    // FNV-1a over first 8 bytes: better distribution than 9-byte XOR cascade
+    // (avoids collisions when pubkeys share the same XOR-selected byte positions).
+    std::uint64_t v;
+    std::memcpy(&v, pubkey_x32, 8);
+    v ^= v >> 33;
+    v *= 0xff51afd7ed558ccdULL;
+    v ^= v >> 33;
+    return static_cast<std::size_t>(v) & (kLiftXCacheSlots - 1);
+}
+
+// Returns slot index so lift_x_cached can reuse it for the store path,
+// avoiding a second call to lift_x_cache_index when the lookup misses.
+static inline bool lift_x_cache_lookup(const uint8_t* pubkey_x32, Point& out,
+                                        std::size_t& idx_out) {
+    idx_out = lift_x_cache_index(pubkey_x32);
+    auto& slot = g_lift_x_cache[idx_out];
+    if (!slot.valid || std::memcmp(slot.x.data(), pubkey_x32, 32) != 0) {
+        return false;
+    }
+    out = slot.p;
+    return !out.is_infinity();
+}
+
+static inline void lift_x_cache_store_at(const uint8_t* pubkey_x32,
+                                           const Point& lifted,
+                                           std::size_t idx) {
+    auto& slot = g_lift_x_cache[idx];
+    std::memcpy(slot.x.data(), pubkey_x32, 32);
+    slot.p = lifted;
+    slot.valid = true;
+}
+#endif
+
+static inline bool lift_x_cached(const uint8_t* pubkey_x32,
+                                 Point& out) {
+#if defined(SECP256K1_PLATFORM_ESP32) || defined(SECP256K1_PLATFORM_STM32)
+    std::uint64_t pkL[4];
+    if (!parse_and_check_lt_p(pubkey_x32, pkL)) return false;
+    Point const lifted = lift_x_from_limbs(pkL);
+    if (lifted.is_infinity()) return false;
+    out = lifted;
+    return true;
+#else
+    std::size_t cache_idx = 0;
+    if (lift_x_cache_lookup(pubkey_x32, out, cache_idx)) {
+        return true;
+    }
+
+    std::uint64_t pkL[4];
+    if (!parse_and_check_lt_p(pubkey_x32, pkL)) return false;
+
+    Point const lifted = lift_x_from_limbs(pkL);
+    if (lifted.is_infinity()) {
+        return false;
+    }
+
+    lift_x_cache_store_at(pubkey_x32, lifted, cache_idx);
+    out = lifted;
+    return true;
+#endif
+}
+
+// -- Shared BIP-340 tagged-hash midstates (from tagged_hash.hpp) ---------------
+using detail::g_aux_midstate;
+using detail::g_nonce_midstate;
+using detail::g_challenge_midstate;
+using detail::cached_tagged_hash;
+
+// -- Tagged Hash (BIP-340) -- generic fallback ---------------------------------
+
+std::array<uint8_t, 32> tagged_hash(const char* tag,
+                                     const void* data, std::size_t len) {
+    std::string_view const sv(tag);
+    auto tag_hash = SHA256::hash(sv.data(), sv.size());
+    SHA256 ctx;
+    ctx.update(tag_hash.data(), 32);
+    ctx.update(tag_hash.data(), 32);
+    ctx.update(data, len);
+    return ctx.finalize();
+}
+
+// -- Schnorr Signature --------------------------------------------------------
+
+std::array<uint8_t, 64> SchnorrSignature::to_bytes() const {
+    std::array<uint8_t, 64> out{};
+    std::memcpy(out.data(), r.data(), 32);
+    auto s_bytes = s.to_bytes();
+    std::memcpy(out.data() + 32, s_bytes.data(), 32);
+    return out;
+}
+
+SchnorrSignature SchnorrSignature::from_bytes(const uint8_t* data64) {
+    SchnorrSignature sig{};
+    std::memcpy(sig.r.data(), data64, 32);
+    // BIP-340: s must be in [0, n-1]. Use strict parser so that s >= n values
+    // produce s = Scalar::zero() (an obviously-invalid signature) instead of
+    // silently reducing to a small value. s == 0 is accepted at parse time and
+    // rejected at verify time (schnorr_verify checks is_zero(sig.s) → false).
+    // This is intentional: from_bytes is a permissive parser; parse_strict rejects
+    // s == 0 if strict non-zero is required. Callers needing strict rejection
+    // should call parse_strict() directly. (RED-TEAM-012: documented by design.)
+    if (!Scalar::parse_bytes_strict(data64 + 32, sig.s)) {
+        sig.s = Scalar::zero();  // s >= n → zero-marks the signature invalid
+    }
+    return sig;
+}
+
+SchnorrSignature SchnorrSignature::from_bytes(const std::array<uint8_t, 64>& data) {
+    return from_bytes(data.data());
+}
+
+// -- BIP-340 strict signature parsing (r < p, 0 < s < n) ---------------------
+
+bool SchnorrSignature::parse_strict(const uint8_t* data64, SchnorrSignature& out) noexcept {
+    // BIP-340: fail if r >= p.
+    // PERF-OPT (OVERHEAD-007): use parse_and_check_lt_p instead of constructing a
+    // full FieldElement that is immediately discarded. The FieldElement stores 4
+    // uint64_t limbs that are never read after the >= p check; the raw limb check
+    // in parse_and_check_lt_p saves 4 store instructions vs FieldElement::parse_bytes_strict.
+    std::uint64_t r_limbs[4];
+    if (!parse_and_check_lt_p(data64, r_limbs)) return false;
+
+    // BIP-340: fail if s >= n; also reject s == 0
+    Scalar s_val;
+    if (!Scalar::parse_bytes_strict_nonzero(data64 + 32, s_val)) return false;
+
+    std::memcpy(out.r.data(), data64, 32);
+    out.s = s_val;
+    return true;
+}
+
+bool SchnorrSignature::parse_strict(const std::array<uint8_t, 64>& data,
+                                     SchnorrSignature& out) noexcept {
+    return parse_strict(data.data(), out);
+}
+
+// -- X-only pubkey ------------------------------------------------------------
+
+std::array<uint8_t, 32> schnorr_pubkey(const Scalar& private_key) {
+    SECP_ASSERT_SCALAR_VALID(private_key);
+    auto P = ct::generator_mul(private_key);
+    auto [px, p_y_odd] = P.x_bytes_and_parity();
+    (void)p_y_odd;
+    return px;
+}
+
+// -- SchnorrKeypair Creation --------------------------------------------------
+
+SchnorrKeypair schnorr_keypair_create(const Scalar& private_key) {
+    // NOTE: This function intentionally accepts a zero scalar and returns
+    // an empty SchnorrKeypair (kp.px == 0). Audit/regression tests
+    // (test_abi_recoverable_recovery_ct_schnorr etc.) deliberately invoke
+    // the function with zero to verify graceful rejection — asserting
+    // non-zero here would crash those tests in Debug builds. Caller code
+    // either passes a strict-parsed scalar (which is already non-zero) or
+    // is testing the zero-input behaviour explicitly.
+    SchnorrKeypair kp{};
+    auto d_prime = private_key;
+    if (ct::scalar_is_zero(d_prime)) return kp;
+
+    auto P = ct::generator_mul(d_prime);
+    auto [px, p_y_odd] = P.x_bytes_and_parity();
+
+    kp.d = ct::scalar_cneg(d_prime, ct::bool_to_mask(p_y_odd));
+    kp.px = px;
+    // d_prime is a private-key copy — scrub it from the stack (kp.d, the public
+    // x-only signing key, is the intended output and is returned by value).
+    detail::secure_erase(&d_prime, sizeof(d_prime));
+    return kp;
+}
+
+// -- BIP-340 Sign (keypair variant, fast) -------------------------------------
+// Uses pre-computed keypair: only 1 gen_mul + 1 FE52 inverse per sign.
+
+SchnorrSignature schnorr_sign(const SchnorrKeypair& kp,
+                              const std::array<uint8_t, 32>& msg,
+                              const std::array<uint8_t, 32>& aux_rand) {
+    SECP_ASSERT_SCALAR_VALID(kp.d);
+    if (kp.d.is_zero_ct()) return SchnorrSignature{};  // CT-008: kp.d is secret
+
+    // Step 1: t = d XOR tagged_hash("BIP0340/aux", aux_rand)
+    auto t_hash = cached_tagged_hash(g_aux_midstate, aux_rand.data(), 32);
+    auto d_bytes = kp.d.to_bytes();
+    uint8_t t[32];
+    for (std::size_t i = 0; i < 32; ++i) t[i] = d_bytes[i] ^ t_hash[i];
+
+    // Step 2: k' = tagged_hash("BIP0340/nonce", t || pubkey_x || msg)
+    uint8_t nonce_input[96];
+    std::memcpy(nonce_input, t, 32);
+    std::memcpy(nonce_input + 32, kp.px.data(), 32);
+    std::memcpy(nonce_input + 64, msg.data(), 32);
+    auto rand_hash = cached_tagged_hash(g_nonce_midstate, nonce_input, 96);
+    // CT note: from_bytes uses a constant-time mod-n reduction (branchless subtraction).
+    // The for-loop alternative creates a dudect-detectable branch. from_bytes passes.
+    auto k_prime = Scalar::from_bytes(rand_hash);
+    if (k_prime.is_zero_ct()) {
+        // Zeroize all secret-derived data before early return (~2^-128 probability).
+        detail::secure_erase(d_bytes.data(), d_bytes.size());
+        detail::secure_erase(t_hash.data(), t_hash.size());
+        detail::secure_erase(t, sizeof(t));
+        detail::secure_erase(nonce_input, sizeof(nonce_input));
+        detail::secure_erase(rand_hash.data(), rand_hash.size());
+        detail::secure_erase(&k_prime, sizeof(k_prime));
+        return SchnorrSignature{};
+    }
+
+    // Step 3: R = k' * G (CT Hamburg comb, blinded when context_randomize active)
+    auto R = ct::generator_mul_blinded(k_prime);
+    auto [rx, r_y_odd] = R.x_bytes_and_parity();
+
+    // Step 4: k = k' if has_even_y(R), else n - k'  [CT: branchless negate]
+    auto k = ct::scalar_cneg(k_prime, ct::bool_to_mask(r_y_odd));
+
+    // Step 5: e = tagged_hash("BIP0340/challenge", R.x || pubkey_x || msg)
+    uint8_t challenge_input[96];
+    std::memcpy(challenge_input, rx.data(), 32);
+    std::memcpy(challenge_input + 32, kp.px.data(), 32);
+    std::memcpy(challenge_input + 64, msg.data(), 32);
+    auto e_hash = cached_tagged_hash(g_challenge_midstate, challenge_input, 96);
+    auto e = Scalar::from_bytes(e_hash);
+
+    // Step 6: sig = (R.x, k + e * d)
+    // CT: use ct::scalar_mul/add — fast::Scalar operator*/+ have a
+    // secret-dependent branch in the final modular reduction (see ct_scalar.cpp).
+    SchnorrSignature sig{};
+    sig.r = rx;
+    sig.s = ct::scalar_add(k, ct::scalar_mul(e, kp.d));
+
+    // Erase all secret-derived stack buffers (matches ct::schnorr_sign cleanup)
+    detail::secure_erase(d_bytes.data(), d_bytes.size());
+    detail::secure_erase(t_hash.data(), t_hash.size());
+    detail::secure_erase(t, sizeof(t));
+    detail::secure_erase(nonce_input, sizeof(nonce_input));
+    detail::secure_erase(rand_hash.data(), rand_hash.size());
+    detail::secure_erase(challenge_input, sizeof(challenge_input));
+    // SEC-009: erase e_hash and e — e_hash encodes R.x (secret nonce derivation);
+    // e (Scalar) is derived from e_hash. Both must be erased like other secret intermediates.
+    detail::secure_erase(e_hash.data(), e_hash.size());
+    detail::secure_erase(&e, sizeof(e));
+    detail::secure_erase(&k_prime, sizeof(k_prime));
+    detail::secure_erase(&k, sizeof(k));
+
+    // Reject degenerate output: r==all-zeros is astronomically rare (~2^-128)
+    // but must never be serialised as a valid signature (Rule 14).
+    if (SECP256K1_UNLIKELY(bytes_all_zero(sig.r) || sig.s.is_zero_ct()))
+        return SchnorrSignature{};
+
+    return sig;
+}
+
+// -- BIP-340 Sign + Verify (fault attack countermeasure) ----------------------
+
+SchnorrSignature schnorr_sign_verified(const SchnorrKeypair& kp,
+                                       const std::array<uint8_t, 32>& msg,
+                                       const std::array<uint8_t, 32>& aux_rand) {
+    // Use ct::schnorr_sign (generator_mul, not blinded) to match the audited
+    // ct::schnorr_sign_verified path and avoid generator_mul_blinded interactions.
+    const auto sig = ct::schnorr_sign(kp, msg, aux_rand);
+
+    if (sig.s.is_zero_ct() || bytes_all_zero(sig.r)) {
+        return SchnorrSignature{};
+    }
+
+    if (!schnorr_verify(kp.px, msg, sig)) {
+        return SchnorrSignature{};
+    }
+
+    return sig;
+}
+
+// -- BIP-340 Sign (raw key, convenience) --------------------------------------
+
+SchnorrSignature schnorr_sign(const Scalar& private_key,
+                              const std::array<uint8_t, 32>& msg,
+                              const std::array<uint8_t, 32>& aux_rand) {
+    // v9 RT-006 / TASK-022: schnorr_keypair_create materialises kp.d (negated
+    // signing scalar, possibly differing from private_key by sign). The kp
+    // structure lives on this frame's stack and must be erased before return —
+    // the kp passed to schnorr_sign(kp, ...) is a *copy* of our local. Erase
+    // our copy after the sub-call returns (sig itself is public output).
+    SchnorrKeypair kp = schnorr_keypair_create(private_key);
+    auto sig = schnorr_sign(kp, msg, aux_rand);
+    detail::secure_erase(&kp.d, sizeof(kp.d));
+    return sig;
+}
+
+// -- BIP-340 Sign (raw key) + Verify ------------------------------------------
+
+SchnorrSignature schnorr_sign_verified(const Scalar& private_key,
+                                       const std::array<uint8_t, 32>& msg,
+                                       const std::array<uint8_t, 32>& aux_rand) {
+    // v9 RT-006 / TASK-022: see comment in schnorr_sign(Scalar) overload above.
+    SchnorrKeypair kp = schnorr_keypair_create(private_key);
+    auto sig = schnorr_sign_verified(kp, msg, aux_rand);
+    detail::secure_erase(&kp.d, sizeof(kp.d));
+    return sig;
+}
+
+// -- BIP-340 Verify -----------------------------------------------------------
+
+bool schnorr_verify(const uint8_t* pubkey_x32,
+                    const uint8_t* msg32,
+                    const SchnorrSignature& sig) noexcept {
+    // Step 0: BIP-340 strict range checks
+    // BIP-340 §4: "Fail if s ≥ n". from_bytes() now enforces this at parse
+    // time (s ≥ n → s set to zero), but we guard here for defense in depth.
+    if (sig.s.is_zero()) return false;
+    // Note: is_zero() is sufficient because from_bytes() now uses strict
+    // parsing; any s >= n is stored as zero. If sig was constructed directly
+    // without using from_bytes/parse_strict, is_zero() still catches s=0 and
+    // Scalar values are always reduced mod n by construction.
+
+    // Check r < p: parse r bytes to 4x64 LE limbs + strict check, no FieldElement.
+    std::uint64_t rL[4];
+    if (!parse_and_check_lt_p(sig.r.data(), rL)) return false;
+
+    // Step 2: Lift x-only pubkey to point (cached for repeated pubkeys)
+    Point P;
+    if (!lift_x_cached(pubkey_x32, P)) return false;
+
+    // Step 3: e = tagged_hash("BIP0340/challenge", r || pubkey_x || msg) mod n
+    const auto e = schnorr_challenge_scalar(sig.r.data(), pubkey_x32, msg32);
+    const auto neg_e = e.negate_var();  // e is public challenge — variable-time negate
+
+    // Step 4: R = s*G - e*P
+    // Fast path: check GLV table cache — on hit, use prebuilt tables (~1,954 ns saved).
+    // Cache miss: build tables, store in cache (amortised over repeated calls).
+#if defined(SECP256K1_FAST_52BIT) && !defined(SECP256K1_USE_4X64_POINT_OPS)
+    Point R;
+    {
+        std::size_t const glv_idx = lift_x_cache_index(pubkey_x32) & (kGLVCacheSlots - 1);
+        auto& glv_slot = g_glv_cache[glv_idx];
+        // GLV cache populated passively by schnorr_xonly_pubkey_parse().
+        // On cache hit: use pre-built tables (zero Z-ratio rebuild ~1,954 ns).
+        // On cache miss: fall through to gen_point — no cache write here
+        //   (avoids 1,320-byte struct write per miss thrashing L1/L2 with unique pubkeys).
+        if (glv_slot.valid && std::memcmp(glv_slot.x.data(), pubkey_x32, 32) == 0) {
+            R = Point::dual_scalar_mul_gen_prebuilt(sig.s, neg_e,
+                                                    glv_slot.tbl_P,
+                                                    glv_slot.tbl_phi_base,
+                                                    glv_slot.Z_shared);
+        } else {
+            R = Point::dual_scalar_mul_gen_point(sig.s, neg_e, P);
+        }
+    }
+#else
+    const auto R = Point::dual_scalar_mul_gen_point(sig.s, neg_e, P);
+#endif
+
+    if (R.is_infinity()) return false;
+
+    // Steps 5+6: Single affine conversion.
+#if defined(SECP256K1_FAST_52BIT)
+    FE52 const z_inv = R.Z52().inverse_safegcd();
+    FE52 const z_inv2 = z_inv.square();
+    FE52 x_aff = R.X52() * z_inv2;
+    FE52 const z_inv3 = z_inv * z_inv2;
+    FE52 y_aff = R.Y52() * z_inv3;
+
+    const FE52 r52 = FE52::from_4x64_limbs(rL);
+    x_aff.negate_assign(1);
+    x_aff.add_assign(r52);
+    const bool x_match = x_aff.normalizes_to_zero_var();
+    // PERF-001: full normalize() is required here — normalize_weak() is NOT safe
+    // for parity extraction because it may leave the value as v or v+p (both
+    // valid weak representations).  Since p is odd, parity(v) != parity(v+p).
+    // Only the fully reduced canonical form in [0, p) gives the correct parity.
+    y_aff.normalize();
+    return x_match & ((y_aff.n[0] & 1) == 0);
+#else
+    FieldElement r_fe_check = FieldElement::from_limbs_raw({rL[0], rL[1], rL[2], rL[3]});
+    FieldElement z_inv = R.z_raw().inverse();
+    FieldElement z_inv2 = z_inv;
+    z_inv2.square_inplace();
+    FieldElement x_aff = R.x_raw() * z_inv2;
+    FieldElement z_inv3 = z_inv * z_inv2;
+    FieldElement y_aff = R.y_raw() * z_inv3;
+    return (x_aff == r_fe_check) & ((y_aff.limbs()[0] & 1) == 0);
+#endif
+}
+
+// -- schnorr_verify(Point) — P1-PERF-001 ----------------------------------
+// Same as schnorr_verify(pubkey_x32, ...) but skips lift_x since the
+// caller has already validated and stored the point (e.g. shim_schnorr
+// reads data[32..63] set by secp256k1_xonly_pubkey_parse). Eliminates
+// the lift_x sqrt (~900ns Jacobi + ~2.9µs sqrt) on every unique-pubkey call.
+
+bool schnorr_verify(const fast::Point& P,
+                    const uint8_t* pubkey_x32,
+                    const uint8_t* msg32,
+                    const SchnorrSignature& sig) noexcept {
+    if (sig.s.is_zero()) return false;
+    std::uint64_t rL[4];
+    if (!parse_and_check_lt_p(sig.r.data(), rL)) return false;
+    if (P.is_infinity()) return false;
+
+    const auto e     = schnorr_challenge_scalar(sig.r.data(), pubkey_x32, msg32);
+    const auto neg_e = e.negate_var();
+    const auto R     = Point::dual_scalar_mul_gen_point(sig.s, neg_e, P);
+
+    if (R.is_infinity()) return false;
+
+#if defined(SECP256K1_FAST_52BIT)
+    FE52 const z_inv  = R.Z52().inverse_safegcd();
+    FE52 const z_inv2 = z_inv.square();
+    FE52       x_aff  = R.X52() * z_inv2;
+    FE52       y_aff  = R.Y52() * (z_inv * z_inv2);
+    const FE52 r52    = FE52::from_4x64_limbs(rL);
+    x_aff.negate_assign(1);
+    x_aff.add_assign(r52);
+    const bool x_match = x_aff.normalizes_to_zero_var();
+    // PERF-001: full normalize() required — see note in schnorr_verify(pubkey_x32).
+    y_aff.normalize();
+    return x_match & ((y_aff.n[0] & 1) == 0);
+#else
+    FieldElement r_fe_check = FieldElement::from_limbs_raw({rL[0], rL[1], rL[2], rL[3]});
+    FieldElement z_inv      = R.z_raw().inverse();
+    FieldElement z_inv2     = z_inv; z_inv2.square_inplace();
+    FieldElement x_aff      = R.x_raw() * z_inv2;
+    FieldElement y_aff      = R.y_raw() * (z_inv * z_inv2);
+    return (x_aff == r_fe_check) & ((y_aff.limbs()[0] & 1) == 0);
+#endif
+}
+
+// -- Pre-cached X-only Pubkey -------------------------------------------------
+
+bool schnorr_xonly_pubkey_parse(SchnorrXonlyPubkey& out,
+                                const uint8_t* pubkey_x32) {
+    Point P = Point::infinity();
+    if (!lift_x_cached(pubkey_x32, P)) return false;
+    out.point = P;
+    std::memcpy(out.x_bytes.data(), pubkey_x32, 32);
+
+#if defined(SECP256K1_FAST_52BIT) && !defined(SECP256K1_USE_4X64_POINT_OPS)
+    // Build GLV P/phi(P) tables immediately on parse (PERF-B fix).
+    // The caller pre-parses pubkeys before verifying — building now avoids
+    // ~3,554 ns (lift_x + table rebuild) per unique pubkey on the verify call.
+    // For ConnectBlock with 2000 unique pubkeys this saves ~7.1 ms per block.
+    //
+    // g_glv_cache is also populated so schnorr_verify(raw) benefits if called
+    // while the cache slot is still warm.
+    // Thread safety: g_glv_cache is thread_local — no concurrent access.
+    {
+        std::size_t const glv_idx = lift_x_cache_index(pubkey_x32) & (kGLVCacheSlots - 1);
+        auto& glv_slot = g_glv_cache[glv_idx];
+
+        bool const cache_hit = glv_slot.valid &&
+                               std::memcmp(glv_slot.x.data(), pubkey_x32, 32) == 0;
+
+        if (cache_hit) {
+            out.tbl_P        = glv_slot.tbl_P;
+            out.tbl_phi_base = glv_slot.tbl_phi_base;
+            out.Z_shared     = glv_slot.Z_shared;
+            out.tables_valid = true;
+        } else {
+            // Build immediately; evict any stale occupant from the slot.
+            out.tables_valid = Point::build_schnorr_verify_tables(
+                P, out.tbl_P, out.tbl_phi_base, out.Z_shared);
+            if (out.tables_valid) {
+                std::memcpy(glv_slot.x.data(), pubkey_x32, 32);
+                glv_slot.tbl_P        = out.tbl_P;
+                glv_slot.tbl_phi_base = out.tbl_phi_base;
+                glv_slot.Z_shared     = out.Z_shared;
+                glv_slot.valid        = true;
+                glv_slot.seen_once    = true;
+            }
+        }
+    }
+#endif
+    return true;
+}
+
+bool schnorr_xonly_pubkey_parse(SchnorrXonlyPubkey& out,
+                                const std::array<uint8_t, 32>& pubkey_x) {
+    return schnorr_xonly_pubkey_parse(out, pubkey_x.data());
+}
+
+SchnorrXonlyPubkey schnorr_xonly_from_keypair(const SchnorrKeypair& kp) {
+    SchnorrXonlyPubkey pub{};
+    // PERF-009: compute point once, then CT-conditionally negate Y instead of
+    // recomputing k_neg*G via a second ct::generator_mul (~33µs savings).
+    //
+    // CT property: p_y_odd is derived from a secret scalar, so the conditional
+    // negate must be branchless.  ct::point_neg + ct::point_select give that:
+    //   mask = all-1s when p_y_odd → select P_neg; mask = 0 → select P.
+    // No branch on infinity: generator_mul of a non-zero scalar is never ∞.
+    auto P = ct::generator_mul(kp.d);
+    auto [px, p_y_odd] = P.x_bytes_and_parity();
+    const std::uint64_t mask = ct::bool_to_mask(p_y_odd);
+    // CT-conditional Y-negation: cheaper than a second generator_mul.
+    auto P_ct     = ct::CTJacobianPoint::from_point(P);
+    auto P_neg_ct = ct::point_neg(P_ct);
+    auto P_even_ct = ct::point_select(P_neg_ct, P_ct, mask);
+    auto P_even = P_even_ct.to_point();
+    P_even.normalize();
+    pub.point = P_even;
+    pub.x_bytes = px;
+    return pub;
+}
+
+// -- BIP-340 Verify (fast, pre-cached pubkey) ---------------------------------
+// Skips lift_x sqrt (~1.6us savings). Same algorithm, just uses cached Point.
+
+bool schnorr_verify(const SchnorrXonlyPubkey& pubkey,
+                    const uint8_t* msg32,
+                    const SchnorrSignature& sig) noexcept {
+    // BIP-340 strict: s must be nonzero
+    if (sig.s.is_zero()) return false;
+
+    // BIP-340 strict: r < p
+    // Parse r bytes directly to 4x64 LE limbs, check against prime, then
+    // convert to FE52 in one shot -- no FieldElement intermediate object.
+    std::uint64_t rL[4];
+    if (!parse_and_check_lt_p(sig.r.data(), rL)) return false;
+
+    const auto e = schnorr_challenge_scalar(sig.r.data(), pubkey.x_bytes.data(), msg32);
+
+    // R = s*G - e*P  (direct Point -- no sqrt needed)
+    const auto neg_e = e.negate_var();  // e is public challenge — variable-time negate
+
+#if defined(SECP256K1_FAST_52BIT) && !defined(SECP256K1_USE_4X64_POINT_OPS)
+    // Fast path: use cached GLV P/phi(P) tables (skips ~1,954 ns table rebuild).
+    // flip_phi = (decomp_e.k1_neg != decomp_e.k2_neg) for neg_e scalar.
+    // Computed inside dual_scalar_mul_gen_prebuilt from GLV(neg_e).
+    const auto R = pubkey.tables_valid
+        ? Point::dual_scalar_mul_gen_prebuilt(sig.s, neg_e,
+                                               pubkey.tbl_P, pubkey.tbl_phi_base,
+                                               pubkey.Z_shared)
+        : Point::dual_scalar_mul_gen_point(sig.s, neg_e, pubkey.point);
+#else
+    const auto R = Point::dual_scalar_mul_gen_point(sig.s, neg_e, pubkey.point);
+#endif
+
+    if (R.is_infinity()) return false;
+
+    // Single affine conversion: Z^{-1} -> (x_aff, y_aff) -> check both.
+    // Since Y-parity requires Z^{-3} anyway, computing X from Z^{-2} is free.
+#if defined(SECP256K1_FAST_52BIT)
+    FE52 const z_inv = R.Z52().inverse_safegcd();
+    FE52 const z_inv2 = z_inv.square();
+    FE52 x_aff = R.X52() * z_inv2;       // magnitude 1
+    FE52 const z_inv3 = z_inv * z_inv2;
+    FE52 y_aff = R.Y52() * z_inv3;       // magnitude 1
+
+    // X-check: parse r directly to FE52 (no FieldElement intermediate)
+    const FE52 r52 = FE52::from_4x64_limbs(rL);
+    x_aff.negate_assign(1);               // magnitude 2
+    x_aff.add_assign(r52);                // magnitude 3 (r52 - x_aff)
+    const bool x_match = x_aff.normalizes_to_zero_var();
+
+    // Y-parity: must fully normalize to check lowest bit reliably.
+    y_aff.normalize();
+    return x_match & ((y_aff.n[0] & 1) == 0);
+#else
+    FieldElement r_fe_check = FieldElement::from_limbs_raw({rL[0], rL[1], rL[2], rL[3]});
+    FieldElement z_inv = R.z_raw().inverse();
+    FieldElement z_inv2 = z_inv;
+    z_inv2.square_inplace();
+    FieldElement x_aff = R.x_raw() * z_inv2;
+    FieldElement z_inv3 = z_inv * z_inv2;
+    FieldElement y_aff = R.y_raw() * z_inv3;
+    return (x_aff == r_fe_check) & ((y_aff.limbs()[0] & 1) == 0);
+#endif
+}
+
+// -- Variable-length message verify (libsecp256k1 API compat) ----------------
+// Matches secp256k1_schnorrsig_verify() which accepts any msglen.
+// For msglen == 32 use the fast fixed-length path; otherwise use varlen hash.
+bool schnorr_verify(const uint8_t* pubkey_x32,
+                    const uint8_t* msg, std::size_t msglen,
+                    const SchnorrSignature& sig) noexcept {
+    if (msglen == 32) return schnorr_verify(pubkey_x32, msg, sig);
+    if (sig.s.is_zero()) return false;
+    std::uint64_t rL[4];
+    if (!parse_and_check_lt_p(sig.r.data(), rL)) return false;
+    Point P = Point::infinity();
+    if (!lift_x_cached(pubkey_x32, P)) return false;
+    const auto e     = schnorr_challenge_scalar_varlen(sig.r.data(), pubkey_x32, msg, msglen);
+    const auto neg_e = e.negate_var();
+    const auto R     = Point::dual_scalar_mul_gen_point(sig.s, neg_e, P);
+    if (R.is_infinity()) return false;
+#if defined(SECP256K1_FAST_52BIT)
+    FE52 const z_inv  = R.Z52().inverse_safegcd();
+    FE52 const z_inv2 = z_inv.square();
+    FE52 x_aff        = R.X52() * z_inv2;
+    FE52 const z_inv3 = z_inv * z_inv2;
+    FE52 y_aff        = R.Y52() * z_inv3;
+    const FE52 r52 = FE52::from_4x64_limbs(rL);
+    x_aff.negate_assign(1);
+    x_aff.add_assign(r52);
+    const bool x_match = x_aff.normalizes_to_zero_var();
+    y_aff.normalize();
+    return x_match & ((y_aff.n[0] & 1) == 0);
+#else
+    FieldElement r_fe = FieldElement::from_limbs_raw({rL[0],rL[1],rL[2],rL[3]});
+    FieldElement z_inv = R.z_raw().inverse();
+    FieldElement z_inv2 = z_inv; z_inv2.square_inplace();
+    FieldElement x_aff = R.x_raw() * z_inv2;
+    FieldElement y_aff = R.y_raw() * (z_inv * z_inv2);
+    return (x_aff == r_fe) & ((y_aff.limbs()[0] & 1) == 0);
+#endif
+}
+
+// -- Array wrappers (delegate to raw-pointer implementations) -----------------
+
+bool schnorr_verify(const std::array<uint8_t, 32>& pubkey_x,
+                    const std::array<uint8_t, 32>& msg,
+                    const SchnorrSignature& sig) noexcept {
+    return schnorr_verify(pubkey_x.data(), msg.data(), sig);
+}
+
+bool schnorr_verify(const std::array<uint8_t, 32>& pubkey_x,
+                    const uint8_t* msg32,
+                    const SchnorrSignature& sig) noexcept {
+    return schnorr_verify(pubkey_x.data(), msg32, sig);
+}
+
+bool schnorr_verify(const SchnorrXonlyPubkey& pubkey,
+                    const std::array<uint8_t, 32>& msg,
+                    const SchnorrSignature& sig) noexcept {
+    return schnorr_verify(pubkey, msg.data(), sig);
+}
+
+} // namespace secp256k1

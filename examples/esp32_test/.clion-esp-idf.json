@@ -1,0 +1,13 @@
+{
+  "idfPath": "C:/Espressif/frameworks/esp-idf-v5.5.1",
+  "pythonPath": "C:/Espressif/python_env/idf5.5_py3.12_env/Scripts/python.exe",
+  "toolsPath": "C:/Espressif",
+  "target": "esp32s3",
+  "port": "COM3",
+  "baudRate": 115200,
+  "flashBaudRate": 460800,
+  "flashMode": "dio",
+  "flashSize": "2MB",
+  "flashFreq": "80m"
+}
+

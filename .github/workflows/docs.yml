@@ -1,0 +1,60 @@
+# ============================================================================
+# Generate API documentation via Doxygen and deploy to GitHub Pages
+# ============================================================================
+name: Docs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-docs
+  cancel-in-progress: true
+
+jobs:
+  docs:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write  # peaceiris/actions-gh-pages requires contents:write to push gh-pages branch
+
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Doxygen
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y doxygen
+
+      - name: Inject version into docs/Doxyfile
+        run: |
+          VERSION=$(cat VERSION.txt 2>/dev/null || echo "dev")
+          sed -i "s/^PROJECT_NUMBER.*/PROJECT_NUMBER         = ${VERSION}/" docs/Doxyfile
+          echo "docs/Doxyfile PROJECT_NUMBER = ${VERSION}"
+
+      - name: Generate documentation
+        run: doxygen docs/Doxyfile
+
+      - name: Build CAAS audit dashboard (H-9)
+        run: |
+          mkdir -p docs/generated/html/dashboard
+          python3 ci/caas_dashboard.py -o docs/generated/html/dashboard/index.html \
+            || python3 ci/render_audit_dashboard.py -o docs/generated/html/dashboard/index.html \
+            || echo "<html><body>Dashboard build skipped.</body></html>" \
+               > docs/generated/html/dashboard/index.html
+
+      - name: Deploy to GitHub Pages (gh-pages branch)
+        uses: peaceiris/actions-gh-pages@4f9cc6602d3f66b9c108549d475ec49e8ef4d45e # v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: docs/generated/html
+          destination_dir: docs
+          keep_files: true

@@ -1,0 +1,2318 @@
+==============================================================
+  BASELINE BENCHMARKS — 2026-03-21T15:18:07+00:00
+  Before: fe_batch_inverse zero-safety, 4-stream WNAF fix,
+          OpenMP parallel batch, MuSig2 validation, Toom-Cook-3
+==============================================================
+
+=== BENCH_UNIFIED ===
+  CPU frequency warmup (3000 ms heavy load)... stable at 2.496 GHz (487317 k*G ops)
+Running integrity check... OK
+
+======================================================================
+  UltrafastSecp256k1 -- Unified Apple-to-Apple Benchmark
+======================================================================
+
+  CPU:       Intel(R) Core(TM) i5-14400F
+  TSC freq:  2.502 GHz
+  Core:      1 (pinned to core 0, priority elevated)
+  Compiler:  Clang 19.1.7 (++20250804090312+cd708029e0b2-1~exp1~20250804210325.79)
+  Arch:      x86-64
+  Ultra:     UltrafastSecp256k1
+  libsecp:   bitcoin-core libsecp256k1 v0.7.x
+  Harness:   3s CPU ramp-up, 500 warmup/op, 11 passes, IQR outlier removal, median
+  Timer:     RDTSCP
+  Pool:      64 independent key/msg/sig sets
+  NOTE:      Both Ultra and libsecp use IDENTICAL harness
+
++----------------------------------------------+------------+
+| FIELD ARITHMETIC (Ultra)                     |      ns/op |
++----------------------------------------------+------------+
+| field_mul                                    |       10.0 |
+| field_sqr                                    |        9.0 |
+| field_inv                                    |      737.3 |
+| field_add                                    |        5.4 |
+| field_sub                                    |        5.7 |
+| field_negate                                 |        5.4 |
+| field_from_bytes (32B)                       |        2.4 |
++----------------------------------------------+------------+
+
++----------------------------------------------+------------+
+| SCALAR ARITHMETIC (Ultra)                    |      ns/op |
++----------------------------------------------+------------+
+| scalar_mul                                   |       15.6 |
+| scalar_inv                                   |      793.0 |
+| scalar_add                                   |        5.4 |
+| scalar_negate                                |        5.2 |
+| scalar_from_bytes (32B)                      |        2.4 |
++----------------------------------------------+------------+
+
++----------------------------------------------+------------+
+| POINT ARITHMETIC (Ultra)                     |      ns/op |
++----------------------------------------------+------------+
+| pubkey_create (k*G)                          |     5742.1 |
+| scalar_mul (k*P)                             |    17776.8 |
+| scalar_mul_with_plan                         |    17951.2 |
+| dual_mul (a*G + b*P)                         |    21855.4 |
+| point_add (affine+affine)                    |      977.0 |
+| point_add (J+A mixed)                        |      140.1 |
+| point_dbl                                    |       79.7 |
+| normalize (J->affine)                        |        1.3 |
+| batch_normalize /pt (N=64)                   |       15.9 |
+| next_inplace (+=G)                           |      149.2 |
+| KPlan::from_scalar(w=4)                      |     1012.4 |
++----------------------------------------------+------------+
+
++----------------------------------------------+------------+
+| POINT SERIALIZATION (Ultra)                  |      ns/op |
++----------------------------------------------+------------+
+| to_compressed (33B)                          |        2.6 |
+| to_uncompressed (65B)                        |        3.3 |
+| x_only_bytes (32B)                           |        1.8 |
+| x_bytes_and_parity                           |        2.4 |
+| has_even_y                                   |        1.0 |
+| batch_to_compressed /pt (N=64)               |        1.5 |
+| batch_x_only_bytes /pt (N=64)                |        1.6 |
++----------------------------------------------+------------+
+
++----------------------------------------------+------------+
+| ECDSA -- Ultra FAST                          |      ns/op |
++----------------------------------------------+------------+
+| ecdsa_sign                                   |     7619.6 |
+| ecdsa_sign_verified                          |    37093.1 |
+| ecdsa_verify                                 |    20755.7 |
++----------------------------------------------+------------+
+
++----------------------------------------------+------------+
+| SCHNORR / BIP-340 -- Ultra FAST              |      ns/op |
++----------------------------------------------+------------+
+| schnorr_keypair_create                       |     5942.9 |
+| schnorr_sign                                 |     5966.9 |
+| schnorr_sign_verified                        |    28683.0 |
+| schnorr_verify (cached xonly)                |    20966.7 |
+| schnorr_verify (raw bytes)                   |    22115.9 |
++----------------------------------------------+------------+
+
++----------------------------------------------+------------+
+| MICRO-DIAGNOSTICS (sub-ops)                  |      ns/op |
++----------------------------------------------+------------+
+| Scalar::from_bytes (32B->scalar)             |        2.4 |
+| Scalar::inverse (safegcd)                    |      793.7 |
+| Scalar::mul                                  |       15.7 |
+| Scalar::negate                               |        5.2 |
+| glv_decompose                                |       83.1 |
+| Point::dbl (jac52_double)                    |       59.6 |
+| Point::add (J+A mixed)                       |      123.9 |
+| dual_scalar_mul_gen_point                    |    19413.2 |
+| FE52::from_4x64_limbs                        |        0.2 |
+| FE52::mul (52-bit)                           |       14.0 |
+| FE52::sqr (52-bit)                           |       13.2 |
+| FE52::inverse_safegcd                        |      726.1 |
+| FE52::inverse (Fermat)                       |     3410.2 |
+|   -> SafeGCD/Fermat speedup                  |     4.70x  |
+| FE52::add (52-bit)                           |        0.4 |
+| FE52::negate (52-bit)                        |        0.3 |
+| FE52::normalize                              |        3.2 |
+| SHA256 (BIP0340/challenge)                   |       62.3 |
+| tagged_hash (recompute tag)                  |      150.2 |
+| cached_tagged_hash (midstate)                |       61.1 |
+|   -> midstate speedup                        |     2.46x  |
+| lift_x (4x64 sqrt)                           |     4923.8 |
+| lift_x (FE52 sqrt)                           |     3413.6 |
+|   -> FE52/4x64 speedup                       |     1.44x  |
+| FE::parse_bytes_strict                       |        3.6 |
++----------------------------------------------+------------+
+
+  ---- VERIFY COST DECOMPOSITION ----
+  ECDSA verify breakdown (estimated):
+    scalar_inv (1x):              793.7 ns
+    scalar_mul (2x):               31.4 ns
+    dual_scalar_mul:            19413.2 ns
+    from_bytes + overhead:          2.4 ns
+    --------------------------------
+    SUM (sub-ops):              20240.7 ns
+    MEASURED ecdsa_verify:      20755.7 ns
+    UNEXPLAINED gap:              515.0 ns  (2.5%)
+
+  Schnorr verify breakdown (estimated):
+    SHA256 challenge:          (included in total)
+    scalar_negate:                  5.2 ns
+    dual_scalar_mul:            19413.2 ns
+    lift_x (sqrt):             (included in total)
+    from_bytes:                     2.4 ns
+    --------------------------------
+    SUM (sub-ops, partial):     19420.8 ns
+    MEASURED schnorr_verify:    20966.7 ns
+    UNEXPLAINED gap:             1545.9 ns  (SHA256+lift_x+Z-check)
+
+  Verify vs libsecp breakdown:
+    Our dual_mul:               19413.2 ns
+    Our scalar_inv:               793.7 ns
+    Our dual+inv:               20206.9 ns
+    Total ECDSA verify:         20755.7 ns
+    Overhead (verify - d+i):      548.8 ns
+
+  ---- SIGN COST DECOMPOSITION (FAST path) ----
+  ecdsa_sign = RFC6979 + k*G + field_inv + scalar_inv + scalar_muls
+    k*G (generator_mul):         5742.1 ns
+    field_inv (R.x):              737.3 ns
+    scalar_inv (k^-1):            793.7 ns
+    scalar_mul (2x):               31.4 ns
+    --------------------------------
+    Core signing (no RFC6979):    7304.5 ns
+    MEASURED ecdsa_sign:          7619.6 ns
+    RFC6979 overhead:              315.1 ns  (4.1%)
+    MEASURED ecdsa_sign_verified:37093.1 ns
+    sign-then-verify overhead:   29473.4 ns  (pubkey + verify)
+
++----------------------------------------------+------------+
+| BATCH VERIFICATION (FAST)                    |      ns/op |
++----------------------------------------------+------------+
+| schnorr_batch_verify(N=4)                    |    81149.3 |
+|   -> per-sig amortized (N=4)                 |    20287.3 |
+|   -> speedup vs individual                   |     1.03x  |
+| schnorr_batch_verify(cached,N=4)             |    80295.4 |
+|   -> per-sig cached (N=4)                    |    20073.9 |
+|   -> cached speedup vs individual            |     1.04x  |
+| schnorr_batch_verify(N=16)                   |   327776.3 |
+|   -> per-sig amortized (N=16)                |    20486.0 |
+|   -> speedup vs individual                   |     1.02x  |
+| schnorr_batch_verify(cached,N=16)            |   328054.5 |
+|   -> per-sig cached (N=16)                   |    20503.4 |
+|   -> cached speedup vs individual            |     1.02x  |
+| schnorr_batch_verify(N=64)                   |  1405971.7 |
+|   -> per-sig amortized (N=64)                |    21968.3 |
+|   -> speedup vs individual                   |     0.95x  |
+| schnorr_batch_verify(cached,N=64)            |  1359405.4 |
+|   -> per-sig cached (N=64)                   |    21240.7 |
+|   -> cached speedup vs individual            |     0.99x  |
+| schnorr_batch_verify(N=128)                  |  2753482.9 |
+|   -> per-sig amortized (N=128)               |    21511.6 |
+|   -> speedup vs individual                   |     0.97x  |
+| schnorr_batch_verify(cached,N=128)           |  2639680.3 |
+|   -> per-sig cached (N=128)                  |    20622.5 |
+|   -> cached speedup vs individual            |     1.02x  |
+| schnorr_batch_verify(N=192)                  |  3644666.8 |
+|   -> per-sig amortized (N=192)               |    18982.6 |
+|   -> speedup vs individual                   |     1.10x  |
+| schnorr_batch_verify(cached,N=192)           |  3574274.2 |
+|   -> per-sig cached (N=192)                  |    18616.0 |
+|   -> cached speedup vs individual            |     1.13x  |
+|                                              |            |
+| ecdsa_batch_verify(N=4)                      |    87032.4 |
+|   -> per-sig amortized (N=4)                 |    21758.1 |
+|   -> speedup vs individual                   |     0.95x  |
+| ecdsa_batch_verify(N=16)                     |   316332.4 |
+|   -> per-sig amortized (N=16)                |    19770.8 |
+|   -> speedup vs individual                   |     1.05x  |
+| ecdsa_batch_verify(N=64)                     |  1281665.0 |
+|   -> per-sig amortized (N=64)                |    20026.0 |
+|   -> speedup vs individual                   |     1.04x  |
+| ecdsa_batch_verify(N=128)                    |  2589554.2 |
+|   -> per-sig amortized (N=128)               |    20230.9 |
+|   -> speedup vs individual                   |     1.03x  |
+| ecdsa_batch_verify(N=192)                    |  3806161.9 |
+|   -> per-sig amortized (N=192)               |    19823.8 |
+|   -> speedup vs individual                   |     1.05x  |
++----------------------------------------------+------------+
+
++----------------------------------------------+------------+
+| CT POINT ARITHMETIC (sub-ops)                |      ns/op |
++----------------------------------------------+------------+
+| ct::scalar_inverse (SafeGCD)                 |     1663.6 |
+| ct::generator_mul (k*G)                      |     9875.1 |
+| ct::scalar_mul (k*P)                         |    22621.1 |
+| ct::point_dbl                                |       84.9 |
+| ct::point_add_complete (11M+6S)              |      220.9 |
+| ct::point_add_mixed_complete (7M+5S)         |      141.2 |
+| ct::point_add_mixed_unified (7M+5S)          |      149.2 |
++----------------------------------------------+------------+
+
+  ---- CT vs FAST point ops ----
+  FAST Point::dbl                          59.6 ns
+  FAST Point::add                         123.9 ns
+  FAST pubkey_create (k*G)               5742.1 ns
+  FAST scalar_mul (k*P)                 17776.8 ns
+  CT   generator_mul (k*G)               9875.1 ns
+  CT   scalar_mul (k*P)                 22621.1 ns
+  CT/FAST ratio (k*G):  1.72x overhead
+  CT/FAST ratio (k*P):  1.27x overhead
+
++----------------------------------------------+------------+
+| CT SIGNING (Ultra CT)                        |      ns/op |
++----------------------------------------------+------------+
+| ct::ecdsa_sign                               |    12199.2 |
+|   CT overhead (ECDSA)                        |      1.60x |
+| ct::ecdsa_sign_verified                      |    42627.5 |
+| ct::schnorr_sign                             |    10179.5 |
+|   CT overhead (Schnorr)                      |      1.71x |
+| ct::schnorr_sign_verified                    |    32581.5 |
+| ct::schnorr_keypair_create                   |    10144.4 |
+|   CT overhead (keypair)                      |      1.71x |
++----------------------------------------------+------------+
+
+  ---- CT ECDSA SIGN DECOMPOSITION ----
+    ct::generator_mul (R=k*G):   9875.1 ns
+    ct::scalar_inverse (k^-1):   1663.6 ns
+    field_inv (R.x affine):       737.3 ns
+    scalar_mul (2x):               31.4 ns
+    --------------------------------
+    SUM (sub-ops):              12307.5 ns
+    MEASURED ct::ecdsa_sign:    12199.2 ns
+    UNEXPLAINED gap:             -108.3 ns  (-0.9%, RFC6979+checks)
+
+  ---- CT SCHNORR SIGN DECOMPOSITION ----
+    ct::generator_mul (R=k*G):   9875.1 ns
+    SHA256 (tag+nonce+msg):    (included in total)
+    scalar_mul + negate:           20.9 ns
+    --------------------------------
+    SUM (sub-ops, partial):      9896.1 ns
+    MEASURED ct::schnorr_sign:  10179.5 ns
+    UNEXPLAINED gap:              283.5 ns  (SHA256+aux+serialize)
+
+  ---- CT vs libsecp (true apples-to-apples) ----
+  CT   ecdsa_sign                       12199.2 ns
+  lib  ecdsa_sign                      (measured after libsecp section)
+  CT   schnorr_sign                     10179.5 ns
+  lib  schnorr_sign                    (measured after libsecp section)
+
++----------------------------------------------+------------+
+| ETHEREUM OPERATIONS                          |      ns/op |
++----------------------------------------------+------------+
+| keccak256 (32B)                              |      221.3 |
+| ethereum_address                             |      244.8 |
+| eip191_hash                                  |      241.1 |
+| eth_sign_hash                                |     8463.5 |
+| ecdsa_sign_recoverable                       |     7571.9 |
+| ecrecover                                    |    27436.0 |
+| eth_personal_sign                            |     7939.0 |
+| ethereum_address_eip55                       |      546.7 |
++----------------------------------------------+------------+
+
++----------------------------------------------+------------+
+| REAL-WORLD FLOWS                             |      ns/op |
++----------------------------------------------+------------+
+| ecdh_compute (SHA256 shared secret)          |    23914.9 |
+| ecdh_compute_raw (x-only shared)             |    21733.5 |
+| taproot_output_key (BIP-341 key path)        |    11361.1 |
+| taproot_tweak_privkey (BIP-341)              |    10586.3 |
+| bip32_master_key (64B seed)                  |     1057.3 |
+| bip32_coin_derive_key (BTC m/84'/0'/0'/0/0)  |    78187.6 |
+| coin_address_from_seed (BTC end-to-end)      |    86525.2 |
+| coin_address_from_seed (ETH end-to-end)      |    87632.7 |
+| silent_payment_create_output                 |    26837.1 |
+| silent_payment_scan (single output set)      |    37184.1 |
++----------------------------------------------+------------+
+
+Running libsecp256k1 benchmark (same harness: RDTSCP, 3s ramp-up, 500 warmup, 11 passes, IQR)...
++----------------------------------------------+------------+
+| libsecp256k1 (bitcoin-core)                  |      ns/op |
++----------------------------------------------+------------+
+| field_mul                                    |       10.8 |
+| field_sqr                                    |        8.7 |
+| field_inv_var                                |      756.4 |
+| field_add                                    |        1.6 |
+| field_negate                                 |        1.1 |
+| field_normalize                              |        4.9 |
+| field_from_bytes (set_b32)                   |        3.3 |
+| scalar_mul                                   |       18.4 |
+| scalar_inverse (CT)                          |     1644.7 |
+| scalar_inverse_var                           |      885.9 |
+| scalar_add                                   |        5.4 |
+| scalar_negate                                |        2.1 |
+| scalar_from_bytes (set_b32)                  |        3.2 |
+| point_dbl (gej_double_var)                   |       78.5 |
+| point_add (gej_add_ge_var)                   |      137.0 |
+| ecmult (a*P + b*G, Strauss)                  |    19078.5 |
+| ecmult_gen (k*G, comb)                       |     9903.0 |
+| generator_mul (ec_pubkey_create)             |    11463.4 |
+| scalar_mul_P (k*P, tweak_mul)                |    18280.6 |
+| serialize_compressed (33B)                   |       12.7 |
+| serialize_uncompressed (65B)                 |       12.7 |
+| point_add (pubkey_combine)                   |     1903.0 |
+| ecdsa_sign                                   |    15999.1 |
+| ecdsa_verify                                 |    20007.6 |
+| schnorr_keypair_create                       |    13033.7 |
+| schnorr_sign (BIP-340)                       |    12522.2 |
+| schnorr_verify (BIP-340)                     |    20710.2 |
++----------------------------------------------+------------+
+
+Running OpenSSL benchmark (OpenSSL 3.0.13 30 Jan 2024, same harness)...
++----------------------------------------------+------------+
+| OpenSSL (ECDSA, secp256k1)                   |      ns/op |
++----------------------------------------------+------------+
+| generator_mul (EC_POINT_mul k*G)             |   222762.7 |
+| ecdsa_sign (ECDSA_do_sign)                   |   221895.5 |
+| ecdsa_verify (ECDSA_do_verify)               |   212797.4 |
++----------------------------------------------+------------+
+  (OpenSSL has no BIP-340 Schnorr -- ECDSA-only comparison)
+
+======================================================================
+  HEAD-TO-HEAD: UltrafastSecp256k1 vs libsecp256k1
+  (ratio > 1.0 = Ultra wins, < 1.0 = libsecp wins)
+======================================================================
+
++------------------------------------+----------+----------+-----------+
+| FIELD ARITHMETIC                   | Ultra ns |  libsecp |     ratio |
++------------------------------------+----------+----------+-----------+
+| mul                                |     10.0 |     10.8 |     1.08x |
+| sqr                                |      9.0 |      8.7 |     0.97x |
+| inv                                |    737.3 |    756.4 |     1.03x |
+| add                                |      5.4 |      1.6 |     0.29x |
+| sub                                |      5.7 |      --- |       --- |
+| negate                             |      5.4 |      1.1 |     0.20x |
+| normalize (FE52)                   |      3.2 |      4.9 |     1.52x |
+| from_bytes (32B)                   |      2.4 |      3.3 |     1.36x |
+| FE52 add (hot path)                |      0.4 |      1.6 |     3.91x |
+| FE52 neg (hot path)                |      0.3 |      1.1 |     3.19x |
++------------------------------------+----------+----------+-----------+
+
++------------------------------------+----------+----------+-----------+
+| SCALAR ARITHMETIC                  | Ultra ns |  libsecp |     ratio |
++------------------------------------+----------+----------+-----------+
+| mul                                |     15.6 |     18.4 |     1.18x |
+| inv (CT)                           |    793.7 |   1644.7 |     2.07x |
+| inv (var-time)                     |    793.7 |    885.9 |     1.12x |
+| add                                |      5.4 |      5.4 |     1.00x |
+| negate                             |      5.2 |      2.1 |     0.40x |
+| from_bytes (32B)                   |      2.4 |      3.2 |     1.33x |
++------------------------------------+----------+----------+-----------+
+
++------------------------------------+----------+----------+-----------+
+| POINT ARITHMETIC                   | Ultra ns |  libsecp |     ratio |
++------------------------------------+----------+----------+-----------+
+| dbl (Jacobian)                     |     79.7 |     78.5 |     0.99x |
+| add (mixed J+A)                    |    140.1 |    137.0 |     0.98x |
+| ecmult (a*P+b*G)                   |  21855.4 |  19078.5 |     0.87x |
+| ecmult_gen (k*G raw)               |   5742.1 |   9903.0 |     1.72x |
+| pubkey_create (API)                |   5742.1 |  11463.4 |     2.00x |
+| scalar_mul (k*P)                   |  17776.8 |  18280.6 |     1.03x |
+| scalar_mul (KPlan)                 |  17951.2 |  18280.6 |     1.02x |
+| point_add (combine)                |    977.0 |   1903.0 |     1.95x |
++------------------------------------+----------+----------+-----------+
+
++------------------------------------+----------+----------+-----------+
+| SERIALIZATION                      | Ultra ns |  libsecp |     ratio |
++------------------------------------+----------+----------+-----------+
+| compressed (33B)                   |      2.6 |     12.7 |     4.86x |
+| uncompressed (65B)                 |      3.3 |     12.7 |     3.88x |
++------------------------------------+----------+----------+-----------+
+
++------------------------------------+----------+----------+-----------+
+| SIGNING (FAST vs libsecp CT)       | Ultra ns |  libsecp |     ratio |
++------------------------------------+----------+----------+-----------+
+| ECDSA Sign                         |   7619.6 |  15999.1 |     2.10x |
+| Schnorr Sign                       |   5966.9 |  12522.2 |     2.10x |
+| Schnorr Keypair                    |   5942.9 |  13033.7 |     2.19x |
++------------------------------------+----------+----------+-----------+
+
++------------------------------------+----------+----------+-----------+
+| VERIFICATION                       | Ultra ns |  libsecp |     ratio |
++------------------------------------+----------+----------+-----------+
+| ECDSA Verify                       |  20755.7 |  20007.6 |     0.96x |
+| Schnorr Verify (cached)            |  20966.7 |  20710.2 |     0.99x |
+| Schnorr Verify (raw)               |  22115.9 |  20710.2 |     0.94x |
++------------------------------------+----------+----------+-----------+
+
++------------------------------------+----------+----------+-----------+
+| CT-vs-CT (fair signing)            | Ultra ns |  libsecp |     ratio |
++------------------------------------+----------+----------+-----------+
+| ECDSA Sign                         |  12199.2 |  15999.1 |     1.31x |
+| Schnorr Sign                       |  10179.5 |  12522.2 |     1.23x |
+| ECDSA Verify                       |  20755.7 |  20007.6 |     0.96x |
+| Schnorr Verify                     |  22115.9 |  20710.2 |     0.94x |
++------------------------------------+----------+----------+-----------+
+
++------------------------------------+----------+----------+-----------+
+| ETHEREUM / RECOVERY                | Ultra ns |  libsecp |     ratio |
++------------------------------------+----------+----------+-----------+
+| sign_recoverable                   |   7571.9 |  15855.5 |     2.09x |
+| ecrecover                          |  27436.0 |  24528.9 |     0.89x |
+| eth_sign_hash                      |   8463.5 |  15855.5 |     1.87x |
+| eth_personal_sign                  |   7939.0 |  15855.5 |     2.00x |
++------------------------------------+----------+----------+-----------+
+
+======================================================================
+  APPLE-TO-APPLE: UltrafastSecp256k1 / OpenSSL
+  (ratio > 1.0 = Ultra wins, < 1.0 = OpenSSL wins)
+======================================================================
+
++----------------------------------------------+------------+
+| FAST path (Ultra FAST vs OpenSSL)            |      ratio |
++----------------------------------------------+------------+
+| Generator * k                                |     38.79x |
+| ECDSA Sign                                   |     29.12x |
+| ECDSA Verify                                 |     10.25x |
++----------------------------------------------+------------+
+
++----------------------------------------------+------------+
+| CT path (Ultra CT vs OpenSSL)                |      ratio |
++----------------------------------------------+------------+
+| ECDSA Sign (CT vs CT)                        |     18.19x |
+| ECDSA Verify                                 |     10.25x |
++----------------------------------------------+------------+
+
++----------------------------------------------+------------+
+| ZK Proofs & Commitments                      |      ns/op |
++----------------------------------------------+------------+
+| Pedersen commit                              |    28844.4 |
+| Knowledge prove (sigma)                      |    21987.9 |
+| Knowledge verify                             |    24544.9 |
+| DLEQ prove                                   |    41255.2 |
+| DLEQ verify                                  |    59182.4 |
+| Bulletproof range_prove (64b)                | 14090864.9 |
+| Bulletproof range_verify (64b)               |  1545398.0 |
++----------------------------------------------+------------+
+
+======================================================================
+  THROUGHPUT SUMMARY (1 core, pinned)
+======================================================================
+
+  --- Ultra FAST ---
+  ECDSA sign                                 7.62 us  ->     131.2 k op/s
+  ECDSA verify                              20.76 us  ->      48.2 k op/s
+  Schnorr sign                               5.97 us  ->     167.6 k op/s
+  Schnorr verify (cached)                   20.97 us  ->      47.7 k op/s
+  Schnorr verify (raw)                      22.12 us  ->      45.2 k op/s
+  pubkey_create (k*G)                        5.74 us  ->     174.2 k op/s
+  ECDH                                      23.91 us  ->      41.8 k op/s
+  Taproot output key                        11.36 us  ->      88.0 k op/s
+  BIP32 derive (BTC)                        78.19 us  ->      12.8 k op/s
+  Silent Payment sender                     26.84 us  ->      37.3 k op/s
+  Silent Payment scan                       37.18 us  ->      26.9 k op/s
+
+  --- Ultra CT ---
+  CT ECDSA sign                             12.20 us  ->      82.0 k op/s
+  CT Schnorr sign                           10.18 us  ->      98.2 k op/s
+
+  --- Ultra ZK ---
+  Pedersen commit                           28.84 us  ->      34.7 k op/s
+  Knowledge prove                           21.99 us  ->      45.5 k op/s
+  Knowledge verify                          24.54 us  ->      40.7 k op/s
+  DLEQ prove                                41.26 us  ->      24.2 k op/s
+  DLEQ verify                               59.18 us  ->      16.9 k op/s
+  Bulletproof range_prove                14090.86 us  ->        71   op/s
+  Bulletproof range_verify                1545.40 us  ->       647   op/s
+
+  --- libsecp256k1 ---
+  field_mul                                  0.01 us  ->     92.53 M op/s
+  field_sqr                                  0.01 us  ->    115.29 M op/s
+  field_inv_var                              0.76 us  ->      1.32 M op/s
+  scalar_mul                                 0.02 us  ->     54.32 M op/s
+  scalar_inverse (CT)                        1.64 us  ->     608.0 k op/s
+  scalar_inverse_var                         0.89 us  ->      1.13 M op/s
+  point_dbl                                  0.08 us  ->     12.73 M op/s
+  point_add (mixed)                          0.14 us  ->      7.30 M op/s
+  ecmult (a*P+b*G)                          19.08 us  ->      52.4 k op/s
+  ecmult_gen (k*G raw)                       9.90 us  ->     101.0 k op/s
+  generator_mul (API)                       11.46 us  ->      87.2 k op/s
+  scalar_mul_P (k*P)                        18.28 us  ->      54.7 k op/s
+  ECDSA sign                                16.00 us  ->      62.5 k op/s
+  ECDSA verify                              20.01 us  ->      50.0 k op/s
+  Schnorr sign                              12.52 us  ->      79.9 k op/s
+  Schnorr verify                            20.71 us  ->      48.3 k op/s
+
+  --- OpenSSL ---
+  ECDSA sign                               221.90 us  ->       4.5 k op/s
+  ECDSA verify                             212.80 us  ->       4.7 k op/s
+  generator_mul (k*G)                      222.76 us  ->       4.5 k op/s
+
+======================================================================
+  BITCOIN BLOCK VALIDATION ESTIMATES (1 core)
+======================================================================
+
+  Pre-Taproot block (~3000 ECDSA verify):
+    Wall time:     62.3 ms
+    Blocks/sec:    16.1
+
+  Taproot block (~2000 Schnorr + ~1000 ECDSA):
+    Wall time:     65.0 ms
+    Blocks/sec:    15.4
+
+  TX throughput (1 core):
+    ECDSA:       48180 tx/sec
+    Schnorr:     45216 tx/sec
+
+======================================================================
+  Intel(R) Core(TM) i5-14400F | 1 core pinned | Clang 19.1.7 (++20250804090312+cd708029e0b2-1~exp1~20250804210325.79)
+  UltrafastSecp256k1 vs libsecp256k1 vs OpenSSL -- Unified Benchmark
+======================================================================
+
+
+=== BENCH_FIELD_52 ===
+[bench_field_52] Running arithmetic validation...
+[bench_field_52] Validation OK
+
+=================================================================
+  FieldElement (4x64) vs FieldElement52 (5x52) Benchmark
+=================================================================
+  Timer:    RDTSCP
+  Warmup:   500 iterations
+  Passes:   11 (IQR outlier removal + median)
+
+Operation                             4x64 (ns)  5x52 (ns)      Ratio
+------------------------------------ ---------- ---------- ----------
+
+--- Single Operations ---
+Addition (single)                        14.24       0.22    65.332x <-- 5x52 wins
+Multiplication (single)                  18.33       0.22    84.076x <-- 5x52 wins
+Squaring (single)                        17.72       0.22    81.276x <-- 5x52 wins
+Normalize (weak, 5x52 only)                N/A       5.47
+Normalize (full, 5x52 only)                N/A       5.47
+Negation                                 14.61       0.21    68.444x <-- 5x52 wins
+Half (5x52 only)                           N/A       0.22
+Convert 4x64 -> 5x52                       N/A       0.80
+Convert 5x52 -> 4x64                      7.11        N/A
+
+--- Addition Chains (Lazy-Reduction Core Advantage) ---
+Add chain (4 adds + norm)                72.42      19.14     3.785x <-- 5x52 wins
+Add chain (8 adds + norm)               135.79      19.29     7.038x <-- 5x52 wins
+Add chain (16 adds + norm)              261.47      19.11    13.683x <-- 5x52 wins
+Add chain (32 adds + norm)              533.30      21.96    24.283x <-- 5x52 wins
+Add chain (64 adds + norm)             1062.80      19.11    55.613x <-- 5x52 wins
+
+--- Mixed Chains (ECC Point Operation Simulation) ---
+Point-Add simulation (12M+4S+7A)        252.63     131.83     1.916x <-- 5x52 wins
+Sqr chain (256 squarings)              5978.09    2655.75     2.251x <-- 5x52 wins
+Mul+Add alternating (32 iters)         1369.15     486.55     2.814x <-- 5x52 wins
+Mul chain (32 muls)                     657.41     398.70     1.649x <-- 5x52 wins
+
+--- Throughput Summary ---
+Multiplication throughput              79.33 M/s   186.72 M/s   2.354x
+Addition throughput                   115.16 M/s   186.82 M/s   1.622x
+Squaring throughput                    83.55 M/s   186.99 M/s   2.238x
+
+=================================================================
+  Legend: Ratio = 4x64_time / 5x52_time  (>1 = 5x52 faster)
+  5x52 advantage: add chains (lazy), fewer carries
+  4x64 advantage: fewer limbs for mul (4 vs 5), no conversion
+=================================================================
+
+
+=== BENCH_CT ===
+================================================================
+  CT Layer Benchmark  (fast:: vs ct::)
+================================================================
+  Timer:    RDTSCP
+  Warmup:   500 iterations
+  Passes:   11 (IQR outlier removal + median)
+
+  Pool size: 32 random 256-bit scalars
+
+--- Field Arithmetic ---
+  field_mul    fast:    0.010 us   ct:    0.018 us   ratio: 1.86x
+  field_square fast:    0.009 us   ct:    0.019 us   ratio: 2.16x
+  field_inv    fast:    0.735 us   ct:    1.449 us   ratio: 1.97x
+
+--- Scalar Arithmetic ---
+  scalar_add   fast:    0.006 us   ct:    0.009 us   ratio: 1.46x
+  scalar_sub   fast:    0.006 us   ct:    0.009 us   ratio: 1.61x
+
+--- Point Operations ---
+  point_add    fast:    1.004 us   ct:    0.219 us   ratio: 0.22x
+  mixed_add    fast:    1.004 us   ct:    0.144 us   ratio: 0.14x
+  point_dbl    fast:    0.060 us   ct:    0.075 us   ratio: 1.26x
+
+--- Scalar Multiplication (k * P) ---
+  scalar_mul   fast:     17.6 us   ct:     20.3 us   ratio: 1.15x
+
+--- Generator Multiplication (k * G) ---
+  generator_mul fast:     5.6 us   ct:      9.1 us   ratio: 1.61x
+
+================================================================
+  Lower ratio = smaller CT overhead (1.0x = same speed)
+================================================================
+
+=== SELFTEST ===
+===============================================================
+  UltrafastSecp256k1 -- Unified Test Runner (ci)
+===============================================================
+
+[Phase 1] Library selftest (ci)...
+
+==============================================
+  SECP256K1 Library Self-Test
+==============================================
+  Mode:     ci
+  Seed:     0x53454350324b3147
+  Compiler: Clang 19.1.7
+  Platform: Linux x64
+  Build:    Release
+  ASM:      enabled
+  Repro:    Selftest(true, SelftestMode::ci, 0x53454350324b3147)
+
+Scalar Multiplication Tests:
+  Testing: Vector 1
+    PASS
+  Testing: Vector 2
+    PASS
+  Testing: Vector 3
+    PASS
+  Testing: Vector 4
+    PASS
+  Testing: Vector 5
+    PASS
+  Testing: 1*G (Generator)
+    PASS
+  Testing: 2*G
+    PASS
+  Testing: 3*G
+    PASS
+  Testing: 10*G
+    PASS
+  Testing: (n-1)*G = -G
+    PASS
+
+Point Addition Test:
+  Testing: 2*G + 3*G = 5*G
+    PASS
+
+Point Subtraction Test:
+  Testing: 5*G - 2*G = 3*G
+    PASS
+
+Field Arithmetic Test:
+    PASS
+
+Scalar Arithmetic Test:
+    PASS
+
+Point Group Identities:
+    PASS
+
+Point Serialization:
+    PASS
+
+Batch Inversion:
+    PASS
+
+Point Addition (constants): G + 2G = 3G
+    PASS
+
+Point Subtraction (constants): 3G - 2G = 1G
+    PASS
+
+Point Doubling (constants): 2*(5G) = 10G
+    PASS
+
+Point Negation (constants): -G = (n-1)*G
+    PASS
+
+Boundary Scalar KAT (limb/order edges):
+    PASS
+
+Field Limb Boundaries:
+    PASS
+
+Extended kG Vectors (4G-9G, 15G, 255G):
+    PASS
+
+Point Advanced (comm/assoc/mixed/dist/edge):
+    PASS
+
+Doubling chain vs scalar multiples (2^i * G):
+    PASS
+
+Large scalar cross-checks (fast vs affine):
+    PASS
+
+Squared scalars k^2 * G (fast vs affine):
+    PASS
+
+Batch Inversion (expanded 32 elems):
+    PASS
+
+Bilinearity: K*(Q+/-G) vs K*Q +/- K*G
+    PASS
+
+Batch Inverse Size Sweep:
+    PASS
+
+Fixed-K plan: with_plan vs direct scalar_mul
+    PASS
+
+Sequential increment: (Q+i*G)*K vs (Q*K)+i*(G*K)
+    PASS
+
+Fast kG vs Generic kG (small 1-20 + 20 random):
+    PASS
+
+Repeated Addition Consistency (k=2..10):
+    PASS
+
+Field Stress (normalization + random algebraic laws):
+    PASS
+
+Scalar Stress ((n-1)^2=1 + random algebraic laws):
+    PASS
+
+NAF/wNAF Encoding Validation:
+    PASS
+
+==============================================
+  Results: 39/39 tests passed (ci)
+  [OK] ALL TESTS PASSED
+==============================================
+
+[Phase 1] Selftest PASSED
+
+[Phase 2] Running 25 test modules...
+
+-- Module 1/25: field & scalar arithmetic --
+
++==========================================================+
+|  Comprehensive Field & Scalar Arithmetic Tests          |
++==========================================================+
+
+-- Field Multiplication --
+-- Field Square --
+-- Field Add / Sub --
+-- Field Normalization --
+-- Scalar Arithmetic --
+-- Scalar Encoding (NAF / wNAF) --
+
+==========================================================
+Results: 4237 passed, 0 failed
+All tests PASSED.
+
+-- PASSED --
+
+-- Module 2/25: arithmetic correctness --
+
++==========================================================+
+|  COMPREHENSIVE ARITHMETIC CORRECTNESS TESTS              |
++==========================================================+
+
++==========================================================+
+| TEST 1: K*G using scalar_mul() method                   |
++==========================================================+
+1*G: [OK] PASS
+2*G: [OK] PASS
+3*G: [OK] PASS
+4*G: [OK] PASS
+5*G: [OK] PASS
+6*G: [OK] PASS
+7*G: [OK] PASS
+8*G: [OK] PASS
+9*G: [OK] PASS
+10*G: [OK] PASS
+
+Result: 10/10 tests passed
+
++==========================================================+
+| TEST 2: K*G using repeated addition (G+G+...+G)         |
++==========================================================+
+1*G: scalar_mul vs repeated_add: [OK] EQUAL
+2*G: scalar_mul vs repeated_add: [OK] EQUAL
+3*G: scalar_mul vs repeated_add: [OK] EQUAL
+4*G: scalar_mul vs repeated_add: [OK] EQUAL
+5*G: scalar_mul vs repeated_add: [OK] EQUAL
+6*G: scalar_mul vs repeated_add: [OK] EQUAL
+7*G: scalar_mul vs repeated_add: [OK] EQUAL
+8*G: scalar_mul vs repeated_add: [OK] EQUAL
+9*G: scalar_mul vs repeated_add: [OK] EQUAL
+10*G: scalar_mul vs repeated_add: [OK] EQUAL
+
+Result: 10/10 tests passed
+
++==========================================================+
+| TEST 3: K*G using doubling (2*G, 4*G, 8*G, etc.)        |
++==========================================================+
+1*G (2^0): scalar_mul vs doubling: [OK] EQUAL
+2*G (2^1): scalar_mul vs doubling: [OK] EQUAL
+4*G (2^2): scalar_mul vs doubling: [OK] EQUAL
+8*G (2^3): scalar_mul vs doubling: [OK] EQUAL
+16*G (2^4): scalar_mul vs doubling: [OK] EQUAL
+32*G (2^5): scalar_mul vs doubling: [OK] EQUAL
+
+Result: 6/6 tests passed
+
++==========================================================+
+| TEST 4: Point Addition P1 + P2 Correctness              |
++==========================================================+
+G + G = 2*G: [OK] PASS
+G + 2*G = 3*G: [OK] PASS
+2*G + 2*G = 4*G: [OK] PASS
+2*G + 3*G = 5*G: [OK] PASS
+3*G + 3*G = 6*G: [OK] PASS
+3*G + 4*G = 7*G: [OK] PASS
+4*G + 4*G = 8*G: [OK] PASS
+5*G + 5*G = 10*G: [OK] PASS
+
+Result: 8/8 tests passed
+
++==========================================================+
+| TEST 5: K*Q for arbitrary point Q (K*Q correctness)     |
++==========================================================+
+1*(7*G) = 7*G: [OK] PASS
+2*(7*G) = 14*G: [OK] PASS
+3*(7*G) = 21*G: [OK] PASS
+4*(7*G) = 28*G: [OK] PASS
+5*(7*G) = 35*G: [OK] PASS
+10*(7*G) = 70*G: [OK] PASS
+
+Result: 6/6 tests passed
+
++==========================================================+
+| TEST 6: K*Q with random large scalars                   |
++==========================================================+
+Test 1/10: k2*(k1*G) = (k1*k2)*G: [OK] PASS
+Test 2/10: k2*(k1*G) = (k1*k2)*G: [OK] PASS
+Test 3/10: k2*(k1*G) = (k1*k2)*G: [OK] PASS
+Test 4/10: k2*(k1*G) = (k1*k2)*G: [OK] PASS
+Test 5/10: k2*(k1*G) = (k1*k2)*G: [OK] PASS
+Test 6/10: k2*(k1*G) = (k1*k2)*G: [OK] PASS
+Test 7/10: k2*(k1*G) = (k1*k2)*G: [OK] PASS
+Test 8/10: k2*(k1*G) = (k1*k2)*G: [OK] PASS
+Test 9/10: k2*(k1*G) = (k1*k2)*G: [OK] PASS
+Test 10/10: k2*(k1*G) = (k1*k2)*G: [OK] PASS
+
+Result: 10/10 tests passed
+
++==========================================================+
+| TEST 7: Distributive: k*(P1+P2) = k*P1 + k*P2           |
++==========================================================+
+k=3: k*(P1+P2) = k*P1 + k*P2: [OK] PASS
+k=4: k*(P1+P2) = k*P1 + k*P2: [OK] PASS
+k=5: k*(P1+P2) = k*P1 + k*P2: [OK] PASS
+k=6: k*(P1+P2) = k*P1 + k*P2: [OK] PASS
+k=7: k*(P1+P2) = k*P1 + k*P2: [OK] PASS
+
+Result: 5/5 tests passed
+
++==========================================================+
+|                    FINAL RESULT                          |
++==========================================================+
+|  Test Suites Passed: 7/7                                   |
++==========================================================+
+|  [OK] ALL ARITHMETIC OPERATIONS ARE CORRECT!               |
+|                                                          |
+|  * K*G works correctly with all methods                 |
+|  * P1 + P2 always produces correct results              |
+|  * K*Q works for arbitrary points and scalars           |
++==========================================================+
+-- PASSED --
+
+-- Module 3/25: scalar multiplication --
+
++==========================================================+
+|  Comprehensive Point/Scalar Multiplication Tests        |
++==========================================================+
+
+-- Known k*G Vectors (Bitcoin Reference) --
+-- Fast kG vs Generic kG --
+-- Large Scalars (2^32, 2^64, 2^128, 2^252, 2^255-1) --
+-- Repeated Addition k*G = G+G+...+G --
+-- Doubling Chain 2^k * G --
+-- Point Addition --
+-- K*Q Arbitrary Point --
+-- Random K*Q = (k1*k2)*G --
+-- Distributive k*(P+Q) = kP + kQ --
+-- Edge Cases --
+
+==========================================================
+Results: 319 passed, 0 failed
+All tests PASSED.
+
+-- PASSED --
+
+-- Module 4/25: constant-time layer --
+=== CT (Constant-Time) Layer Tests ===
+
+--- Field Arithmetic ---
+  PASS: field_add basic
+  PASS: field_sub basic
+  PASS: field_mul basic
+  PASS: field_sqr basic
+  PASS: field_neg: a + (-a) == 0
+  PASS: field_neg(0) == 0
+  PASS: field_inv: a * a^-1 == 1
+  PASS: field_normalize: small value unchanged
+--- Field Conditional Ops ---
+  PASS: field_cmov: mask=0 -> no change
+  PASS: field_cmov: mask=all-ones -> moved
+  PASS: field_cswap: mask=0 -> no swap
+  PASS: field_cswap: mask=all-ones -> swapped
+  PASS: field_select: mask=0 -> b
+  PASS: field_select: mask=all-ones -> a
+  PASS: field_cneg: mask=0 -> unchanged
+  PASS: field_cneg: mask=all-ones -> negated
+  PASS: field_is_zero(0) -> true
+  PASS: field_is_zero(1) -> false
+  PASS: field_eq: equal -> true
+  PASS: field_eq: not equal -> false
+--- Scalar Arithmetic ---
+  PASS: scalar_add basic
+  PASS: scalar_sub basic
+  PASS: scalar_neg: a + (-a) == 0
+  PASS: scalar_neg(0) == 0
+--- Scalar Conditional + Bit Access ---
+  PASS: scalar_cmov: mask=0 -> no change
+  PASS: scalar_cmov: mask=all-ones -> moved
+  PASS: scalar_bit(5, 0) == 1
+  PASS: scalar_bit(5, 1) == 0
+  PASS: scalar_bit(5, 2) == 1
+  PASS: scalar_bit(5, 3) == 0
+  PASS: scalar_window(0xAB, 0, 4) == 0xB
+  PASS: scalar_window(0xAB, 4, 4) == 0xA
+--- Complete Addition (edge cases) ---
+  PASS: complete_add: G + 2G == 3G
+  PASS: complete_add: G + G == 2G
+  PASS: complete_add: G + O == G
+  PASS: complete_add: O + G == G
+  PASS: complete_add: O + O == O
+  PASS: complete_add: G + (-G) == O
+--- CT Scalar Multiplication ---
+  PASS: CT scalar_mul: 1*G == G
+  PASS: CT scalar_mul: 2*G == fast 2*G
+  PASS: CT scalar_mul: 7*G == fast 7*G
+  PASS: CT scalar_mul: 0xDEADBEEF*G == fast
+  PASS: CT scalar_mul: 0*G == O
+--- CT Generator Multiplication ---
+  PASS: CT generator_mul(42) == fast 42*G
+--- CT On-Curve Check ---
+  PASS: generator is on curve
+  PASS: 12345*G is on curve
+--- CT Point Equality ---
+  PASS: point_eq(G, G) -> true
+  PASS: point_eq(G, 42*G) -> false
+  PASS: point_eq(O, O) -> true
+  PASS: point_eq(G, O) -> false
+--- CT + Fast Mixing ---
+  PASS: mixing: fast(100*G) -> CT(7*P) == 700*G
+--- CT Signing (ecdsa + schnorr) ---
+  PASS: ct::ecdsa_sign.r matches fast::ecdsa_sign.r
+  PASS: ct::ecdsa_sign.s matches fast::ecdsa_sign.s
+  PASS: ct::ecdsa_sign signature verifies
+  PASS: ct::ecdsa_sign(zero key) returns zero sig
+  PASS: ct::schnorr_keypair_create.px matches fast
+  PASS: ct::schnorr_sign.r matches fast::schnorr_sign.r
+  PASS: ct::schnorr_sign.s matches fast::schnorr_sign.s
+  PASS: ct::schnorr_sign signature verifies
+  PASS: ct::schnorr_pubkey(1) == G.x
+--- CT PrivateKey Overloads ---
+  PASS: PrivateKey::from_bytes(1) succeeds
+  PASS: ct::ecdsa_sign(PrivateKey).r == ct::ecdsa_sign(Scalar).r
+  PASS: ct::ecdsa_sign(PrivateKey).s == ct::ecdsa_sign(Scalar).s
+  PASS: ct::ecdsa_sign_verified(PrivateKey).r matches Scalar
+  PASS: ct::ecdsa_sign_verified(PrivateKey).s matches Scalar
+  PASS: PrivateKey::from_bytes(3) succeeds
+  PASS: ct::ecdsa_sign_hedged(PrivateKey).r matches Scalar
+  PASS: ct::ecdsa_sign_hedged(PrivateKey).s matches Scalar
+  PASS: ct::ecdsa_sign_hedged_verified(PrivateKey).r matches Scalar
+  PASS: ct::ecdsa_sign_hedged_verified(PrivateKey).s matches Scalar
+  PASS: PrivateKey::from_bytes(2) succeeds
+  PASS: ct::schnorr_pubkey(PrivateKey) matches Scalar
+  PASS: ct::schnorr_keypair_create(PrivateKey).px matches Scalar
+
+=== Results: 73 passed, 0 failed ===
+-- PASSED --
+
+-- Module 5/25: FAST≡CT equivalence --
+=== FAST == CT Equivalence Tests ===
+
+--- Boundary: ct::generator_mul vs fast generator mul ---
+--- Property: 64 random ct::generator_mul vs fast ---
+--- Property: 64 random ct::scalar_mul(P, k) vs fast ---
+--- Boundary: ct::scalar_mul edge scalars ---
+--- Property: 32 random ECDSA sign CT==FAST ---
+--- Property: 32 random Schnorr sign CT==FAST ---
+--- Schnorr pubkey CT==FAST (boundary + random) ---
+--- CT group law invariants ---
+
+=== CT Equivalence: 320 passed, 0 failed ===
+-- PASSED --
+
+-- Module 6/25: ECDSA + Schnorr --
+================================================================
+  ECDSA + Schnorr (BIP-340) Test Suite
+================================================================
+
+--- SHA-256 ---
+  [PASS] SHA256("abc") matches NIST vector
+  [PASS] SHA256("") matches NIST vector
+
+--- Scalar::inverse ---
+  [PASS] 7 * 7^{-1} = 1 mod n
+  [PASS] random * random^{-1} = 1 mod n
+  [PASS] inverse(0) = 0
+
+--- Scalar::negate ---
+  [PASS] a + (-a) = 0
+  [PASS] negate(0) = 0
+
+--- ECDSA Sign/Verify ---
+  [PASS] signature is non-zero
+  [PASS] signature has low-S (BIP-62)
+  [PASS] verify(sign(msg, priv), pub) = true
+  [PASS] verify with wrong message = false
+  [PASS] verify with wrong pubkey = false
+  [PASS] compact encoding round-trip
+  [PASS] DER encoding starts with SEQUENCE tag
+
+--- ECDSA Deterministic (RFC 6979) ---
+  [PASS] same key + message -> same signature (deterministic)
+  [PASS] different message -> different signature
+
+--- Tagged Hash (BIP-340) ---
+  [PASS] tagged_hash is deterministic
+  [PASS] different tags -> different hashes
+
+--- Schnorr BIP-340 Sign/Verify ---
+  [PASS] x-only pubkey is non-zero
+  [PASS] schnorr_verify(sign(msg, priv), pubkey) = true
+  [PASS] schnorr_verify with wrong message = false
+  [PASS] schnorr signature round-trip
+
+================================================================
+  Results: 22 / 22 passed
+================================================================
+-- PASSED --
+
+-- Module 7/25: multi-scalar & batch verify --
+=== Multi-Scalar Multiplication & Batch Verification Tests ===
+
+--- Shamir's Trick ---
+  [PASS] shamir_trick(7, G, 13, 5G) == 72G
+  [PASS] shamir_trick(0, P, b, Q) == b*Q
+  [PASS] shamir_trick(a, P, 0, Q) == a*P
+
+--- Multi-Scalar Multiplication ---
+  [PASS] multi_scalar_mul: 1 point
+  [PASS] multi_scalar_mul: 3 points (2G+6G+15G=23G)
+  [PASS] multi_scalar_mul: 0 points = infinity
+  [PASS] multi_scalar_mul: G + (-G) = infinity
+
+--- Schnorr Batch Verification ---
+  [PASS] Schnorr batch: 5 valid signatures pass
+  [PASS] Schnorr batch: individual verification agrees
+  [PASS] Schnorr batch: corrupted sig #2 detected
+  [PASS] Schnorr batch identify: correctly finds sig #2
+  [PASS] Schnorr batch: empty = true
+  [PASS] Schnorr batch: single entry pass
+  [PASS] Schnorr batch cached: parse x-only pubkeys
+  [PASS] Schnorr batch cached: valid signatures pass
+  [PASS] Schnorr batch cached: corrupted sig #2 detected
+  [PASS] Schnorr batch cached identify: correctly finds sig #2
+  [PASS] Schnorr batch cached: null pubkey rejected
+  [PASS] Schnorr batch cached identify: null pubkey reported invalid
+
+--- ECDSA Batch Verification ---
+  [PASS] ECDSA batch: 4 valid signatures pass
+  [PASS] ECDSA batch: corrupted sig #1 detected
+  [PASS] ECDSA batch identify: correctly finds sig #1
+
+=== Results: 22/22 passed ===
+-- PASSED --
+
+-- Module 8/25: BIP-32 HD derivation --
+=== BIP-32 HD Key Derivation Tests ===
+
+--- HMAC-SHA512 ---
+  [PASS] HMAC-SHA512 RFC 4231 TC2 matches
+
+--- BIP-32 Master Key ---
+  [PASS] Master key generation succeeds
+  [PASS] Master key is private
+  [PASS] Master depth = 0
+  [PASS] Master chain code matches BIP-32 TV1
+  [PASS] Master private key matches BIP-32 TV1
+
+--- BIP-32 Child Derivation ---
+  [PASS] Master key OK for derivation test
+  [PASS] m/0' derivation succeeds
+  [PASS] m/0' depth = 1
+  [PASS] m/0' is private
+  [PASS] m/0' chain code matches BIP-32 TV1
+  [PASS] to_public() returns public key
+  [PASS] m/0'/1 derivation succeeds
+  [PASS] m/0'/1 depth = 2
+
+--- BIP-32 Path Derivation ---
+  [PASS] Master key OK for path test
+  [PASS] Path m/0'/1 succeeds
+  [PASS] Path m/0'/1 depth = 2
+  [PASS] Path m/0'/1/2' succeeds
+  [PASS] Path m/0'/1/2' depth = 3
+  [PASS] Empty path fails
+  [PASS] Path not starting with 'm' fails
+
+--- BIP-32 Serialization ---
+  [PASS] Serialized key is 78 bytes
+  [PASS] Serialized version = xprv
+  [PASS] Serialized depth = 0
+  [PASS] Fingerprint is 4 bytes
+
+--- BIP-32 Seed Validation ---
+  [PASS] Seed < 16 bytes rejected
+  [PASS] 16-byte seed accepted
+  [PASS] 64-byte seed accepted
+
+=== Results: 28/28 passed ===
+-- PASSED --
+
+-- Module 9/25: BIP-32 official test vectors TV1-5 --
+=== BIP-32 Official Test Vectors (TV1-TV5) ===
+
+--- BIP-32 Test Vector 1 ---
+  [PASS] TV1: master key generation succeeds
+  [PASS] TV1 m: chain_code
+  [PASS] TV1 m: priv_key
+  [PASS] TV1 m: pub_key
+  [PASS] TV1 m/0': derivation succeeds
+  [PASS] TV1 m/0': chain_code
+  [PASS] TV1 m/0': priv_key
+  [PASS] TV1 m/0': pub_key
+  [PASS] TV1 m/0'/1: derivation succeeds
+  [PASS] TV1 m/0'/1: chain_code
+  [PASS] TV1 m/0'/1: priv_key
+  [PASS] TV1 m/0'/1: pub_key
+  [PASS] TV1 m/0'/1/2': derivation succeeds
+  [PASS] TV1 m/0'/1/2': chain_code
+  [PASS] TV1 m/0'/1/2': priv_key
+  [PASS] TV1 m/0'/1/2': pub_key
+  [PASS] TV1 m/0'/1/2'/2: derivation succeeds
+  [PASS] TV1 m/0'/1/2'/2: chain_code
+  [PASS] TV1 m/0'/1/2'/2: priv_key
+  [PASS] TV1 m/0'/1/2'/2: pub_key
+  [PASS] TV1 m/0'/1/2'/2/1000000000: derivation succeeds
+  [PASS] TV1 m/0'/1/2'/2/1000000000: chain_code
+  [PASS] TV1 m/0'/1/2'/2/1000000000: priv_key
+  [PASS] TV1 m/0'/1/2'/2/1000000000: pub_key
+
+--- BIP-32 Test Vector 2 ---
+  [PASS] TV2: master key generation succeeds
+  [PASS] TV2 m: chain_code
+  [PASS] TV2 m: priv_key
+  [PASS] TV2 m: pub_key
+  [PASS] TV2 m/0: derivation succeeds
+  [PASS] TV2 m/0: chain_code
+  [PASS] TV2 m/0: priv_key
+  [PASS] TV2 m/0: pub_key
+  [PASS] TV2 m/0/2147483647': derivation succeeds
+  [PASS] TV2 m/0/2147483647': chain_code
+  [PASS] TV2 m/0/2147483647': priv_key
+  [PASS] TV2 m/0/2147483647': pub_key
+  [PASS] TV2 m/0/2147483647'/1: derivation succeeds
+  [PASS] TV2 m/0/2147483647'/1: chain_code
+  [PASS] TV2 m/0/2147483647'/1: priv_key
+  [PASS] TV2 m/0/2147483647'/1: pub_key
+  [PASS] TV2 m/0/2147483647'/1/2147483646': derivation succeeds
+  [PASS] TV2 m/0/2147483647'/1/2147483646': chain_code
+  [PASS] TV2 m/0/2147483647'/1/2147483646': priv_key
+  [PASS] TV2 m/0/2147483647'/1/2147483646': pub_key
+  [PASS] TV2 m/0/2147483647'/1/2147483646'/2: derivation succeeds
+  [PASS] TV2 m/0/2147483647'/1/2147483646'/2: chain_code
+  [PASS] TV2 m/0/2147483647'/1/2147483646'/2: priv_key
+  [PASS] TV2 m/0/2147483647'/1/2147483646'/2: pub_key
+
+--- BIP-32 Test Vector 3 (leading zeros retention) ---
+  [PASS] TV3: master key generation succeeds
+  [PASS] TV3 m: chain_code
+  [PASS] TV3 m: priv_key
+  [PASS] TV3 m: pub_key
+  [PASS] TV3 m/0': derivation succeeds
+  [PASS] TV3 m/0': chain_code
+  [PASS] TV3 m/0': priv_key
+  [PASS] TV3 m/0': pub_key
+
+--- BIP-32 Test Vector 4 (leading zeros, hardened children) ---
+  [PASS] TV4: master key generation succeeds
+  [PASS] TV4 m: chain_code
+  [PASS] TV4 m: priv_key
+  [PASS] TV4 m: pub_key
+  [PASS] TV4 m/0': derivation succeeds
+  [PASS] TV4 m/0': chain_code
+  [PASS] TV4 m/0': priv_key
+  [PASS] TV4 m/0': pub_key
+  [PASS] TV4 m/0'/1': derivation succeeds
+  [PASS] TV4 m/0'/1': chain_code
+  [PASS] TV4 m/0'/1': priv_key
+  [PASS] TV4 m/0'/1': pub_key
+
+--- BIP-32 Test Vector 5 (serialization) ---
+  [PASS] TV5: master key generation succeeds
+  [PASS] TV5: serialized master is 78 bytes
+  [PASS] TV5: version bytes = xprv (0x0488ADE4)
+  [PASS] TV5: depth = 0
+  [PASS] TV5: parent fingerprint = 00000000
+  [PASS] TV5: child number = 00000000
+  [PASS] TV5: chain code in serialization matches TV1
+  [PASS] TV5: private key prefix = 0x00
+  [PASS] TV5: private key in serialization matches TV1
+  [PASS] TV5: serialized public key is 78 bytes
+  [PASS] TV5: public version bytes = xpub (0x0488B21E)
+  [PASS] TV5: m/0' derivation succeeds
+  [PASS] TV5: m/0' depth = 1 in serialization
+  [PASS] TV5: m/0' parent fingerprint = fingerprint(master)
+  [PASS] TV5: m/0' child number = 0x80000000
+
+--- BIP-32 Public Derivation Consistency ---
+  [PASS] PubDeriv: master key OK
+  [PASS] PubDeriv: m/0' OK
+  [PASS] PubDeriv: m/0'/1 (private) OK
+  [PASS] PubDeriv: to_public() is public
+  [PASS] PubDeriv: m/0'/1 (public) OK
+  [PASS] PubDeriv: private and public derivation yield same pubkey
+  [PASS] PubDeriv: chain codes match for private/public derivation
+
+=== BIP-32 Vectors: 90/90 passed ===
+-- PASSED --
+
+-- Module 10/25: BIP-39 mnemonic seed phrases --
+=== BIP-39 Mnemonic Seed Phrase Tests ===
+
+--- PBKDF2-HMAC-SHA512 ---
+  [PASS] PBKDF2-HMAC-SHA512 (c=1)
+  [PASS] PBKDF2-HMAC-SHA512 (c=2)
+
+--- Wordlist ---
+  [PASS] wordlist not null
+  [PASS] first word = abandon
+  [PASS] last word = zoo
+  [PASS] word[1] = ability
+  [PASS] word[100] = arrive
+
+--- Entropy to Mnemonic ---
+  [PASS] TV1: generate ok
+  [PASS] TV1: 128-bit zero entropy -> correct mnemonic
+  [PASS] TV2: generate ok
+  [PASS] TV2: 128-bit 0x7f entropy -> correct mnemonic
+  [PASS] TV3: generate ok
+  [PASS] TV3: 128-bit 0x80 entropy -> correct mnemonic
+  [PASS] TV4: generate ok
+  [PASS] TV4: 128-bit 0xff entropy -> correct mnemonic
+  [PASS] TV5: generate ok
+  [PASS] TV5: 256-bit zero entropy -> correct mnemonic
+  [PASS] TV6: generate ok
+  [PASS] TV6: 256-bit 0x7f entropy -> correct mnemonic
+  [PASS] TV7: generate ok
+  [PASS] TV7: 256-bit 0xff entropy -> correct mnemonic
+
+--- Mnemonic Validation ---
+  [PASS] valid 12-word mnemonic
+  [PASS] valid 12-word zoo mnemonic
+  [PASS] valid 24-word mnemonic
+  [PASS] invalid word rejected
+  [PASS] bad checksum rejected
+  [PASS] 3-word mnemonic rejected
+  [PASS] empty mnemonic rejected
+
+--- Mnemonic to Seed ---
+  [PASS] TV1 seed: derivation ok
+  [PASS] TV1 seed: matches Trezor vector
+  [PASS] TV5 seed: derivation ok
+  [PASS] TV5 seed: matches Trezor vector
+  [PASS] no-passphrase seed: derivation ok
+  [PASS] no-passphrase seed: correct
+
+--- Mnemonic to Entropy ---
+  [PASS] roundtrip: generate ok
+  [PASS] roundtrip: decode ok
+  [PASS] roundtrip: entropy length = 16
+  [PASS] roundtrip: entropy matches
+  [PASS] roundtrip-256: generate ok
+  [PASS] roundtrip-256: decode ok
+  [PASS] roundtrip-256: entropy length = 32
+  [PASS] roundtrip-256: entropy matches
+
+--- Random Generation ---
+  [PASS] random 12-word generation ok
+  [PASS] random 12-word validates
+  [PASS] random 24-word generation ok
+  [PASS] random 24-word validates
+  [PASS] 15-byte entropy rejected
+  [PASS] 33-byte entropy rejected
+
+--- Edge Cases ---
+  [PASS] 160-bit entropy generates ok
+  [PASS] 160-bit entropy -> 15 words
+  [PASS] 160-bit mnemonic validates
+  [PASS] 192-bit entropy generates ok
+  [PASS] 192-bit entropy -> 18 words
+  [PASS] 192-bit mnemonic validates
+  [PASS] 224-bit entropy generates ok
+  [PASS] 224-bit entropy -> 21 words
+  [PASS] 224-bit mnemonic validates
+
+=== Results: 57/57 passed ===
+-- PASSED --
+
+-- Module 11/25: MuSig2 --
+=== MuSig2 Multi-Signature Tests ===
+
+--- Key Aggregation ---
+  [PASS] Aggregated key is valid point
+  [PASS] Agg key != P1
+  [PASS] Agg key != P2
+  [PASS] Key aggregation is deterministic
+
+--- Nonce Generation ---
+  [PASS] Secret nonces are non-zero
+  [PASS] R1 is valid compressed point
+  [PASS] R2 is valid compressed point
+  [PASS] Different extra -> different nonce
+
+--- 2-of-2 MuSig2 Signing ---
+  [PASS] Partial sig 1 verifies
+  [PASS] Partial sig 2 verifies
+  [PASS] Final MuSig2 sig verifies as standard Schnorr
+
+--- 3-of-3 MuSig2 Signing ---
+  [PASS] 3-of-3 agg key valid
+  [PASS] 3-of-3 partial sig 0 verifies
+  [PASS] 3-of-3 partial sig 1 verifies
+  [PASS] 3-of-3 partial sig 2 verifies
+  [PASS] 3-of-3 MuSig2 sig verifies as Schnorr
+
+--- Edge Cases ---
+  [PASS] Single-signer agg key valid
+  [PASS] Single-signer partial verify OK
+  [PASS] Single-signer MuSig2 = valid Schnorr sig
+
+=== Results: 19/19 passed ===
+-- PASSED --
+
+-- Module 12/25: ECDH + recovery + taproot --
+===============================================================
+  UltrafastSecp256k1 -- v3.2.0 Feature Tests
+===============================================================
+
+[ECDH] Basic key exchange...
+[ECDH] X-only variant...
+[ECDH] Raw x-coordinate...
+[ECDH] Edge: zero private key...
+[ECDH] Edge: infinity public key...
+
+[Recovery] Basic sign + recover...
+[Recovery] Multiple different private keys...
+[Recovery] Compact 65-byte serialization...
+[Recovery] Wrong recovery ID...
+[Recovery] Invalid signature (zero r/s)...
+
+[Taproot] TapTweak hash...
+[Taproot] Output key derivation...
+[Taproot] Private key tweaking...
+[Taproot] Commitment verification...
+[Taproot] Leaf and branch hashes...
+[Taproot] Merkle tree construction...
+[Taproot] Merkle proof verification...
+[Taproot] Full flow: key-path + script-path...
+
+[CT Utils] Constant-time equality...
+[CT Utils] Constant-time zero check...
+[CT Utils] Constant-time compare...
+[CT Utils] Secure memory zeroing...
+[CT Utils] Conditional copy and swap...
+
+[Wycheproof] ECDSA edge cases...
+[Wycheproof] Schnorr (BIP-340) edge cases...
+[Wycheproof] Recovery edge cases...
+
+===============================================================
+  Results: 76 passed, 0 failed (total 76)
+===============================================================
+-- PASSED --
+
+-- Module 13/25: edge cases & coverage gaps --
+
+=== Scalar zero rejection ===
+  [PASS] Scalar::zero() is zero
+  [PASS] Scalar::from_uint64(0) is zero
+  [PASS] parse_bytes_strict_nonzero rejects zero
+  [PASS] parse_bytes_strict accepts zero (valid < n)
+  [PASS] parse_bytes_strict(0) returns zero scalar
+
+=== Scalar parse_bytes_strict boundaries ===
+  [PASS] parse_bytes_strict accepts n-1
+  [PASS] n-1 is nonzero
+  [PASS] parse_bytes_strict rejects n (== order)
+  [PASS] parse_bytes_strict rejects n+1 (> order)
+  [PASS] parse_bytes_strict rejects 0xFF..FF
+  [PASS] parse_bytes_strict_nonzero accepts n-1
+  [PASS] parse_bytes_strict_nonzero rejects n
+
+=== Infinity arithmetic ===
+  [PASS] O + O = O
+  [PASS] dbl(O) = O
+  [PASS] O + G is not infinity
+  [PASS] O + G = G
+  [PASS] G + O is not infinity
+  [PASS] G + O = G
+  [PASS] (n-1)*G is not infinity
+  [PASS] (n-1)*G + G = O
+  [PASS] (n-1)*G == -G
+
+=== ECDSA zero/boundary key tests ===
+  [PASS] ECDSA sign+verify with k=1
+  [PASS] ECDSA sign+verify with k=n-1
+  [PASS] ECDSA verify with wrong key fails
+
+=== Schnorr boundary key tests ===
+  [PASS] Schnorr sign+verify with k=1
+  [PASS] Schnorr sign+verify with k=n-1
+
+=== BIP-32 IL >= n rejection ===
+  [PASS] BIP-32 master key from 16-byte seed
+  [PASS] BIP-32 child derivation index=0 succeeds
+  [PASS] BIP-32 child depth = 1
+  [PASS] BIP-32 derive 10 children all succeed
+  [PASS] BIP-32 hardened child index=0 succeeds
+  [PASS] BIP-32 rejects seed < 16 bytes
+  [PASS] BIP-32 rejects seed > 64 bytes
+
+=== Precompute cache corruption recovery ===
+  [PASS] load_precompute_cache rejects nonexistent file
+  [PASS] load_precompute_cache rejects corrupt file
+  [PASS] load_precompute_cache rejects truncated file
+
+=== Scalar arithmetic edges ===
+  [PASS] 0 + 1 = 1
+  [PASS] (n-1) + 1 = 0 mod n
+  [PASS] (n-1) + 2 = 1 mod n
+  [PASS] 1 * 0 = 0
+  [PASS] 1 * 1 = 1
+  [PASS] negate(0) = 0
+  [PASS] negate(1) = n-1
+  [PASS] negate(n-1) = 1
+
+=== Field element edge cases ===
+  [PASS] FE: 0 * 0 = 0
+  [PASS] FE: 1 * 1 = 1
+  [PASS] FE: 0 * 1 = 0
+  [PASS] FE: 0 + 0 = 0
+  [PASS] FE: 1 + 0 = 1
+  [PASS] FE: 1 - 1 = 0
+  [PASS] FE: negate(0) = 0
+  [PASS] FE: square(0) = 0
+  [PASS] FE: square(1) = 1
+
+=== ECDSA signature parse boundaries ===
+  [PASS] parse_compact_strict rejects zero sig (r=0,s=0)
+  [PASS] parse_compact_strict rejects r=1,s=0
+  [PASS] parse_compact_strict rejects r=0,s=1
+  [PASS] parse_compact_strict accepts r=1,s=1
+  [PASS] parse_compact_strict rejects r=n
+  [PASS] parse_compact_strict rejects s=n
+  [PASS] parse_compact_strict accepts r=n-1,s=n-1
+
+--- Edge case summary: 60/60 passed ---
+-- PASSED --
+
+-- Module 14/25: v4 features (Pedersen/FROST/etc) --
+===========================================
+  v4.0.0 Feature Tests
+  Pedersen | FROST | Adaptor | Address | SP
+===========================================
+
+=== Pedersen Commitments ===
+  [PASS] generator_H_not_infinity
+  [PASS] H_differs_from_G
+  [PASS] commitment_not_infinity
+  [PASS] commit_verify_roundtrip
+  [PASS] wrong_value_fails
+  [PASS] wrong_blinding_fails
+
+=== Pedersen Homomorphic ===
+  [PASS] homomorphic_addition
+
+=== Pedersen Balance ===
+  [PASS] balance_proof_valid
+
+=== Pedersen Switch ===
+  [PASS] generator_J_not_infinity
+  [PASS] switch_commit_not_infinity
+
+=== Pedersen Serialization ===
+  [PASS] compressed_prefix_valid
+  [PASS] compressed_size_33
+
+=== Edge: Zero Value Commitment ===
+  [PASS] zero_value_equals_blind_times_G
+
+=== FROST Lagrange ===
+  [PASS] lagrange_l1_equals_2
+  [PASS] lagrange_l2_equals_neg1
+  [PASS] lagrange_interpolation
+
+=== FROST Key Generation ===
+  [PASS] participant1_poly_degree
+  [PASS] participant1_share_count
+  [PASS] participant1_keygen_ok
+  [PASS] participant2_keygen_ok
+  [PASS] participant3_keygen_ok
+  [PASS] group_key_1_2_match
+  [PASS] group_key_2_3_match
+
+=== FROST 2-of-3 Signing ===
+  [PASS] keygen_2of3_ok
+  [PASS] frost_2of3_signature_valid
+
+=== Schnorr Adaptor Basic ===
+  [PASS] adaptor_R_hat_not_infinity
+  [PASS] adaptor_pre_sig_valid
+  [PASS] adapted_sig_valid_schnorr
+  [PASS] adaptor_extract_ok
+  [PASS] extracted_secret_matches
+
+=== ECDSA Adaptor Basic ===
+  [PASS] ecdsa_adaptor_R_hat_valid
+  [PASS] ecdsa_adaptor_r_nonzero
+  [PASS] ecdsa_adaptor_verify_ok
+  [PASS] adapted_ecdsa_nonzero
+  [PASS] ecdsa_extract_ok
+  [PASS] ecdsa_extracted_secret_matches
+
+=== Edge: Identity Adaptor ===
+  [PASS] identity_adaptor_valid
+
+=== Base58Check ===
+  [PASS] base58_encode_nonempty
+  [PASS] base58_leading_ones
+  [PASS] base58_decode_valid
+  [PASS] base58_decode_size
+  [PASS] base58_roundtrip
+
+=== Bech32/Bech32m ===
+  [PASS] bech32_encode_nonempty
+  [PASS] bech32_prefix_bc1
+  [PASS] bech32_decode_valid
+  [PASS] bech32_witness_v0
+  [PASS] bech32_prog_20_bytes
+  [PASS] bech32_hrp_bc
+  [PASS] bech32m_prefix_bc1p
+  [PASS] bech32m_decode_valid
+  [PASS] bech32m_witness_v1
+  [PASS] bech32m_prog_32_bytes
+
+=== HASH160 ===
+  [PASS] hash160_deterministic
+  [PASS] hash160_different_for_different_input
+
+=== P2PKH Address ===
+  [PASS] p2pkh_starts_with_1
+  [PASS] p2pkh_valid_length
+  [PASS] p2pkh_testnet_prefix
+
+=== P2WPKH Address ===
+  [PASS] p2wpkh_bc1q_prefix
+  [PASS] p2wpkh_testnet_tb1q
+  [PASS] p2wpkh_decode_valid
+  [PASS] p2wpkh_version_0
+  [PASS] p2wpkh_20_byte_program
+
+=== P2TR Address ===
+  [PASS] p2tr_bc1p_prefix
+  [PASS] p2tr_decode_valid
+  [PASS] p2tr_version_1
+  [PASS] p2tr_32_byte_program
+
+=== WIF Encode/Decode ===
+  [PASS] wif_compressed_prefix
+  [PASS] wif_decode_valid
+  [PASS] wif_decode_compressed
+  [PASS] wif_network_mainnet
+  [PASS] wif_key_matches
+  [PASS] wif_uncompressed_prefix
+  [PASS] wif_uncompressed_valid
+  [PASS] wif_uncompressed_flag
+  [PASS] wif_testnet_roundtrip
+
+=== Address Consistency ===
+  [PASS] p2pkh_deterministic
+  [PASS] p2wpkh_deterministic
+  [PASS] p2tr_deterministic
+  [PASS] different_keys_different_p2pkh
+  [PASS] different_keys_different_p2wpkh
+
+=== Silent Payments ===
+  [PASS] sp_scan_key_valid
+  [PASS] sp_spend_key_valid
+  [PASS] sp_address_encoded
+  [PASS] sp_address_prefix
+
+=== Silent Payment Flow ===
+  [PASS] sp_output_key_valid
+  [PASS] sp_tweak_nonzero
+  [PASS] sp_detected_one_output
+  [PASS] sp_detected_index_0
+  [PASS] sp_derived_key_matches_output
+
+=== Silent Payment Multiple Outputs ===
+  [PASS] sp_detected_three_outputs
+
+===========================================
+  Results: 90 passed, 0 failed
+===========================================
+-- PASSED --
+
+-- Module 15/25: coins layer --
+=== Coins Layer + Custom Generator Tests ===
+
+[CurveContext]
+  [TEST] CurveContext::secp256k1_default()                  PASS
+  [TEST] CurveContext::with_generator(custom)               PASS
+  [TEST] derive_public_key(default vs custom G)             PASS
+  [TEST] effective_generator(nullptr vs ctx)                PASS
+
+[CoinParams]
+  [TEST] CoinParams: 28 coins defined                       PASS
+  [TEST] CoinParams: Bitcoin values                         PASS
+  [TEST] CoinParams: Ethereum values                        PASS
+  [TEST] CoinParams: find_by_ticker + find_by_coin_type     PASS
+
+[Keccak-256]
+  [TEST] Keccak-256: empty string                           PASS
+  [TEST] Keccak-256: "abc"                                  PASS
+  [TEST] Keccak-256: incremental == one-shot                PASS
+
+[Ethereum]
+  [TEST] Ethereum: address format 0x + 40 hex               PASS
+  [TEST] Ethereum: EIP-55 checksum verify                   PASS
+  [TEST] Ethereum: EIP-55 case sensitivity                  PASS
+
+[Coin Addresses]
+  [TEST] Bitcoin: P2PKH address starts with 1               PASS
+  [TEST] Bitcoin: P2WPKH address starts with bc1q           PASS
+  [TEST] Litecoin: Bech32 address starts with ltc1q         PASS
+  [TEST] Dogecoin: P2PKH address starts with D              PASS
+  [TEST] Ethereum: coin_address returns EIP-55              PASS
+  [TEST] Dash: P2PKH address starts with X                  PASS
+  [TEST] Dogecoin: P2WPKH returns empty (no SegWit)         PASS
+
+[P2SH-P2WPKH (Nested SegWit)]
+  [TEST] Bitcoin: P2SH-P2WPKH nested SegWit starts with 3   PASS
+  [TEST] Litecoin: P2SH-P2WPKH nested SegWit starts with M  PASS
+  [TEST] Dogecoin: P2SH-P2WPKH returns empty (no SegWit)    PASS
+  [TEST] P2SH-P2WPKH: same key produces same address        PASS
+  [TEST] Core: address_p2sh_p2wpkh starts with 3            PASS
+
+[P2SH / P2WSH]
+  [TEST] Core: address_p2sh from hash starts with 3         PASS
+  [TEST] Core: address_p2wsh starts with bc1q (32-byte)     PASS
+
+[CashAddr (Bitcoin Cash)]
+  [TEST] BCH: CashAddr starts with bitcoincash:q            PASS
+  [TEST] BCH: coin_address returns CashAddr                 PASS
+  [TEST] BCH: CashAddr deterministic                        PASS
+  [TEST] Core: address_cashaddr starts with bitcoincash:    PASS
+  [TEST] CashAddr: non-BCH coin returns empty               PASS
+
+[Taproot]
+  [TEST] Bitcoin: P2TR Taproot starts with bc1p             PASS
+  [TEST] Litecoin: P2TR returns empty (no Taproot)          PASS
+
+[WIF]
+  [TEST] Bitcoin: WIF starts with K or L (compressed)       PASS
+  [TEST] Litecoin: WIF starts with T (compressed)           PASS
+
+[BIP-44 HD]
+  [TEST] BIP-44: Bitcoin path m/86'/0'/0'/0/0 (Taproot)     PASS
+  [TEST] BIP-44: Ethereum path m/44'/60'/0'/0/0             PASS
+  [TEST] BIP-44: best_purpose selection                     PASS
+  [TEST] BIP-44: seed -> key derivation                     PASS
+  [TEST] BIP-44: seed -> Bitcoin address                    PASS
+  [TEST] BIP-44: seed -> Ethereum address                   PASS
+
+[Custom Generator]
+  [TEST] Custom G: coin_derive with custom generator        PASS
+  [TEST] Custom G: deterministic derivation                 PASS
+
+[Full Pipeline]
+  [TEST] Full pipeline: same key -> different addresses per coin PASS
+
+========================================
+Results: 46 passed, 0 failed
+========================================
+-- PASSED --
+
+-- Module 16/25: affine batch addition --
+
+=== Affine Batch Addition Tests ===
+[BatchAffine] Empty batch...
+[BatchAffine] Precompute G-multiples table...
+  Verified 64 G-multiples
+[BatchAffine] batch_add_affine_x correctness...
+  Verified 128 batch additions
+[BatchAffine] batch_add_affine_x convenience wrapper...
+[BatchAffine] batch_add_affine_xy correctness...
+  Verified 64 XY results
+[BatchAffine] Bidirectional batch add...
+  Verified 32 bidirectional pairs
+[BatchAffine] Y-parity extraction...
+  Verified 32 parity values
+[BatchAffine] Arbitrary point multiples table...
+  Verified 16 arbitrary multiples
+[BatchAffine] Negate table...
+  Verified 16 negated points
+[BatchAffine] Large batch (1024 points)...
+  Precompute 1024 G-multiples: 320.0 us
+  Batch 1024: 191.0 us total, 186.5 ns/point
+  Throughput: 5.36 Mpoints/s (single thread)
+
+  Affine batch add: 564 passed, 0 failed
+-- PASSED --
+
+-- Module 17/25: accelerated hashing --
+
+=== Accelerated Hashing Tests ===
+[HashAccel] Feature detection...
+  Hash tier: SHA-NI
+  SHA-NI:    yes
+  AVX2:      yes
+  AVX-512:   no
+[HashAccel] SHA-256 known vectors...
+[HashAccel] sha256_33 correctness...
+[HashAccel] sha256_32 correctness...
+[HashAccel] RIPEMD-160 known vectors...
+[HashAccel] ripemd160_32 correctness...
+[HashAccel] Hash160 pipeline correctness...
+[HashAccel] Double-SHA256...
+[HashAccel] Batch operations...
+[HashAccel] SHA-NI vs Scalar cross-check...
+[HashAccel] Benchmark...
+  Scalar SHA256_33:  173.5 ns/call
+  Auto   SHA256_33:  25.4 ns/call (SHA-NI)
+  Scalar RIPEMD160_32: 224.8 ns/call
+  Auto   Hash160_33: 257.5 ns/call
+  Old    SHA256::hash: 38.6 ns/call (reference)
+  Batch  Hash160_33 (1024): 255.1 ns/key, 3.92 Mkeys/s
+
+  Hash accel: 877 passed, 0 failed
+-- PASSED --
+
+-- Module 18/25: exhaustive algebraic verification --
+
+=== Exhaustive Algebraic Verification ===
+  [1] Closure: k*G on curve for k=1..256
+  [2] Additive consistency: k*G + G = (k+1)*G, k=1..256
+  [3] Homomorphism: a*G + b*G = (a+b)*G, a,b=1..128
+    1024 pairs verified
+  [4] Scalar mul: scalar_mul(k) vs iterated add, k=1..256
+  [5] Scalar associativity: k*(l*G) = (k*l)*G
+  [6] Addition axioms: assoc, commut, identity, inverse
+  [7] Doubling: 2*P = P + P
+  [8] Curve order: n*G = O, (n-1)*G = -G
+  [9] Scalar arithmetic exhaustive, N=128
+    1089 pairs verified
+  [10] CT consistency: ct::scalar_mul vs fast::scalar_mul, k=1..64
+  [11] Negation properties
+  [12] In-place ops: next/prev/dbl_inplace vs immutable
+  [13] Pippenger MSM correctness
+  [14] Comb generator: comb_mul(k) vs k*G
+
+  -- Results: 5399 passed, 0 failed (13 ms)
+  All exhaustive tests PASSED [ok]
+-- PASSED --
+
+-- Module 19/25: comprehensive 500+ test suite --
+
+=== Comprehensive Test Suite (29 categories) ===
+
+-- Field Arithmetic --
+  [FieldArith] Field arithmetic tests...
+
+-- Field Conversions --
+  [FieldConversions] Field conversion tests...
+
+-- Field Edge Cases --
+  [FieldEdgeCases] Field edge case tests...
+
+-- Field Inverse --
+  [FieldInverse] Field inverse algorithm tests...
+
+-- Field Branchless --
+  [FieldBranchless] Branchless operation tests...
+
+-- Field Optimal Dispatch --
+  [FieldOptimal] Optimal representation dispatch...
+
+-- Field Representations --
+  [FieldRepresentations] ASM/platform field ops...
+
+-- Scalar Arithmetic --
+  [ScalarArith] Scalar arithmetic tests...
+    4225 small-range pairs verified
+
+-- Scalar Conversions --
+  [ScalarConversions] Scalar conversion tests...
+
+-- Scalar Edge Cases --
+  [ScalarEdgeCases] Scalar edge case tests...
+
+-- Scalar NAF/wNAF --
+  [ScalarEncoding] NAF/wNAF encoding tests...
+
+-- Point Basic --
+  [PointBasic] Point basic operations...
+
+-- Point Scalar Mul --
+  [PointScalarMul] Scalar multiplication tests...
+
+-- Point In-Place --
+  [PointInplace] In-place operations...
+
+-- Point Precomputed --
+  [PointPrecomputed] Precomputed scalar mul...
+
+-- Point Serialization --
+  [PointSerialization] Point serialization tests...
+
+-- Point Edge Cases --
+  [PointEdgeCases] Point edge cases...
+
+-- CT Primitives --
+  [CTOps] Constant-time primitive tests...
+
+-- CT Field --
+  [CTField] CT field operations...
+
+-- CT Scalar --
+  [CTScalar] CT scalar operations...
+
+-- CT Point --
+  [CTPoint] CT point operations...
+
+-- GLV Endomorphism --
+  [GLV] GLV endomorphism tests...
+
+-- Multi-Scalar Mul --
+  [MSM] Multi-scalar multiplication tests...
+
+-- Comb Generator --
+  [CombGen] Comb generator tests...
+
+-- Batch Inverse --
+  [BatchInverse] Batch inverse tests...
+
+-- ECDSA --
+  [ECDSA] ECDSA sign/verify tests...
+
+-- Schnorr --
+  [Schnorr] Schnorr sign/verify tests...
+
+-- ECDH --
+  [ECDH] ECDH shared secret tests...
+
+-- Key Recovery --
+  [Recovery] Key recovery tests...
+
+-- Extra/Cross-cutting Tests --
+  [Hashing] SHA-256/SHA-512 tests...
+  [BatchAddAffine] Batch affine addition tests...
+  [BatchVerify] Batch verification tests...
+  [Homomorphism] Expanded homomorphism tests...
+  [Precompute] Precomputation module tests...
+
+  -- Comprehensive Results: 12023 passed, 0 failed, 10 skipped (21 ms)
+  All comprehensive tests PASSED
+-- PASSED --
+
+-- Module 20/25: BIP-340 official test vectors --
+================================================================
+  BIP-340 Official Test Vectors (bitcoin/bips)
+================================================================
+
+  -- Vector 0 (sk=3, msg=00..00) --
+  [PASS] V0: pubkey matches expected
+  [PASS] V0: signature matches expected
+  [PASS] V0: verification passes
+  [PASS] V0: verify(our_sig) passes
+
+  -- Vector 1 --
+  [PASS] V1: pubkey matches expected
+  [PASS] V1: signature matches expected
+  [PASS] V1: verification passes
+  [PASS] V1: verify(our_sig) passes
+
+  -- Vector 2 --
+  [PASS] V2: pubkey matches expected
+  [PASS] V2: signature matches expected
+  [PASS] V2: verification passes
+  [PASS] V2: verify(our_sig) passes
+
+  -- Vector 3 --
+  [PASS] V3: pubkey matches expected
+  [PASS] V3: signature matches expected
+  [PASS] V3: verification passes
+  [PASS] V3: verify(our_sig) passes
+
+--- BIP-340 Verify-Only Vectors (4-14) ---
+  [PASS] V4: valid sig
+  [PASS] V5: pk not on curve => reject
+  [PASS] V6: R has odd Y => reject
+  [PASS] V7: negated message => reject
+  [PASS] V8: negated s => reject
+  [PASS] V9: R at infinity => reject
+  [PASS] V10: R at inf (x=1) => reject
+  [PASS] V11: R.x not on curve => reject
+  [PASS] V12: R.x == p => reject
+  [PASS] V13: s == n => reject
+  [PASS] V14: pk >= p => reject
+
+================================================================
+  BIP-340 Results: 27 / 27 passed
+================================================================
+-- PASSED --
+
+-- Module 21/25: RFC 6979 ECDSA test vectors --
+================================================================
+  RFC 6979 Deterministic ECDSA Test Vectors (secp256k1)
+================================================================
+
+--- RFC 6979 Nonce Generation (secp256k1 + SHA-256) ---
+  [PASS] RFC6979 nonce: d=fee0...be1e msg='test data'
+  [PASS] RFC6979 nonce: d=1 msg='Everything should be...'
+  [PASS] RFC6979 nonce: d=2 msg='Satoshi Nakamoto'
+  [PASS] RFC6979 nonce: d=7f7f...7f msg='Diffie Hellman'
+  [PASS] RFC6979 nonce: d=8080...80 msg='Japan'
+  [PASS] RFC6979 nonce: d=n-1 msg='Bitcoin'
+
+--- ECDSA Signature Vectors (secp256k1 + SHA-256) ---
+  [PASS] ECDSA sig r: d=1 (Einstein quote)
+  [PASS] ECDSA sig s: d=1 (Einstein quote)
+  [PASS] ECDSA sig r: d=1 (Bohr quote)
+  [PASS] ECDSA sig s: d=1 (Bohr quote)
+  [PASS] ECDSA sig r: d=n-1 (Dirac quote)
+  [PASS] ECDSA sig s: d=n-1 (Dirac quote)
+  [PASS] ECDSA sig r: d=n-1 (Heisenberg quote)
+  [PASS] ECDSA sig s: d=n-1 (Heisenberg quote)
+  [PASS] ECDSA sig r: d=69ec (Dijkstra quote)
+  [PASS] ECDSA sig s: d=69ec (Dijkstra quote)
+  [PASS] ECDSA sig r: small d (programming quote)
+  [PASS] ECDSA sig s: small d (programming quote)
+  [PASS] ECDSA sig r: tiny d (Dijkstra submarine)
+  [PASS] ECDSA sig s: tiny d (Dijkstra submarine)
+
+--- ECDSA Verify Roundtrip ---
+  [PASS] verify roundtrip #1
+  [PASS] wrong msg rejects #1
+  [PASS] verify roundtrip #2
+  [PASS] wrong msg rejects #2
+  [PASS] verify roundtrip #3
+  [PASS] wrong msg rejects #3
+  [PASS] verify roundtrip #4
+  [PASS] wrong msg rejects #4
+  [PASS] verify roundtrip #5
+  [PASS] wrong msg rejects #5
+
+--- ECDSA Determinism ---
+  [PASS] same (key, msg) -> identical signature
+  [PASS] different msg -> different signature
+  [PASS] sig1 is low-S
+  [PASS] sig2 is low-S
+  [PASS] sig3 is low-S
+
+================================================================
+  Results: 35 / 35 passed
+================================================================
+-- PASSED --
+
+-- Module 22/25: ECC property-based invariants --
+
+================================================================
+  ECC Property-Based Tests (secp256k1 group-law invariants)
+================================================================
+
+--- Identity element: P + O == P ---
+  [PASS] G + O == G
+  [PASS] O + G == G
+  [PASS] O + O == O
+  [PASS] P + O == P (arbitrary point)
+  [PASS] O + P == P (arbitrary point)
+
+--- Inverse element: P + (-P) == O ---
+  [PASS] G + (-G) == O
+  [PASS] P_1 + (-P_1) == O
+  [PASS] P_2 + (-P_2) == O
+  [PASS] P_3 + (-P_3) == O
+  [PASS] P_4 + (-P_4) == O
+  [PASS] P_5 + (-P_5) == O
+
+--- Negate involution: -(-P) == P ---
+  [PASS] -(-G) == G
+  [PASS] -(-P_1) == P_1
+  [PASS] -(-P_2) == P_2
+  [PASS] -(-P_3) == P_3
+  [PASS] -(-P_4) == P_4
+  [PASS] -(-P_5) == P_5
+
+--- Commutativity: P + Q == Q + P ---
+  [PASS] P_0 + Q_1 == Q_1 + P_0
+  [PASS] P_2 + Q_3 == Q_3 + P_2
+  [PASS] P_4 + Q_5 == Q_5 + P_4
+  [PASS] P_6 + Q_7 == Q_7 + P_6
+  [PASS] P_8 + Q_9 == Q_9 + P_8
+  [PASS] P_10 + Q_11 == Q_11 + P_10
+  [PASS] P_12 + Q_13 == Q_13 + P_12
+  [PASS] P_14 + Q_15 == Q_15 + P_14
+
+--- Associativity: (P + Q) + R == P + (Q + R) ---
+  [PASS] (P_0 + Q_1) + R_2 == P_0 + (Q_1 + R_2)
+  [PASS] (P_3 + Q_4) + R_5 == P_3 + (Q_4 + R_5)
+  [PASS] (P_6 + Q_7) + R_8 == P_6 + (Q_7 + R_8)
+  [PASS] (P_9 + Q_10) + R_11 == P_9 + (Q_10 + R_11)
+  [PASS] (P_12 + Q_13) + R_14 == P_12 + (Q_13 + R_14)
+
+--- Double consistency: 2*P == P + P ---
+  [PASS] 2*G == G + G
+  [PASS] 2*P_1 == P_1 + P_1
+  [PASS] 2*P_2 == P_2 + P_2
+  [PASS] 2*P_3 == P_3 + P_3
+  [PASS] 2*P_4 == P_4 + P_4
+  [PASS] 2*P_5 == P_5 + P_5
+
+--- Scalar ring: (a + b)*G == a*G + b*G ---
+  [PASS] (a_0 + b_1)*G == a_0*G + b_1*G
+  [PASS] (a_2 + b_3)*G == a_2*G + b_3*G
+  [PASS] (a_4 + b_5)*G == a_4*G + b_5*G
+  [PASS] (a_6 + b_7)*G == a_6*G + b_7*G
+  [PASS] (a_8 + b_9)*G == a_8*G + b_9*G
+  [PASS] (a_10 + b_11)*G == a_10*G + b_11*G
+  [PASS] (a_12 + b_13)*G == a_12*G + b_13*G
+  [PASS] (a_14 + b_15)*G == a_14*G + b_15*G
+
+--- Scalar associativity: (a*b)*G == a*(b*G) ---
+  [PASS] (a_0 * b_1)*G == a_0 * (b_1 * G)
+  [PASS] (a_2 * b_3)*G == a_2 * (b_3 * G)
+  [PASS] (a_4 * b_5)*G == a_4 * (b_5 * G)
+  [PASS] (a_6 * b_7)*G == a_6 * (b_7 * G)
+  [PASS] (a_8 * b_9)*G == a_8 * (b_9 * G)
+  [PASS] (a_10 * b_11)*G == a_10 * (b_11 * G)
+  [PASS] (a_12 * b_13)*G == a_12 * (b_13 * G)
+  [PASS] (a_14 * b_15)*G == a_14 * (b_15 * G)
+
+--- Distributivity: k*(P + Q) == k*P + k*Q ---
+  [PASS] k_0 * (P_0 + Q_1) == k_0*P_0 + k_0*Q_1
+  [PASS] k_1 * (P_2 + Q_3) == k_1*P_2 + k_1*Q_3
+  [PASS] k_2 * (P_4 + Q_5) == k_2*P_4 + k_2*Q_5
+  [PASS] k_3 * (P_6 + Q_7) == k_3*P_6 + k_3*Q_7
+  [PASS] k_4 * (P_8 + Q_9) == k_4*P_8 + k_4*Q_9
+  [PASS] k_5 * (P_10 + Q_11) == k_5*P_10 + k_5*Q_11
+  [PASS] k_6 * (P_12 + Q_13) == k_6*P_12 + k_6*Q_13
+  [PASS] k_7 * (P_14 + Q_15) == k_7*P_14 + k_7*Q_15
+
+--- Generator order: n*G == O ---
+  [PASS] n * G == O (full order)
+  [PASS] (n-1)*G != O
+  [PASS] (n-1)*G == -G
+  [PASS] 1*G == G
+  [PASS] 0*G == O
+
+--- Subtraction: P - Q == P + (-Q) ---
+  [PASS] P_0 - Q_1 == P_0 + (-Q_1)
+  [PASS] P_2 - Q_3 == P_2 + (-Q_3)
+  [PASS] P_4 - Q_5 == P_4 + (-Q_5)
+  [PASS] P_6 - Q_7 == P_6 + (-Q_7)
+  [PASS] P_8 - Q_9 == P_8 + (-Q_9)
+
+--- Scalar mul small values: k*G consistency ---
+  [PASS] 1*G == G+G+...+G (1 times)
+  [PASS] 2*G == G+G+...+G (2 times)
+  [PASS] 3*G == G+G+...+G (3 times)
+  [PASS] 4*G == G+G+...+G (4 times)
+  [PASS] 5*G == G+G+...+G (5 times)
+  [PASS] 6*G == G+G+...+G (6 times)
+  [PASS] 7*G == G+G+...+G (7 times)
+  [PASS] 8*G == G+G+...+G (8 times)
+
+--- In-place ops consistency ---
+  [PASS] add_inplace(Q) == add(Q)
+  [PASS] dbl_inplace() == dbl()
+  [PASS] negate_inplace() == negate()
+  [PASS] next_inplace() == next()
+  [PASS] prev_inplace() == prev()
+  [PASS] next_inplace + prev_inplace == identity
+
+--- Dual scalar mul: a*G + b*P ---
+  [PASS] dual_mul(0) == a*G + b*P
+  [PASS] dual_mul(1) == a*G + b*P
+  [PASS] dual_mul(2) == a*G + b*P
+  [PASS] dual_mul(3) == a*G + b*P
+  [PASS] dual_mul(4) == a*G + b*P
+
+================================================================
+  ECC Property Results: 89 / 89 passed
+================================================================
+-- PASSED --
+
+-- Module 23/25: Ethereum signing layer --
+
+========================================
+  Ethereum Signing Layer Tests
+========================================
+
+--- EIP-155 Chain ID ---
+  [TEST] Legacy v=27 -> recid=0                                  PASS
+  [TEST] Legacy v=28 -> recid=1                                  PASS
+  [TEST] EIP-155 Ethereum mainnet (chain_id=1)                   PASS
+  [TEST] EIP-155 BSC (chain_id=56)                               PASS
+  [TEST] EIP-155 Polygon (chain_id=137)                          PASS
+  [TEST] EIP-155 round-trip (10 chains)                          PASS
+
+--- EIP-191 Personal Message Hash ---
+  [TEST] EIP-191 hash 'Hello, world!'                            PASS
+  [TEST] EIP-191 hash empty message                              PASS
+  [TEST] EIP-191 different messages -> different hashes          PASS
+  [TEST] EIP-191 deterministic                                   PASS
+
+--- eth_sign_hash ---
+  [TEST] eth_sign_hash basic (legacy, chain_id=0)                PASS
+  [TEST] eth_sign_hash with chain_id=1 (Ethereum)                PASS
+  [TEST] eth_sign_hash deterministic (RFC 6979)                  PASS
+  [TEST] eth_sign_hash different hash -> different sig           PASS
+
+--- ecrecover ---
+  [TEST] ecrecover round-trip                                    PASS
+  [TEST] ecrecover with EIP-155 chain_id=1                       PASS
+  [TEST] ecrecover wrong hash -> wrong address                   PASS
+  [TEST] ecrecover invalid r=0                                   PASS
+  [TEST] ecrecover invalid s=0                                   PASS
+
+--- eth_personal_sign + verify ---
+  [TEST] personal_sign basic                                     PASS
+  [TEST] personal_verify valid                                   PASS
+  [TEST] personal_verify wrong message                           PASS
+  [TEST] personal_verify wrong address                           PASS
+
+--- Multi-chain EIP-155 ---
+  [TEST] Round-trip chain_id=1 (Ethereum)                        PASS
+  [TEST] Round-trip chain_id=56 (BSC)                            PASS
+  [TEST] Round-trip chain_id=137 (Polygon)                       PASS
+  [TEST] Round-trip chain_id=43114 (Avalanche)                   PASS
+  [TEST] Round-trip chain_id=250 (Fantom)                        PASS
+  [TEST] Round-trip chain_id=42161 (Arbitrum)                    PASS
+  [TEST] Round-trip chain_id=10 (Optimism)                       PASS
+
+--- Keccak-256 Test Vectors ---
+  [TEST] Keccak-256 empty string                                 PASS
+  [TEST] Keccak-256 'abc'                                        PASS
+
+========================================
+  Result: 32 passed, 0 failed (total 32)
+========================================
+-- PASSED --
+
+-- Module 24/25: Unified wallet API --
+
+========================================
+  Unified Wallet API Tests
+========================================
+
+--- Key Management ---
+  [TEST] from_private_key: valid key                             PASS
+  [TEST] from_private_key: zero key rejected                     PASS
+
+--- Address Generation ---
+  [TEST] wallet::get_address Bitcoin                             PASS
+  [TEST] wallet::get_address Litecoin                            PASS
+  [TEST] wallet::get_address Dogecoin (Base58Check)              PASS
+  [TEST] wallet::get_address Ethereum                            PASS
+  [TEST] wallet::get_address Tron                                PASS
+
+--- Key Export ---
+  [TEST] export_private_key: Bitcoin WIF                         PASS
+  [TEST] export_private_key: Ethereum 0x-hex                     PASS
+  [TEST] export_private_key: Tron raw hex                        PASS
+  [TEST] export_public_key_hex: Bitcoin (compressed)             PASS
+  [TEST] export_public_key_hex: Ethereum (uncompressed)          PASS
+
+--- Bitcoin Message Signing ---
+  [TEST] bitcoin_message_hash: 'Hello' known format              PASS
+  [TEST] bitcoin_sign_message + verify round-trip                PASS
+  [TEST] bitcoin_sign + recover round-trip                       PASS
+  [TEST] bitcoin_sig base64 encode/decode round-trip             PASS
+
+--- Wallet Signing API ---
+  [TEST] wallet: sign_message + verify_message (Bitcoin)         PASS
+  [TEST] wallet: sign_hash + recover_signer (Bitcoin)            PASS
+  [TEST] wallet: sign_message + recover_address (Ethereum)       PASS
+  [TEST] wallet: sign_message + recover_address (Tron)           PASS
+
+--- Coin Params ---
+  [TEST] CoinParams: Tron descriptor                             PASS
+  [TEST] CoinParams: chain_id values                             PASS
+  [TEST] wallet: multiple coins from same key                    PASS
+  [TEST] MessageSignature::to_rsv format                         PASS
+
+--- Address Formats ---
+  [TEST] wallet: get_address_p2pkh Bitcoin                       PASS
+  [TEST] wallet: get_address_p2wpkh Bitcoin                      PASS
+  [TEST] wallet: get_address_p2sh_p2wpkh Bitcoin                 PASS
+  [TEST] wallet: get_address_p2tr Bitcoin                        PASS
+  [TEST] wallet: get_address_cashaddr BCH                        PASS
+  [TEST] wallet: BCH default is CashAddr                         PASS
+  [TEST] wallet: all 4 BTC address formats                       PASS
+
+========================================
+  Result: 31 passed, 0 failed (total 31)
+========================================
+-- PASSED --
+
+-- Module 25/25: ZK proofs (knowledge/DLEQ/Bulletproof) --
+=== ZK Proof Layer Tests ===
+
+=== Knowledge Proof: Basic ===
+  [PASS] valid_proof_verifies
+
+=== Knowledge Proof: Wrong Key ===
+  [PASS] correct_key_passes
+  [PASS] wrong_key_fails
+
+=== Knowledge Proof: Wrong Message ===
+  [PASS] correct_msg_passes
+  [PASS] wrong_msg_fails
+
+=== Knowledge Proof: Serialization ===
+  [PASS] deserialization_succeeds
+  [PASS] deserialized_proof_verifies
+
+=== Knowledge Proof: Custom Base ===
+  [PASS] custom_base_verifies
+  [PASS] wrong_base_fails
+
+=== Knowledge Proof: Deterministic ===
+  [PASS] deterministic_proofs_match
+
+=== DLEQ Proof: Basic ===
+  [PASS] valid_dleq_verifies
+
+=== DLEQ Proof: Wrong Secret ===
+  [PASS] wrong_discrete_log_fails
+
+=== DLEQ Proof: Serialization ===
+  [PASS] serialized_dleq_verifies
+
+=== DLEQ Proof: Deterministic ===
+  [PASS] deterministic_dleq_match
+
+=== Range Proof: Generator Vectors ===
+  [PASS] all_generators_valid
+  [PASS] G_and_H_generators_differ
+  [PASS] G0_differs_from_G1
+
+=== Range Proof: Basic (value=42) ===
+  [PASS] range_proof_42_valid
+
+=== Range Proof: Edge Case (value=0) ===
+  [PASS] range_proof_zero_valid
+
+=== Range Proof: Edge Case (value=2^64-1) ===
+  [PASS] range_proof_max64_valid
+
+=== Range Proof: Wrong Commitment ===
+  [PASS] correct_commitment_passes
+  [PASS] wrong_commitment_fails
+
+=== Range Proof: Deterministic ===
+  [PASS] deterministic_range_proofs_match
+
+=== Batch Operations: batch_commit ===
+  [PASS] batch_commit_matches_individual
+
+=== Results: 24/24 passed ===
+-- PASSED --
+
+===============================================================
+  Results: 25/25 modules passed (selftest + 25 modules)
+  ALL TESTS PASSED
+===============================================================

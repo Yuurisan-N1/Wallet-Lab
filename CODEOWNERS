@@ -1,0 +1,4 @@
+# CODEOWNERS — every file owned by the project maintainer.
+# Required for codeowners review enforcement on the main branch
+# (improves OpenSSF Scorecard Branch-Protection score).
+* @shrec

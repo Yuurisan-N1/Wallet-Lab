@@ -1,0 +1,139 @@
+# conformance-vectors.yml — official BIP spec-vector conformance over the shim ABI.
+#
+# WHY THIS EXISTS:
+# The shim conformance tests (test_bip341_vectors, test_bip327_keyagg_vectors,
+# test_bip327_tweak_sign, test_bip327_sign_verify_vectors, shim_test) exercise the
+# libsecp256k1-compatible shim ABI — the drop-in surface integrators (e.g. Sparrow
+# Wallet's Frigate) actually consume — against the OFFICIAL bitcoin/bips vectors and
+# the bip-0327 reference.py oracle. They are the tests that catch the
+# "self-consistent but spec-divergent" bug class (e.g. the MuSig2 binding-factor tag
+# and the infinity-aggregate-nonce handling fixed in this cycle).
+#
+# Before this workflow they never ran in CI: the shim test block in
+# compat/libsecp256k1_shim/CMakeLists.txt is guarded by `NOT SECP256K1_BUILD_SHIM`,
+# while the subdirectory was only ever added when SECP256K1_BUILD_SHIM=ON — a
+# contradiction that made the block unreachable. The CMake fix (subdir added when
+# SECP256K1_SHIM_BUILD_TESTS=ON with BUILD_SHIM=OFF) plus this job make them live.
+#
+# Hard gate: any conformance failure fails the job.
+
+name: Conformance Vectors
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: conformance-vectors-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  conformance:
+    name: BIP-340/341/327 shim conformance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends g++-14 ninja-build python3
+
+      # Build the shim conformance test block: BUILD_SHIM=OFF so the
+      # `NOT SECP256K1_BUILD_SHIM` test block activates, SHIM_BUILD_TESTS=ON so the
+      # shim subdirectory is added (see compat/libsecp256k1_shim/CMakeLists.txt).
+      - name: Configure (shim conformance tests)
+        run: |
+          # Named build profile (CMakePresets.json) is the single source of truth for the
+          # config; compiler + march are environment-specific overrides layered on top.
+          # binaryDir is out/conformance (from the preset).
+          cmake --preset conformance \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DSECP256K1_MARCH=x86-64-v3
+
+      - name: Build conformance targets
+        run: |
+          cmake --build out/conformance -j"$(nproc)" --target \
+            test_bip341_vectors \
+            test_bip327_keyagg_vectors \
+            test_bip327_tweak_sign \
+            test_bip327_sign_verify_vectors \
+            shim_test
+
+      - name: Run official BIP spec-vector conformance (hard gate)
+        run: |
+          ctest --test-dir out/conformance --output-on-failure \
+            --no-tests=error \
+            -R '^(bip341_vectors|bip327_keyagg_vectors|bip327_tweak_sign|bip327_sign_verify_vectors|secp256k1_shim_test)$'
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Conformance Vectors — BIP-340/341/327 shim ABI" >> "$GITHUB_STEP_SUMMARY"
+          echo "Official bitcoin/bips vectors + bip-0327 reference.py oracle over the" >> "$GITHUB_STEP_SUMMARY"
+          echo "libsecp256k1-compatible shim surface (MuSig2 keyagg / tweak-sign /" >> "$GITHUB_STEP_SUMMARY"
+          echo "sign-verify, Taproot key/script tweaks)." >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Gold-standard trust anchor: link BOTH this engine AND bitcoin-core/libsecp256k1
+  # in one process and assert byte-identical outputs for the same inputs across
+  # ec_pubkey_create / ecdsa_sign+verify / schnorrsig_sign+verify / xonly_pubkey.
+  # If both agree on every input, they implement the same math. (test_cross_libsecp256k1)
+  # ---------------------------------------------------------------------------
+  differential-libsecp:
+    name: Differential vs libsecp256k1 (in-process)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Harden the runner
+        # audit egress (not block): the cross-test FetchContent's bitcoin-core/secp256k1
+        # v0.6.0 at configure time.
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends g++-14 ninja-build python3 git
+
+      # SECP256K1_BUILD_CROSS_TESTS=ON FetchContent's bitcoin-core/secp256k1 v0.6.0,
+      # builds it with schnorrsig/extrakeys/recovery/ecdh, and links it alongside the
+      # engine in test_cross_libsecp256k1.
+      - name: Configure (cross-library differential)
+        run: |
+          # Named build profile (CMakePresets.json); compiler + march are env overrides.
+          # binaryDir is out/cross-libsecp (from the preset).
+          cmake --preset cross-libsecp \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DSECP256K1_MARCH=x86-64-v3
+
+      - name: Build the in-process cross-library test
+        run: cmake --build out/cross-libsecp -j"$(nproc)" --target test_cross_libsecp256k1
+
+      - name: Run engine == libsecp256k1 differential (hard gate)
+        run: |
+          ctest --test-dir out/cross-libsecp --output-on-failure \
+            --no-tests=error -R '^cross_libsecp256k1$'
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Differential vs libsecp256k1 (in-process)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Engine vs bitcoin-core/secp256k1 v0.6.0 — byte-identical outputs for" >> "$GITHUB_STEP_SUMMARY"
+          echo "ec_pubkey_create / ecdsa_sign+verify / schnorrsig_sign+verify / xonly / ECDH." >> "$GITHUB_STEP_SUMMARY"

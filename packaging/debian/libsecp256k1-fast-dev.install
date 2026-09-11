@@ -1,0 +1,7 @@
+usr/include/secp256k1/
+usr/include/ufsecp/
+usr/lib/*/libfastsecp256k1.so
+usr/lib/*/libufsecp.so
+usr/lib/*/libfastsecp256k1.a
+usr/lib/*/pkgconfig/secp256k1-fast.pc
+usr/lib/*/cmake/secp256k1-fast/

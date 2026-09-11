@@ -1,0 +1,54 @@
+{
+  "name": "react-native-ultrafast-secp256k1",
+  "version": "0.0.0-dev",
+  "description": "React Native bindings for UltrafastSecp256k1 \u2014 high-performance secp256k1 ECDSA, Schnorr, Bitcoin/Ethereum crypto for mobile apps (version overridden at release time by CI from git tag)",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "react-native": "lib/index.js",
+  "files": [
+    "lib/",
+    "android/",
+    "ios/",
+    "cpp/",
+    "react-native-ultrafast-secp256k1.podspec",
+    "README.md"
+  ],
+  "scripts": {
+    "test:contract": "node tests/mock_bridge_smoke.cjs",
+    "typescript": "tsc --noEmit",
+    "lint": "eslint lib/"
+  },
+  "keywords": [
+    "react-native",
+    "secp256k1",
+    "bitcoin",
+    "ethereum",
+    "crypto",
+    "ecdsa",
+    "schnorr",
+    "taproot",
+    "mobile-crypto",
+    "wallet",
+    "signing",
+    "elliptic-curve",
+    "ios",
+    "android"
+  ],
+  "author": "UltrafastSecp256k1",
+  "license": "MIT",
+  "homepage": "https://github.com/shrec/UltrafastSecp256k1",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shrec/UltrafastSecp256k1.git",
+    "directory": "libs/UltrafastSecp256k1/bindings/react-native"
+  },
+  "peerDependencies": {
+    "react": ">=18.0.0",
+    "react-native": ">=0.71.0"
+  },
+  "devDependencies": {
+    "react": "^19.2.4",
+    "react-native": "^0.85.1",
+    "typescript": "^6.0.2"
+  }
+}

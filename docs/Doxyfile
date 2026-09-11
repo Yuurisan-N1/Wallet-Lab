@@ -1,0 +1,77 @@
+# ============================================================================
+# UltrafastSecp256k1 — Doxygen Configuration
+# ============================================================================
+# Generate: doxygen Doxyfile
+# Output:   docs/html/
+# ============================================================================
+
+PROJECT_NAME           = "UltrafastSecp256k1"
+PROJECT_NUMBER         = 0.0.0-dev
+PROJECT_BRIEF          = "Ultra high-performance secp256k1 elliptic curve cryptography library"
+PROJECT_LOGO           =
+
+OUTPUT_DIRECTORY       = docs/generated
+CREATE_SUBDIRS         = NO
+
+# ── Input ─────────────────────────────────────────────────────────────────────
+INPUT                  = src/cpu/include \
+                         include \
+                         bindings/wasm/secp256k1_wasm.h \
+                         README.md
+INPUT_ENCODING         = UTF-8
+FILE_PATTERNS          = *.hpp *.h *.cpp *.md
+RECURSIVE              = YES
+EXCLUDE                = src/cpu/include/secp256k1/config.hpp
+USE_MDFILE_AS_MAINPAGE = README.md
+
+# ── Extraction ────────────────────────────────────────────────────────────────
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = YES
+EXTRACT_LOCAL_CLASSES  = YES
+EXTRACT_ANON_NSPACES   = NO
+
+# ── Source browsing ───────────────────────────────────────────────────────────
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+STRIP_CODE_COMMENTS    = YES
+REFERENCED_BY_RELATION = YES
+REFERENCES_RELATION    = YES
+
+# ── Build ─────────────────────────────────────────────────────────────────────
+BUILTIN_STL_SUPPORT    = YES
+CASE_SENSE_NAMES       = YES
+SHOW_INCLUDE_FILES     = YES
+SORT_MEMBER_DOCS       = YES
+GENERATE_TODOLIST      = YES
+GENERATE_DEPRECATEDLIST = YES
+
+# ── Output formats ────────────────────────────────────────────────────────────
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+HTML_COLORSTYLE        = LIGHT
+HTML_DYNAMIC_SECTIONS  = YES
+GENERATE_TREEVIEW      = YES
+TREEVIEW_WIDTH         = 280
+SEARCHENGINE           = YES
+
+GENERATE_LATEX         = NO
+GENERATE_XML           = NO
+GENERATE_MAN           = NO
+GENERATE_RTF           = NO
+
+# ── Graphs ────────────────────────────────────────────────────────────────────
+HAVE_DOT               = NO
+CLASS_DIAGRAMS         = YES
+COLLABORATION_GRAPH    = NO
+INCLUDE_GRAPH          = NO
+INCLUDED_BY_GRAPH      = NO
+CALL_GRAPH             = NO
+CALLER_GRAPH           = NO
+
+# ── Warnings ──────────────────────────────────────────────────────────────────
+QUIET                  = YES
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = NO
+WARN_IF_DOC_ERROR      = YES
+WARN_FORMAT            = "$file:$line: $text"

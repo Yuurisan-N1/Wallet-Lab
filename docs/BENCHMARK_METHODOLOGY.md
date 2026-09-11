@@ -1,0 +1,258 @@
+# Benchmark Methodology
+
+How UltrafastSecp256k1 benchmarks are collected, reported, and tracked for
+regression detection.
+
+---
+
+## Principles
+
+1. **Reproducibility** -- same code on same hardware produces same results (+-2%)
+2. **Isolation** -- benchmarks run with minimal background load
+3. **Statistical rigor** -- multiple iterations with median reporting
+4. **Cross-platform** -- results collected on multiple architectures
+5. **Automated tracking** -- CI catches regressions before merge
+
+---
+
+## Benchmark Framework
+
+### `bench_unified`
+
+The primary benchmark binary:
+
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSECP256K1_BUILD_BENCH=ON
+cmake --build build --target bench_unified
+./build/cpu/bench_unified
+```
+
+#### Operations Measured
+
+| Category | Operations |
+|----------|-----------|
+| Field | mul, square, add, sub, negate, inverse, sqrt, batch_inverse |
+| Scalar | mul, add, negate, inverse |
+| Point | add (Jacobian), double, scalar_mul, generator_mul |
+| Signatures | ECDSA sign/verify, Schnorr sign/verify |
+| Multi-scalar | Straus (N=2..64), Pippenger (N=64..4096) |
+| CT | ct::scalar_mul, ct::ecdsa_sign, ct::schnorr_sign |
+| Protocols | MuSig2 (2/3/5 party), FROST (2-of-3, 3-of-5), Adaptor |
+
+#### Timing Method
+
+The actual `bench_unified` harness (`bench/benchmark_harness.hpp`):
+
+```
+1. CPU frequency warm-up: 3-second wall-clock spin at full load (establishes
+   stable TSC rate before any measurement begins)
+2. Per-operation runs: 11 passes, each timed with RDTSCP
+3. IQR trimming: discard values outside [Q1 − 1.5×IQR, Q3 + 1.5×IQR]
+4. Report: median of trimmed values converted to nanoseconds via TSC calibration
+```
+
+- **Timer**: `RDTSCP` (serialising read of TSC — no out-of-order reordering)
+- **Warmup**: 3-second wall-clock CPU frequency stabilisation, then 500
+  discarded iterations per operation before measurement begins
+- **Passes**: 11 timed passes per operation; IQR outlier removal applied
+- **CPU pinning**: `taskset -c 0` + turbo disabled for all published results
+
+### Output Format
+
+```
+[field_mul]          17 ns
+[field_square]       16 ns
+[scalar_mul]         25 us
+[ecdsa_sign]         30 us
+```
+
+Parsed by `.github/scripts/parse_benchmark.py` into JSON for dashboard:
+
+```json
+[
+  {"name": "field_mul", "unit": "ns", "value": 17},
+  {"name": "scalar_mul", "unit": "ns", "value": 25000}
+]
+```
+
+---
+
+## Measurement Environment
+
+### Hardware Requirements
+
+For reliable results:
+
+- **CPU frequency**: Fixed (disable turbo boost / dynamic scaling)
+- **Thermal throttling**: Monitor -- abort if throttled
+- **Background load**: Minimal (no browser, no IDE profiling)
+- **Memory**: Sufficient to avoid swapping
+
+### Linux (Recommended)
+
+```bash
+# Disable CPU frequency scaling
+sudo cpupower frequency-set -g performance
+
+# Disable turbo boost (Intel)
+echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo
+
+# Pin to single core (reduce scheduling noise)
+taskset -c 0 ./build/cpu/bench_unified
+```
+
+### Windows
+
+```powershell
+# Set high-performance power plan
+powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+
+# Close background applications
+# Use Process Lasso or similar for core affinity
+```
+
+---
+
+## Statistical Method
+
+### Single Run
+
+Each operation runs **11 internal passes** (500 warmup iterations, IQR outlier
+removal, median reported). This matches `benchmark_harness.hpp` `Harness(500, 11)`.
+
+### Regression Detection
+
+The CI benchmark workflow (`benchmark.yml`) uses
+[github-action-benchmark](https://github.com/benchmark-action/github-action-benchmark):
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| Alert threshold | 200% | Warns if >100% slower (shared-runner noise tolerance) |
+| Tool | `customSmallerIsBetter` | Lower = faster |
+| Auto-push | No | Manual workflow_dispatch required for baseline updates |
+| Comment-on-alert | Yes | PR notification |
+| Fail-on-alert | No | Allows investigation |
+
+### What Counts as a Regression
+
+| Severity | Threshold | Action |
+|----------|-----------|--------|
+| Warning | >20% slower | Comment on PR |
+| Alert | >50% slower | Block merge (investigate) |
+| Critical | >100% slower (2x) | Revert immediately |
+
+---
+
+## Platform Matrix
+
+Benchmarks are collected on:
+
+| Platform | Hardware | CI |
+|----------|----------|-----|
+| x86-64 Linux | Ubuntu 24.04, GH Actions runner | [OK] Every push (dev/main) |
+| x86-64 Windows | Windows Latest, GH Actions runner | [OK] Every push (dev/main) |
+| ARM64 Linux | Cross-compile + QEMU (estimated) | [!] Nightly |
+| RISC-V 64 | SiFive HiFive Unmatched (manual) | [FAIL] Manual |
+| ESP32-S3 | 240 MHz LX7 (manual) | [FAIL] Manual |
+| Apple Silicon | M3 Pro (manual) | [FAIL] Manual |
+| CUDA | RTX 5060 Ti (manual) | [FAIL] Manual |
+
+---
+
+## Reference Numbers
+
+Current baseline: see [`docs/bench_unified_2026-05-30_gcc14_x86-64.json`](bench_unified_2026-05-30_gcc14_x86-64.json)
+for canonical measurements (GCC 14.2.0, Release+LTO, Intel i5-14400F, turbo off,
+taskset -c 0, nice -20, 11 passes IQR).
+
+Key values (GCC 14.2.0, Release+LTO, from `bench_unified_2026-05-30_gcc14_x86-64.json`):
+
+| Operation | Time | Notes |
+|-----------|------|-------|
+| CT ECDSA sign | ~22.5 µs | `ct::ecdsa_sign` — constant-time production path (canonical `ct_signing_gcc_detail.ct_ecdsa_sign_ns` = 22500.94) |
+| CT Schnorr sign | ~18.0 µs | `ct::schnorr_sign` — constant-time production path (canonical `ct_signing_gcc_detail.ct_schnorr_sign_ns` = 17953.41) |
+| ECDSA verify | ~41.1 µs | variable-time, correct for public data (canonical `sign_verify_gcc.ecdsa_verify_ns` = 41111.04) |
+| Schnorr verify | ~42.2 µs | variable-time, cached x-only (canonical `sign_verify_gcc.schnorr_verify_cached_ns` = 42164.67) |
+
+These serve as the alert baseline. Any commit causing >100% regression on a tracked
+metric is flagged (200% threshold accounts for shared-runner noise).
+
+---
+
+## Adding New Benchmarks
+
+1. Add the benchmark to `src/cpu/bench/bench_unified.cpp`
+2. Use the standard timing pattern (warmup + DoNotOptimize + median)
+3. Output format: `[operation_name]  <value> <unit>`
+4. Update `.github/scripts/parse_benchmark.py` if the output format changes
+5. The CI dashboard auto-discovers new entries from the JSON output
+
+---
+
+## See Also
+
+- [docs/BENCHMARKS.md](BENCHMARKS.md) -- Full results across all platforms
+- [docs/PERFORMANCE_GUIDE.md](PERFORMANCE_GUIDE.md) -- Tuning recommendations
+- [docs/PERFORMANCE_REGRESSION.md](PERFORMANCE_REGRESSION.md) -- Regression tracking policy
+
+---
+
+## Agent / AI Optimization Protocol (Strict)
+
+This section applies to any AI agent (Claude, Codex, Gemini, etc.) making
+performance-related changes. Violations were observed in the 2026-05-04 session
+and resulted in incorrect regression claims.
+
+### Mandatory 4-step procedure
+
+**Step 1 — Stable baseline BEFORE touching code**
+
+```bash
+sudo cpupower frequency-set -g performance
+echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost
+
+cmake -S . -B /tmp/bench_baseline -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build /tmp/bench_baseline --target bench_unified
+
+# Run ≥5 times — accept only if run-to-run variance < 3%
+for i in 1 2 3 4 5; do
+    taskset -c 0 nice -20 /tmp/bench_baseline/src/cpu/bench_unified \
+        2>/dev/null | grep "TARGET_OP"
+done
+```
+
+If variance > 3%: do not proceed — fix thermal/scheduling first.
+
+**Step 2 — Make the change, rebuild**
+
+```bash
+cmake --build /tmp/bench_new --target bench_unified
+```
+
+Use a SEPARATE build directory from the baseline. Same cmake flags.
+
+**Step 3 — Measure new code identically (≥5 runs)**
+
+**Step 4 — Compare ranges**
+
+| Result | Condition |
+|--------|-----------|
+| ✓ Improvement | `new_max < baseline_min` |
+| ✗ Regression | `new_min > baseline_max` |
+| ○ Inconclusive | ranges overlap — do NOT claim speedup |
+
+### What NOT to do
+
+- ❌ Compare a saved `benchmark.json` against a new run (different harness/compiler)
+- ❌ Claim improvement from a single measurement
+- ❌ Treat overlapping ranges as a regression or improvement
+- ❌ Run bench_unified without CPU pinning and frequency locking on a shared server
+
+### Lesson from 2026-05-04 session
+
+`dual_mul +3.2%` and `ecdsa_verify +4.1%` were flagged as regressions after
+comparing `benchmark.json` (GCC 13, 3 passes) vs a new run (GCC 14, 11 passes).
+A controlled 5-run comparison showed ranges fully overlapping → pure noise.
+The threshold for noise on this hardware without pinning is ±10–15% for ~20µs ops.
+A separate struct-copy bug was found and fixed (commit `c40ca6fc`) during the same
+investigation.

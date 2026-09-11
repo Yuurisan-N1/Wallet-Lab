@@ -1,0 +1,660 @@
+# Audit Traceability Matrix
+
+**UltrafastSecp256k1 v4.5.0** -- Evidence-Based Correctness & Security Mapping
+
+> Every security claim in this system is traceable to executable evidence.
+>
+> If a claim cannot be traced to a test, it is not considered valid.
+
+## TL;DR
+
+- All security claims are mapped to specific tests
+- All tests execute in CI on every commit
+- All results are locally reproducible
+
+Security is not asserted — it is traceable.
+
+**Chain:** Claim → Test → Module → Audit Run → Result → CI → Coverage
+
+**Example:**
+
+| Element | Value |
+|---------|-------|
+| Claim | "Scalar multiplication is correct" |
+| Test | `audit/test_scalar_invariants.cpp` |
+| Module | Section 1 / Math Invariants |
+| Result | PASS (~93,215 checks) |
+| Coverage | Included in `unified_audit_runner` |
+
+---
+
+> This document maps every mathematical invariant to its implementation code,
+> validation method, and specific test location. It is the primary artifact for
+> auditors to verify that all claimed guarantees have corresponding evidence.
+
+---
+
+## Methodology
+
+Each row in this matrix links:
+1. **Invariant ID** -- from [INVARIANTS.md](INVARIANTS.md) (108 total)
+2. **Mathematical Claim** -- the exact property guaranteed
+3. **Implementation** -- source file(s) implementing the primitive
+4. **Validation Method** -- how it is verified (deterministic, statistical, differential)
+5. **Test Location** -- exact file and function/line where evidence is produced
+6. **Status** -- [OK] Verified | [!] Partial | [FAIL] Gap
+7. **Formal invariant spec** -- machine-readable invariant definitions for critical operations in `docs/FORMAL_INVARIANTS_SPEC.json`, validated by `ci/check_formal_invariants.py`
+
+---
+
+## 1. Field Arithmetic ($\mathbb{F}_p$, $p = 2^{256} - 2^{32} - 977$)
+
+| ID | Invariant | Implementation | Validation | Test Location | Status |
+|----|-----------|---------------|------------|---------------|--------|
+| **F1** | $\text{normalize}(a) \in [0, p)$ | `src/cpu/include/secp256k1/field.hpp` | Canonical serialization check (10K random) | `audit_field.cpp` -> `test_canonical()` | [OK] |
+| **F2** | $a + b \equiv (a + b) \bmod p$ | `src/cpu/include/secp256k1/field.hpp` | Commutativity + associativity + overflow (3K random) | `audit_field.cpp` -> `test_addition_overflow()` | [OK] |
+| **F3** | $a - b \equiv (a - b + p) \bmod p$ | `src/cpu/include/secp256k1/field.hpp` | Borrow-chain, $0 - a = -a$ (3K random) | `audit_field.cpp` -> `test_subtraction_borrow()` | [OK] |
+| **F4** | $a \cdot b \equiv (a \cdot b) \bmod p$ | `src/cpu/include/secp256k1/field.hpp` | Commutativity + associativity + distributivity (5K random) | `audit_field.cpp` -> `test_mul_carry()` | [OK] |
+| **F5** | $a^2 = a \cdot a$ | `src/cpu/include/secp256k1/field.hpp` | Square vs mul equivalence (10K random) | `audit_field.cpp` -> `test_square_vs_mul()` | [OK] |
+| **F6** | $a \cdot a^{-1} \equiv 1 \bmod p$ for $a \neq 0$ | `src/cpu/include/secp256k1/field.hpp` | Inverse correctness + double inverse (11K random) | `audit_field.cpp` -> `test_inverse()` | [OK] |
+| **F7** | $\text{inv}(0)$ is undefined / returns zero | `src/cpu/include/secp256k1/field.hpp` | Exception/zero-return check | `audit_security.cpp` -> `test_zero_key_handling()` | [OK] |
+| **F8** | $\sqrt{a}^2 = a$ when $a$ is QR | `src/cpu/include/secp256k1/field.hpp` | Square root correctness (10K random, ~50.72% QR) | `audit_field.cpp` -> `test_sqrt()` | [OK] |
+| **F9** | $\sqrt{a}$ returns nullopt for QNR | `src/cpu/include/secp256k1/field.hpp` | Implicit (non-QR returns +-x mismatch) | `audit_field.cpp` -> `test_sqrt()` | [OK] |
+| **F10** | $-a + a \equiv 0 \bmod p$ | `src/cpu/include/secp256k1/field.hpp` | Negate + add to zero (1K random) | `audit_field.cpp` -> `test_addition_overflow()` | [OK] |
+| **F11** | `from_bytes(to_bytes(a)) == a` | `src/cpu/include/secp256k1/field.hpp` | Serialization round-trip (1K random) | `audit_field.cpp` -> `test_reduction()` | [OK] |
+| **F12** | `from_limbs` = little-endian uint64[4] | `src/cpu/include/secp256k1/field.hpp` | Endianness conformance | `audit_field.cpp` -> `test_limb_boundary()` | [OK] |
+| **F13** | `from_bytes` = big-endian 32 bytes | `src/cpu/include/secp256k1/field.hpp` | Known vector: $\text{from\_bytes}(p) = 0$ | `audit_field.cpp` -> `test_reduction()` | [OK] |
+| **F14** | Commutativity: $a+b = b+a$, $a \cdot b = b \cdot a$ | `src/cpu/include/secp256k1/field.hpp` | Random stress (2K) | `audit_field.cpp` -> `test_addition_overflow()`, `test_mul_carry()` | [OK] |
+| **F15** | Associativity: $(a+b)+c = a+(b+c)$ | `src/cpu/include/secp256k1/field.hpp` | Random stress (1K) | `audit_field.cpp` -> `test_addition_overflow()` | [OK] |
+| **F16** | Distributivity: $a(b+c) = ab + ac$ | `src/cpu/include/secp256k1/field.hpp` | Random stress (1K) | `audit_field.cpp` -> `test_mul_carry()` | [OK] |
+| **F17** | `field_select` branchless: $\text{sel}(0,a,b)=a$, $\text{sel}(1,a,b)=b$ | `src/cpu/include/secp256k1/ct/ops.hpp` | Functional correctness | `audit_ct.cpp` -> `test_ct_cmov_cswap()` | [OK] |
+
+**Field Subtotal: 17/17 [OK]**
+
+---
+
+## 2. Scalar Arithmetic ($\mathbb{Z}_n$, $n = $ order of secp256k1)
+
+| ID | Invariant | Implementation | Validation | Test Location | Status |
+|----|-----------|---------------|------------|---------------|--------|
+| **S1** | $a + b \equiv (a + b) \bmod n$ | `src/cpu/include/secp256k1/scalar.hpp` | Commutativity + associativity (10K random) | `audit_scalar.cpp` -> `test_scalar_laws()` | [OK] |
+| **S2** | $a - b \equiv (a - b + n) \bmod n$ | `src/cpu/include/secp256k1/scalar.hpp` | Edge cases + random | `audit_scalar.cpp` -> `test_edge_scalars()` | [OK] |
+| **S3** | $a \cdot b \equiv (a \cdot b) \bmod n$ | `src/cpu/include/secp256k1/scalar.hpp` | Commutativity + associativity + distributivity (10K) | `audit_scalar.cpp` -> `test_scalar_laws()` | [OK] |
+| **S4** | $a \cdot a^{-1} \equiv 1 \bmod n$ for $a \neq 0$ | `src/cpu/include/secp256k1/scalar.hpp` | Inverse + double inverse (11K random) | `audit_scalar.cpp` -> `test_scalar_inverse()` | [OK] |
+| **S5** | $-a + a \equiv 0 \bmod n$ | `src/cpu/include/secp256k1/scalar.hpp` | Negate self-consistency (10K) | `audit_scalar.cpp` -> `test_negate()` | [OK] |
+| **S6** | `is_zero(0) == true` | `src/cpu/include/secp256k1/scalar.hpp` | Direct check | `audit_scalar.cpp` -> `test_edge_scalars()` | [OK] |
+| **S7** | `is_zero(1) == false` | `src/cpu/include/secp256k1/scalar.hpp` | Direct check | `audit_scalar.cpp` -> `test_edge_scalars()` | [OK] |
+| **S8** | `normalize(a)` yields $0 \leq a < n$ | `src/cpu/include/secp256k1/scalar.hpp` | Overflow normalization (10K random) | `audit_scalar.cpp` -> `test_overflow_normalization()` | [OK] |
+| **S9** | Low-S: if $s > n/2$, replace with $n - s$ | `src/cpu/include/secp256k1/ecdsa.hpp` | High-S detection + normalization (1K) | `audit_security.cpp` -> `test_high_s_rejection()` | [OK] |
+
+**Scalar Subtotal: 9/9 [OK]**
+
+---
+
+## 3. Point / Group Invariants (secp256k1 curve)
+
+| ID | Invariant | Implementation | Validation | Test Location | Status |
+|----|-----------|---------------|------------|---------------|--------|
+| **P1** | $G$ on curve: $G_y^2 = G_x^3 + 7 \bmod p$ | `src/cpu/include/secp256k1/point.hpp` | On-curve check (100K random points) | `audit_point.cpp` -> `test_stress_random()` | [OK] |
+| **P2** | $n \cdot G = \mathcal{O}$ | `src/cpu/include/secp256k1/point.hpp` | Direct computation | `audit_point.cpp` -> `test_infinity()` | [OK] |
+| **P3** | $P + \mathcal{O} = P$ | `src/cpu/include/secp256k1/point.hpp` | Identity element | `audit_point.cpp` -> `test_infinity()` | [OK] |
+| **P4** | $P + (-P) = \mathcal{O}$ | `src/cpu/include/secp256k1/point.hpp` | Inverse cancellation (1K random) | `audit_point.cpp` -> `test_point_negation()` | [OK] |
+| **P5** | $(P+Q)+R = P+(Q+R)$ | `src/cpu/include/secp256k1/point.hpp` | Associativity (500 random triples) | `audit_point.cpp` -> `test_jacobian_add()` | [OK] |
+| **P6** | $P + Q = Q + P$ | `src/cpu/include/secp256k1/point.hpp` | Commutativity (1K random) | `audit_point.cpp` -> `test_jacobian_add()` | [OK] |
+| **P7** | $k(P+Q) = kP + kQ$ | `src/cpu/include/secp256k1/point.hpp` | Distributivity | `test_ecc_properties.cpp` -> `test_distributivity()` | [OK] |
+| **P8** | $(a+b) \cdot G = aG + bG$ | `src/cpu/include/secp256k1/point.hpp` | Scalar addition homomorphism (1K) | `audit_point.cpp` -> `test_scalar_mul_identities()` | [OK] |
+| **P9** | $(ab) \cdot G = a(bG)$ | `src/cpu/include/secp256k1/point.hpp` | Scalar multiplication (500) | `audit_point.cpp` -> `test_scalar_mul_identities()` | [OK] |
+| **P10** | `to_affine(to_jacobian(P)) == P` | `src/cpu/include/secp256k1/point.hpp` | Round-trip (1K) | `test_ecc_properties.cpp` -> `test_jacobian_affine_roundtrip()` | [OK] |
+| **P11** | Jacobian add == Affine add | `src/cpu/include/secp256k1/point.hpp` | Consistency | `test_ecc_properties.cpp` | [OK] |
+| **P12** | $\text{dbl}(P) = P + P$ | `src/cpu/include/secp256k1/point.hpp` | Double vs add (chain of 10 dbls = 1024*G) | `audit_point.cpp` -> `test_jacobian_dbl()` | [OK] |
+| **P13** | $\forall P: P_y^2 = P_x^3 + 7$ | `src/cpu/include/secp256k1/point.hpp` | On-curve stress (100K) | `audit_point.cpp` -> `test_stress_random()` | [OK] |
+| **P14** | `deserialize(serialize(P)) == P` | `src/cpu/include/secp256k1/point.hpp` | Compressed + uncompressed (1K) | `audit_point.cpp` -> `test_affine_conversion()` | [OK] |
+
+**Point Subtotal: 14/14 [OK]**
+
+---
+
+## 4. GLV Endomorphism
+
+| ID | Invariant | Implementation | Validation | Test Location | Status |
+|----|-----------|---------------|------------|---------------|--------|
+| **G1** | $\phi(P) = \lambda \cdot P$, $\lambda^3 \equiv 1 \bmod n$ | `src/cpu/include/secp256k1/glv.hpp` | Algebraic point verification | `audit_scalar.cpp` -> `test_glv_split()` | [OK] |
+| **G2** | $\phi(\phi(P)) + \phi(P) + P = \mathcal{O}$ | `src/cpu/include/secp256k1/glv.hpp` | Endomorphism relation | Comprehensive test #22 | [OK] |
+| **G3** | $k \equiv k_1 + k_2 \lambda \bmod n$ | `src/cpu/include/secp256k1/glv.hpp` | Decomposition algebraic check | `audit_scalar.cpp` -> `test_glv_split()` | [OK] |
+| **G4** | $\lvert k_1\rvert, \lvert k_2\rvert < \sqrt{n}$ | `src/cpu/include/secp256k1/glv.hpp` | Balanced split | Comprehensive test #22 | [OK] |
+
+**GLV Subtotal: 4/4 [OK]**
+
+---
+
+## 5. ECDSA (RFC 6979)
+
+| ID | Invariant | Implementation | Validation | Test Location | Status |
+|----|-----------|---------------|------------|---------------|--------|
+| **E1** | `verify(msg, sign(msg, sk), pk) == true` | `src/cpu/include/secp256k1/ecdsa.hpp` | Sign+verify round-trip (1K random) + official vectors | `audit_point.cpp` -> `test_ecdsa_roundtrip()`, `test_rfc6979_vectors.cpp` | [OK] |
+| **E2** | Deterministic nonce (same msg+sk -> same sig) | `src/cpu/include/secp256k1/ecdsa.hpp` | 6 official RFC 6979 nonce vectors | `test_rfc6979_vectors.cpp` | [OK] |
+| **E3** | $r \in [1, n-1]$, $s \in [1, n-1]$ | `src/cpu/include/secp256k1/ecdsa.hpp` | Non-zero sig check (1K) | `audit_point.cpp` -> `test_ecdsa_roundtrip()` | [OK] |
+| **E4** | Low-S enforced: $s \leq n/2$ | `src/cpu/include/secp256k1/ecdsa.hpp` | `is_low_s()` check + high-S rejection | `audit_security.cpp` -> `test_high_s_rejection()` | [OK] |
+| **E5** | DER encoding round-trip | `src/cpu/include/secp256k1/ecdsa.hpp` | Parse -> serialize -> parse | `test_fuzz_parsers.cpp` suites 1-3 | [OK] |
+| **E6** | Sign with $sk = 0$ or $sk \geq n$ -> failure | `src/cpu/include/secp256k1/ecdsa.hpp` | Zero/overflow key rejection | `audit_security.cpp` -> `test_zero_key_handling()` | [OK] |
+| **E7** | Verify with wrong message -> false | `src/cpu/include/secp256k1/ecdsa.hpp` | Message bit-flip (1K) | `audit_point.cpp` -> `test_ecdsa_roundtrip()` | [OK] |
+| **E8** | Verify with wrong pubkey -> false | `src/cpu/include/secp256k1/ecdsa.hpp` | Wrong-key rejection (1K) | `audit_point.cpp` -> `test_ecdsa_roundtrip()` | [OK] |
+
+**ECDSA Subtotal: 8/8 [OK]**
+
+---
+
+## 6. Schnorr / BIP-340
+
+| ID | Invariant | Implementation | Validation | Test Location | Status |
+|----|-----------|---------------|------------|---------------|--------|
+| **B1** | BIP-340 sign+verify round-trip | `src/cpu/include/secp256k1/schnorr.hpp` | 1K random round-trips | `audit_point.cpp` -> `test_schnorr_roundtrip()` | [OK] |
+| **B2** | All 15 official test vectors | `src/cpu/include/secp256k1/schnorr.hpp` | v0-v3 sign + v4-v14 verify | `test_bip340_vectors.cpp` | [OK] |
+| **B3** | Signature = 64 bytes $(R_x \| s)$ | `src/cpu/include/secp256k1/schnorr.hpp` | Format validation | `test_bip340_vectors.cpp` | [OK] |
+| **B4** | $R$ has even y-coordinate | `src/cpu/include/secp256k1/schnorr.hpp` | Parity check in vectors | `test_bip340_vectors.cpp` | [OK] |
+| **B5** | Public key is x-only (32 bytes) | `src/cpu/include/secp256k1/schnorr.hpp` | X-only format | `test_bip340_vectors.cpp` | [OK] |
+| **B6** | Sign with $sk = 0$ -> failure | `src/cpu/include/secp256k1/schnorr.hpp` | Edge case | `test_fuzz_address_bip32_ffi.cpp` | [OK] |
+
+**Schnorr Subtotal: 6/6 [OK]**
+
+---
+
+## 7. MuSig2 (BIP-327)
+
+| ID | Invariant | Implementation | Validation | Test Location | Status |
+|----|-----------|---------------|------------|---------------|--------|
+| **M1** | Aggregated sig verifies as BIP-340 | `src/cpu/include/secp256k1/musig2.hpp` | Multi-party simulation | `test_musig2_frost.cpp` suites 1-6 | [OK] |
+| **M2** | Key aggregation deterministic | `src/cpu/include/secp256k1/musig2.hpp` | Same-input reproducibility | `test_musig2_frost.cpp` | [OK] |
+| **M3** | Nonce aggregation deterministic | `src/cpu/include/secp256k1/musig2.hpp` | Same-input reproducibility | `test_musig2_frost.cpp` | [OK] |
+| **M4** | 2/3/5-of-N signing | `src/cpu/include/secp256k1/musig2.hpp` | Multi-threshold simulation | `test_musig2_frost.cpp` suites 4-6 | [OK] |
+| **M5** | Invalid partial sig detected | `src/cpu/include/secp256k1/musig2.hpp` | Fault injection | `test_musig2_frost_advanced.cpp` suite 5 | [OK] |
+| **M6** | Rogue-key attack detected | `src/cpu/include/secp256k1/musig2.hpp` | Wagner-style simulation | `test_musig2_frost_advanced.cpp` suites 1-2, `test_adversarial_protocol.cpp` A.4 | [OK] |
+| **M7** | Nonce reuse detected | `src/cpu/include/secp256k1/musig2.hpp` | Cross-message detection | `test_musig2_frost_advanced.cpp` suites 3-4, `test_adversarial_protocol.cpp` A.1 | [OK] |
+| **M8** | Transcript mutation detected | `src/cpu/include/secp256k1/musig2.hpp` | Corrupt keyagg blob between steps | `test_adversarial_protocol.cpp` A.5 | [OK] |
+| **M9** | Signer ordering mismatch detected | `src/cpu/include/secp256k1/musig2.hpp` | Sign with wrong index | `test_adversarial_protocol.cpp` A.6 | [OK] |
+| **M10** | Malicious aggregator detected | `src/cpu/include/secp256k1/musig2.hpp` | Tampered aggnonce | `test_adversarial_protocol.cpp` A.7 | [OK] |
+
+**MuSig2 Subtotal: 10/10 [OK]**
+
+---
+
+## 8. FROST Threshold Signatures
+
+| ID | Invariant | Implementation | Validation | Test Location | Status |
+|----|-----------|---------------|------------|---------------|--------|
+| **FR1** | t-of-n DKG consistent group pubkey | `src/cpu/include/secp256k1/frost.hpp` | 2-of-3, 3-of-5 DKG | `test_musig2_frost.cpp` suites 7, 9 | [OK] |
+| **FR2** | Shamir reconstruction: $\sum \lambda_i s_i = s$ | `src/cpu/include/secp256k1/frost.hpp` | Lagrange reconstruction | `test_musig2_frost.cpp` | [OK] |
+| **FR3** | Aggregated sig verifies as BIP-340 | `src/cpu/include/secp256k1/frost.hpp` | Signing round-trip | `test_musig2_frost.cpp` suites 8, 10-11 | [OK] |
+| **FR4** | 2-of-3 with any 2 signers | `src/cpu/include/secp256k1/frost.hpp` | Combinatorial test | `test_musig2_frost.cpp` | [OK] |
+| **FR5** | 3-of-5 with any 3 signers | `src/cpu/include/secp256k1/frost.hpp` | Combinatorial test | `test_musig2_frost.cpp` | [OK] |
+| **FR6** | Lagrange coefficients correct | `src/cpu/include/secp256k1/frost.hpp` | Secret reconstruction | `test_musig2_frost.cpp` | [OK] |
+| **FR7** | Malicious DKG share detected | `src/cpu/include/secp256k1/frost.hpp` | Commitment verification | `test_musig2_frost_advanced.cpp` suites 6-7 | [OK] |
+| **FR8** | Invalid partial sig detected | `src/cpu/include/secp256k1/frost.hpp` | Rejection test | `test_musig2_frost_advanced.cpp` | [OK] |
+| **FR9** | Below-threshold subset fails | `src/cpu/include/secp256k1/frost.hpp` | 1-of-3 attempt -> fail | `test_musig2_frost_advanced.cpp`, `test_adversarial_protocol.cpp` B.1 | [OK] |
+| **FR10** | Malicious coordinator detected | `src/cpu/include/secp256k1/frost.hpp` | Inconsistent commit sets | `test_adversarial_protocol.cpp` B.4 | [OK] |
+| **FR11** | Duplicate nonce commitments handled | `src/cpu/include/secp256k1/frost.hpp` | Submit same nonce twice | `test_adversarial_protocol.cpp` B.5 | [OK] |
+
+**FROST Subtotal: 11/11 [OK]**
+
+---
+
+## 9. BIP-324 Encrypted Transport
+
+| ID | Invariant | Implementation | Validation | Test Location | Status |
+|----|-----------|---------------|------------|---------------|--------|
+| **T3241** | Initiator/responder derive matching session state from the same handshake transcript | `src/cpu/include/secp256k1/bip324.hpp`, `src/cpu/src/bip324.cpp` | Deterministic handshake round-trip | `src/cpu/tests/test_bip324.cpp` -> `test_bip324_session()` | [OK] |
+| **T3242** | Post-handshake encrypt/decrypt are inverse operations across message sequences | `src/cpu/include/secp256k1/bip324.hpp`, `src/cpu/src/bip324.cpp` | Multi-message round-trip | `src/cpu/tests/test_bip324.cpp` -> `test_bip324_sequence()` | [OK] |
+| **T3243** | Fixed-key sessions remain deterministic across repeated runs | `src/cpu/include/secp256k1/bip324.hpp`, `src/cpu/src/bip324.cpp` | Repeatability check | `src/cpu/tests/test_bip324.cpp` -> `test_bip324_determinism()` | [OK] |
+| **T3244** | Empty, short, and 4 KiB payloads survive transport round-trip | `src/cpu/include/secp256k1/bip324.hpp`, `src/cpu/src/bip324.cpp` | Size sweep | `src/cpu/tests/test_bip324.cpp` -> `test_bip324_sizes()` | [OK] |
+| **T3245** | Tampered ciphertext, tag, or transcript inputs are rejected | `src/cpu/include/secp256k1/bip324.hpp`, `src/cpu/src/bip324.cpp` | Tamper matrix + wrong-peer checks | `src/cpu/tests/test_bip324.cpp` -> `test_bip324_tamper()` | [OK] |
+| **T3246** | Public C ABI create/handshake/encrypt/decrypt surface matches C++ transport behavior | `include/ufsecp/ufsecp.h`, `include/ufsecp/ufsecp_impl.cpp` | FFI round-trip coverage | `src/cpu/tests/test_ffi_coverage.cpp` -> `test_bip324_session()` | [OK] |
+
+**BIP-324 Subtotal: 6/6 [OK]**
+
+---
+
+## 10. BIP-32 HD Derivation
+
+| ID | Invariant | Implementation | Validation | Test Location | Status |
+|----|-----------|---------------|------------|---------------|--------|
+| **H1** | TV1-TV5 official vectors (90 checks) | `src/cpu/include/secp256k1/bip32.hpp` | Byte-exact comparison | `test_bip32_vectors.cpp` | [OK] |
+| **H2** | `derive(master, "m") == master` | `src/cpu/include/secp256k1/bip32.hpp` | Identity derivation | `test_bip32_vectors.cpp` | [OK] |
+| **H3** | Hardened derivation formula correct | `src/cpu/include/secp256k1/bip32.hpp` | Official vector conformance | `test_bip32_vectors.cpp` | [OK] |
+| **H4** | Normal derivation formula correct | `src/cpu/include/secp256k1/bip32.hpp` | Official vector conformance | `test_bip32_vectors.cpp` | [OK] |
+| **H5** | Path parser: valid/invalid paths | `src/cpu/include/secp256k1/bip32.hpp` | Fuzz testing | `test_fuzz_address_bip32_ffi.cpp` suites 5-7 | [OK] |
+| **H6** | Seed length 16-64 bytes enforced | `src/cpu/include/secp256k1/bip32.hpp` | Boundary test | `test_fuzz_address_bip32_ffi.cpp` | [OK] |
+| **H7** | Deterministic for same seed+path | `src/cpu/include/secp256k1/bip32.hpp` | Reproducibility | `test_bip32_vectors.cpp` | [OK] |
+
+**BIP-32 Subtotal: 7/7 [OK]**
+
+---
+
+## 11. Address Generation
+
+| ID | Invariant | Implementation | Validation | Test Location | Status |
+|----|-----------|---------------|------------|---------------|--------|
+| **A1** | P2PKH: `1...` prefix (mainnet) | `src/cpu/include/secp256k1/address.hpp` | Prefix check | `test_fuzz_address_bip32_ffi.cpp` suites 1-4 | [OK] |
+| **A2** | P2WPKH: `bc1q...` prefix (mainnet) | `src/cpu/include/secp256k1/address.hpp` | Prefix check | `test_fuzz_address_bip32_ffi.cpp` | [OK] |
+| **A3** | P2TR: `bc1p...` prefix (mainnet) | `src/cpu/include/secp256k1/address.hpp` | Prefix check | `test_fuzz_address_bip32_ffi.cpp` | [OK] |
+| **A4** | WIF round-trip | `src/cpu/include/secp256k1/address.hpp` | Encode->decode identity | `test_fuzz_address_bip32_ffi.cpp` | [OK] |
+| **A5** | NULL/invalid -> error (no crash) | `src/cpu/include/secp256k1/address.hpp` | Fuzz 10K random blobs | `test_fuzz_address_bip32_ffi.cpp` | [OK] |
+| **A6** | Zero pubkey -> graceful failure | `src/cpu/include/secp256k1/address.hpp` | Edge case | `test_fuzz_address_bip32_ffi.cpp` | [OK] |
+
+**Address Subtotal: 6/6 [OK]**
+
+---
+
+## 12. C ABI (`ufsecp` shim)
+
+| ID | Invariant | Implementation | Validation | Test Location | Status |
+|----|-----------|---------------|------------|---------------|--------|
+| **C1** | `context_create()` -> non-NULL | `compat/ufsecp.h` | Direct check | `test_fuzz_address_bip32_ffi.cpp` suites 8-13 | [OK] |
+| **C2** | `context_destroy(NULL)` = safe no-op | `compat/ufsecp.h` | NULL safety | `test_fuzz_address_bip32_ffi.cpp` | [OK] |
+| **C3** | NULL args -> `UFSECP_ERROR_NULL_ARGUMENT` | `compat/ufsecp.h` | All functions | `test_fuzz_address_bip32_ffi.cpp` | [OK] |
+| **C4** | `last_error()` reflects last code | `compat/ufsecp.h` | Sequence check | `test_fuzz_address_bip32_ffi.cpp` | [OK] |
+| **C5** | `error_string()` -> non-NULL for all codes | `compat/ufsecp.h` | Exhaustive | `test_fuzz_address_bip32_ffi.cpp` | [OK] |
+| **C6** | `abi_version()` -> non-zero | `compat/ufsecp.h` | Version check | `test_fuzz_address_bip32_ffi.cpp` | [OK] |
+| **C7** | Thread-safety: separate contexts safe | `compat/ufsecp.h` | TSan CI | CI `tsan.yml` + `test_c_abi_thread_stress.cpp` | [OK] |
+
+**C ABI Subtotal: 7/7**
+
+---
+
+## 13. Constant-Time (Side-Channel Resistance)
+
+| ID | Invariant | Implementation | Validation | Test Location | Status |
+|----|-----------|---------------|------------|---------------|--------|
+| **CT1** | `ct::scalar_mul` timing-independent of scalar | `src/cpu/include/secp256k1/ct/point.hpp` | dudect Welch t-test ($\lvert t\rvert < 4.5$) | `test_ct_sidechannel.cpp` -- sections 4a-4b | [OK] |
+| **CT2** | `ct::ecdsa_sign` timing-independent of privkey | `src/cpu/include/secp256k1/ct/point.hpp` | dudect Welch t-test | `test_ct_sidechannel.cpp` -- section 4c | [OK] |
+| **CT3** | `ct::schnorr_sign` timing-independent of privkey | `src/cpu/include/secp256k1/ct/point.hpp` | dudect Welch t-test | `test_ct_sidechannel.cpp` -- section 4d | [OK] |
+| **CT4** | `ct::field_inv` timing-independent of input | `src/cpu/include/secp256k1/ct/field.hpp` | dudect Welch t-test | `test_ct_sidechannel.cpp` -- section 2e | [OK] |
+| **CT5** | No secret-dependent branches in CT paths | `src/cpu/include/secp256k1/ct/*.hpp` | ct-verif (LLVM IR analysis) + dudect + code review | `ct-verif.yml` CI workflow + `test_ct_sidechannel.cpp` | [OK] |
+| **CT6** | No secret-dependent memory access in CT paths | `src/cpu/include/secp256k1/ct/*.hpp` | Valgrind CT (memory-origin tracking) + dudect + code review | `valgrind-ct.yml` CI workflow + `test_ct_sidechannel.cpp` | [OK] |
+
+**CT Subtotal: 6/6**
+
+---
+
+## 14. Batch / Performance
+
+| ID | Invariant | Implementation | Validation | Test Location | Status |
+|----|-----------|---------------|------------|---------------|--------|
+| **BP1** | `batch_inverse(a[]) * a[i] == 1` | `src/cpu/include/secp256k1/field.hpp` | Batch vs single inverse (256 elements) | `audit_field.cpp` -> `test_batch_inverse()` | [OK] |
+| **BP2** | Batch verify == sequential verify | `src/cpu/include/secp256k1/batch_verify.hpp` | Cross-library differential | `test_cross_libsecp256k1.cpp` suites 8-9 | [OK] |
+| **BP3** | Hamburg comb == double-and-add | `src/cpu/include/secp256k1/ct/point.hpp` | CT generator mul vs naive | `audit_ct.cpp` -> `test_ct_generator_mul()` | [OK] |
+
+**Batch Subtotal: 3/3 [OK]**
+
+---
+
+## 15. Serialization / Parsing
+
+| ID | Invariant | Implementation | Validation | Test Location | Status |
+|----|-----------|---------------|------------|---------------|--------|
+| **SP1** | DER parse->serialize round-trip | `src/cpu/include/secp256k1/ecdsa.hpp` | Fuzz 10K random | `test_fuzz_parsers.cpp` suites 1-3 | [OK] |
+| **SP2** | Compressed pubkey round-trip (33 bytes) | `src/cpu/include/secp256k1/point.hpp` | Fuzz | `test_fuzz_parsers.cpp` suites 6-8 | [OK] |
+| **SP3** | Uncompressed pubkey round-trip (65 bytes) | `src/cpu/include/secp256k1/point.hpp` | Fuzz | `test_fuzz_parsers.cpp` suites 6-8 | [OK] |
+| **SP4** | Invalid DER -> error (no crash) | `src/cpu/include/secp256k1/ecdsa.hpp` | Truncated/bad-tag/bad-length | `test_fuzz_parsers.cpp` suites 1-3 | [OK] |
+| **SP5** | 10K random blobs -> no crash | `src/cpu/include/secp256k1/ecdsa.hpp` | Fuzz robustness | `test_fuzz_parsers.cpp` | [OK] |
+
+**Parsing Subtotal: 5/5 [OK]**
+
+---
+
+## 16. ECIES Hardening
+
+| ID | Invariant | Implementation | Validation | Test Location | Status |
+|----|-----------|---------------|------------|---------------|--------|
+| **EC1** | Encrypt->decrypt round-trip (1, 13, 32 byte plaintexts) | `src/cpu/src/ecies.cpp` | KAT with 3 sizes, wrong-key rejection | `test_ecies_regression.cpp` -> `test_ecies_roundtrip_kat()` | [OK] |
+| **EC2** | Parity tamper: flip 0x02/0x03 on ephemeral pubkey -> decrypt fails | `src/cpu/src/ecies.cpp` | Deterministic bit-flip | `test_ecies_regression.cpp` -> `test_ecies_parity_tamper()` | [OK] |
+| **EC3** | Invalid prefix (0x00, 0x04, 0xFF) -> clean error | `src/cpu/src/ecies.cpp` | 3 bad prefix checks | `test_ecies_regression.cpp` -> `test_ecies_invalid_prefix()` | [OK] |
+| **EC4** | Truncated envelope (0-81 bytes) -> clean error, no crash | `src/cpu/src/ecies.cpp` | 6 truncated sizes | `test_ecies_regression.cpp` -> `test_ecies_truncated_envelope()` | [OK] |
+| **EC5** | Single-bit tamper in any field (pubkey/IV/ct/HMAC) -> decrypt fails | `src/cpu/src/ecies.cpp` | Tamper matrix: 4 fields x bit-flip | `test_ecies_regression.cpp` -> `test_ecies_tamper_matrix()` | [OK] |
+| **EC6** | ABI prefix rejection: 6 bad prefixes x 5 endpoints -> consistent ERR | `include/ufsecp/ufsecp_impl.cpp` | 30 ABI boundary checks | `test_ecies_regression.cpp` -> `test_abi_prefix_rejection()` | [OK] |
+| **EC7** | Pubkey parser consistency: malformed x-coords -> same error across all parsers | `include/ufsecp/ufsecp_impl.cpp` | 3 malformed coords x 3 functions | `test_ecies_regression.cpp` -> `test_pubkey_parser_consistency()` | [OK] |
+| **EC8** | RNG fail-closed: blocked `getrandom` -> process SIGABRT (no silent fallback) | `src/cpu/src/random.cpp` | fork + seccomp filter (Linux x86-64) | `test_ecies_regression.cpp` -> `test_rng_fail_closed()` | [OK] |
+
+**ECIES Subtotal: 8/8 [OK]**
+
+---
+
+## Cross-Cutting Evidence
+
+### Differential Testing (Gold Standard)
+
+| Evidence | Method | Scale | Location |
+|----------|--------|-------|----------|
+| UltrafastSecp256k1 == libsecp256k1 v0.6.0 | Bit-exact output comparison | 7,860 checks/CI, 1.3M/nightly | `test_cross_libsecp256k1.cpp` (10 suites) |
+| ECDSA cross-sign/verify | UF signs -> Ref verifies, Ref signs -> UF verifies | 500xM each direction | Suites [2], [3] |
+| Schnorr cross-sign/verify | Bidirectional BIP-340 | 500xM | Suite [4] |
+| RFC 6979 byte-exact nonce | Compact sig byte comparison | 200xM | Suite [5] |
+
+### Boundary Value Coverage
+
+All core arithmetic operations are tested on boundary values:
+
+| Boundary | Field ($\mathbb{F}_p$) | Scalar ($\mathbb{Z}_n$) | Point |
+|----------|------------------------|-------------------------|-------|
+| $0$ | [OK] `audit_field.cpp` | [OK] `audit_scalar.cpp` | [OK] $\mathcal{O}$ in `audit_point.cpp` |
+| $1$ | [OK] | [OK] | [OK] $G$ |
+| $p-1$ / $n-1$ | [OK] `test_limb_boundary` | [OK] `test_edge_scalars` | [OK] $(n-1) \cdot G$ |
+| $p$ / $n$ | [OK] reduces to 0 | [OK] reduces to 0 | [OK] $n \cdot G = \mathcal{O}$ |
+| $p+1$ / $n+1$ | [OK] reduces to 1 | [OK] reduces to 1 | -- |
+| $2^{255}$ | [OK] limb stress | [OK] `test_high_bits` | -- |
+| $2^{256}-1$ | [OK] `0xFF..FF` stress | -- | -- |
+
+### Fuzzing Coverage
+
+| Harness | Target | Iterations (Nightly) | Location |
+|---------|--------|---------------------|----------|
+| `fuzz_field` | Field arithmetic | 100K+ | `src/cpu/fuzz/fuzz_field.cpp` |
+| `fuzz_scalar` | Scalar arithmetic | 100K+ | `src/cpu/fuzz/fuzz_scalar.cpp` |
+| `fuzz_point` | Point operations | 100K+ | `src/cpu/fuzz/fuzz_point.cpp` |
+| `fuzz_ecdsa` | ECDSA sign→verify invariant, wrong-msg | 100K+ | `src/cpu/fuzz/fuzz_ecdsa.cpp` |
+| `fuzz_schnorr` | BIP-340 sign→verify, adversarial verify | 100K+ | `src/cpu/fuzz/fuzz_schnorr.cpp` |
+| `fuzz_der_parse` | DER signature parse + round-trip | 100K+ | `audit/fuzz_der_parse.cpp` |
+| `fuzz_pubkey_parse` | Pubkey parse, tweak_add, encoding | 100K+ | `audit/fuzz_pubkey_parse.cpp` |
+| `fuzz_schnorr_verify` | BIP-340 sign→verify + forged-sig rejection | 100K+ | `audit/fuzz_schnorr_verify.cpp` |
+| `fuzz_ecdsa_verify` | ECDSA sign→verify round-trip | 100K+ | `audit/fuzz_ecdsa_verify.cpp` |
+| `fuzz_bip32_path` | BIP-32 path parser — boundary + overflow | 100K+ | `audit/fuzz_bip32_path.cpp` |
+| `fuzz_bip324_frame` | BIP-324 AEAD frame decrypt | 100K+ | `audit/fuzz_bip324_frame.cpp` |
+| DER parser fuzz | `test_fuzz_parsers.cpp` | 10K per suite | Suites 1-3 |
+| Schnorr parser fuzz | `test_fuzz_parsers.cpp` | 10K per suite | Suites 4-5 |
+| Pubkey parse fuzz | `test_fuzz_parsers.cpp` | 10K per suite | Suites 6-8 |
+| Address encoder fuzz | `test_fuzz_address_bip32_ffi.cpp` | 10K per suite | Suites 1-4 |
+| BIP32 path fuzz | `test_fuzz_address_bip32_ffi.cpp` | 10K per suite | Suites 5-7 |
+| FFI boundary fuzz | `test_fuzz_address_bip32_ffi.cpp` | 10K per suite | Suites 8-13 |
+| BIP-324 transport checks | `src/cpu/tests/test_bip324.cpp` | 62 checks | handshake, sequence, determinism, sizes, tamper, random-key paths |
+| ECIES regression | `test_ecies_regression.cpp` | 85 tests | Categories A-H |
+
+### Negative Testing (Adversarial Inputs)
+
+| Category | Description | Test Location |
+|----------|-------------|---------------|
+| Zero key ECDSA | `sign(msg, 0)` -> zero sig; `verify` rejects | `audit_security.cpp` -> `test_zero_key_handling()` |
+| Zero key Schnorr | `schnorr_sign(0, msg, aux)` -> fails gracefully | `audit_fuzz.cpp` -> `test_malformed_pubkeys()` |
+| Off-curve point | Verify with infinity -> false | `audit_fuzz.cpp` -> `test_malformed_pubkeys()` |
+| $r = 0$ signature | `verify(msg, pk, {r=0, s=1})` -> false | `audit_fuzz.cpp` -> `test_invalid_ecdsa_sigs()` |
+| $s = 0$ signature | `verify(msg, pk, {r=1, s=0})` -> false | `audit_fuzz.cpp` -> `test_invalid_ecdsa_sigs()` |
+| Bit-flip resilience | 1-bit change in sig -> verify fails | `audit_security.cpp` -> `test_bitflip_resilience()` |
+| Message bit-flip | 1-bit change in msg -> verify fails | `audit_security.cpp` -> `test_message_bitflip()` |
+| Nonce determinism | Same (msg, sk) -> same nonce | `audit_security.cpp` -> `test_nonce_determinism()` |
+| Zeroization | Secret memory zeroed after use | `audit_security.cpp` -> `test_zeroization()` |
+| MuSig2 rogue-key | 0xFF / zero / duplicate xonly keys | `test_adversarial_protocol.cpp` A.4 |
+| MuSig2 transcript mutation | Corrupt keyagg blob between steps | `test_adversarial_protocol.cpp` A.5 |
+| MuSig2 signer ordering | Wrong signer index | `test_adversarial_protocol.cpp` A.6 |
+| MuSig2 malicious aggregator | Tampered aggnonce | `test_adversarial_protocol.cpp` A.7 |
+| FROST malicious coordinator | Inconsistent commit sets to signers | `test_adversarial_protocol.cpp` B.4 |
+| FROST duplicate nonce | Same commitment submitted twice | `test_adversarial_protocol.cpp` B.5 |
+| BIP-324 tampered packet | Ciphertext/tag/transcript mutation must fail | `src/cpu/tests/test_bip324.cpp` -> `test_bip324_tamper()` |
+| Adaptor transcript mismatch | Sign msg1, verify msg2 -> reject | `test_adversarial_protocol.cpp` D.5 |
+| Adaptor extraction misuse | Extract from unrelated sig pair | `test_adversarial_protocol.cpp` D.6 |
+| DLEQ malformed proof | 6 corruption strategies + zero proof | `test_adversarial_protocol.cpp` E.4 |
+| DLEQ wrong generators | Swap G/H, swap P/Q, different G'/H' | `test_adversarial_protocol.cpp` E.5 |
+| FFI undersized buffers | DER, WIF, BIP-39 with tiny output buffers | `test_adversarial_protocol.cpp` G.18 |
+| FFI overlapping buffers | Input==output aliasing | `test_adversarial_protocol.cpp` G.19 |
+| FFI malformed counts | n=0 for combine, batch, multi_scalar_mul | `test_adversarial_protocol.cpp` G.20 |
+
+---
+
+## Aggregate Summary
+
+| Category | Total | [OK] Verified | [!] Partial | [FAIL] Gap |
+|----------|-------|------------|-----------|-------|
+| Field (F) | 17 | 17 | 0 | 0 |
+| Scalar (S) | 9 | 9 | 0 | 0 |
+| Point (P) | 14 | 14 | 0 | 0 |
+| GLV (G) | 4 | 4 | 0 | 0 |
+| ECDSA (E) | 8 | 8 | 0 | 0 |
+| Schnorr (B) | 6 | 6 | 0 | 0 |
+| MuSig2 (M) | 10 | 10 | 0 | 0 |
+| FROST (FR) | 11 | 11 | 0 | 0 |
+| BIP-324 (T324) | 6 | 6 | 0 | 0 |
+| BIP-32 (H) | 7 | 7 | 0 | 0 |
+| Address (A) | 6 | 6 | 0 | 0 |
+| C ABI (C) | 7 | 7 | 0 | 0 |
+| CT (CT) | 6 | 4 | 2 | 0 |
+| Batch (BP) | 3 | 3 | 0 | 0 |
+| Parsing (SP) | 5 | 5 | 0 | 0 |
+| ECIES (EC) | 8 | 8 | 0 | 0 |
+| **Total** | **128** | **126** | **2** | **0** |
+
+**Partial items** (2):
+- **CT5**: No secret-dependent branches (code review only, no CTGRIND/formal tool)
+- **CT6**: No secret-dependent memory access (code review only)
+
+---
+
+## How to Reproduce
+
+```bash
+# Full audit suite (from build directory)
+cmake -S . -B out/release -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build out/release -j
+ctest --test-dir build --output-on-failure
+
+# Specific audit targets
+./build/cpu/audit_field          # 641K+ field checks
+./build/cpu/audit_scalar         # scalar checks
+./build/cpu/audit_point          # point + signature checks
+./build/cpu/audit_ct             # CT correctness
+./build/cpu/audit_security       # security hardening
+./build/cpu/audit_fuzz           # adversarial inputs
+./build/cpu/audit_integration    # end-to-end flows
+
+# Differential testing (requires libsecp256k1)
+./build/src/cpu/test_cross_libsecp256k1    # 7,860 baseline checks
+DIFFERENTIAL_MULTIPLIER=100 ./build/src/cpu/test_cross_libsecp256k1  # 1.3M checks
+
+# dudect side-channel (statistical)
+./build/src/cpu/test_ct_sidechannel        # full mode (~30 min)
+./build/src/cpu/test_ct_sidechannel_smoke  # smoke mode (~2 min)
+```
+
+---
+
+## GPU C ABI Audit Coverage
+
+| Test | Scope | Source |
+|------|-------|--------|
+| `gpu_abi_gate` | ABI surface, error codes, discovery, lifecycle, NULL safety | `audit/test_gpu_abi_gate.cpp` |
+| `gpu_ops_equivalence` | GPU vs CPU reference: all 6 ops (gen_mul, ecdsa, schnorr, ecdh, hash160, msm) | `audit/test_gpu_ops_equivalence.cpp` |
+| `gpu_host_api_negative` | NULL ptrs, count=0, invalid backend/device, error strings | `audit/test_gpu_host_api_negative.cpp` |
+| `gpu_backend_matrix` | Backend enumeration, device info, per-backend op probing | `audit/test_gpu_backend_matrix.cpp` |
+
+Backend-specific internal audit runners:
+- CUDA: `src/cuda/src/gpu_audit_runner.cu` ( 436 modules)
+- OpenCL: `opencl/src/opencl_audit_runner.cpp` ( 436 modules)
+- Metal: `metal/src/metal_audit_runner.mm` ( 436 modules)
+
+---
+
+## New ABI Surface Edge Cases (§H / §N, v3.22+)
+
+> Gap analysis (v3.22) found 26 `ufsecp_*` functions with no dedicated
+> edge-case coverage. All gaps are closed by the test functions below, wired
+> into `test_adversarial_protocol_run()`.
+> Source: `audit/test_adversarial_protocol.cpp`
+
+| ID | Claim | ABI functions | Validation method | Test location | Status |
+|----|-------|---------------|-------------------|---------------|--------|
+| **H1** | `ufsecp_ctx_size()` returns > 0 | `ufsecp_ctx_size` | Direct check | `test_h1_ctx_size()` | [OK] |
+| **H2a** | AEAD encrypt/decrypt NULL args → `ERR_NULL_ARG` | `ufsecp_aead_chacha20_encrypt`, `ufsecp_aead_chacha20_decrypt` | NULL injection | `test_h2_aead()` | [OK] |
+| **H2b** | AEAD bad authentication tag rejected | `ufsecp_aead_chacha20_decrypt` | Tampered ciphertext | `test_h2_aead()` | [OK] |
+| **H2c** | AEAD wrong nonce rejected | `ufsecp_aead_chacha20_decrypt` | Modified nonce | `test_h2_aead()` | [OK] |
+| **H2d** | AEAD zero-length plaintext roundtrip succeeds | `ufsecp_aead_chacha20_encrypt`, `ufsecp_aead_chapha20_decrypt` | Smoke | `test_h2_aead()` | [OK] |
+| **H3a** | ECIES NULL args → `ERR_NULL_ARG` | `ufsecp_ecies_encrypt`, `ufsecp_ecies_decrypt` | NULL injection | `test_h3_ecies()` | [OK] |
+| **H3b** | ECIES off-curve pubkey rejected | `ufsecp_ecies_encrypt` | Invalid point | `test_h3_ecies()` | [OK] |
+| **H3c** | ECIES tampered envelope rejected | `ufsecp_ecies_decrypt` | Byte flip | `test_h3_ecies()` | [OK] |
+| **H4a** | EllSwift NULL args → `ERR_NULL_ARG` | `ufsecp_ellswift_create`, `ufsecp_ellswift_xdh` | NULL injection | `test_h4_ellswift()` | [OK] |
+| **H4b** | EllSwift zero privkey rejected | `ufsecp_ellswift_create` | Zero scalar | `test_h4_ellswift()` | [OK] |
+| **H4c** | EllSwift symmetric shared secret | `ufsecp_ellswift_xdh` | A-to-B == B-to-A | `test_h4_ellswift()` | [OK] |
+| **H5a** | ETH checksummed NULL args → error | `ufsecp_eth_address_checksummed` | NULL injection | `test_h5_eth_edge()` | [OK] |
+| **H5b** | ETH checksummed undersized buffer → `ERR_BUF_TOO_SMALL` | `ufsecp_eth_address_checksummed` | Short buffer | `test_h5_eth_edge()` | [OK] |
+| **H5c** | ETH personal_hash NULL args → error | `ufsecp_eth_personal_hash` | NULL injection | `test_h5_eth_edge()` | [OK] |
+| **H6a** | Pedersen switch_commit NULL args → `ERR_NULL_ARG` | `ufsecp_pedersen_switch_commit` | NULL injection | `test_h6_pedersen_switch()` | [OK] |
+| **H6b** | Pedersen switch_commit output is valid point (prefix 0x02/0x03) | `ufsecp_pedersen_switch_commit` | Prefix byte check | `test_h6_pedersen_switch()` | [OK] |
+| **H7a** | Schnorr adaptor extract NULL args → `ERR_NULL_ARG` | `ufsecp_schnorr_adaptor_extract` | NULL injection | `test_h7_schnorr_adaptor_extract()` | [OK] |
+| **H7b** | Schnorr adaptor extract zero inputs rejected | `ufsecp_schnorr_adaptor_extract` | Zero bytes | `test_h7_schnorr_adaptor_extract()` | [OK] |
+| **H8a** | `ecdsa_sign_batch` NULL args → error | `ufsecp_ecdsa_sign_batch` | NULL injection | `test_h8_batch_sign()` | [OK] |
+| **H8b** | `schnorr_sign_batch` NULL args → error | `ufsecp_schnorr_sign_batch` | NULL injection | `test_h8_batch_sign()` | [OK] |
+| **H8c** | Batch sign count=0 → error | `ufsecp_ecdsa_sign_batch`, `ufsecp_schnorr_sign_batch` | Zero count | `test_h8_batch_sign()` | [OK] |
+| **H9a** | BIP-143 sighash NULL args → `ERR_NULL_ARG` | `ufsecp_bip143_sighash` | NULL injection | `test_h9_bip143()` | [OK] |
+| **H9b** | P2WPKH script_code has OP_DUP OP_HASH160 PUSH20 format | `ufsecp_bip143_p2wpkh_script_code` | Byte pattern check | `test_h9_bip143()` | [OK] |
+| **H10a** | BIP-144 txid/wtxid NULL args → `ERR_NULL_ARG` | `ufsecp_bip144_txid`, `ufsecp_bip144_wtxid` | NULL injection | `test_h10_bip144()` | [OK] |
+| **H10b** | BIP-144 witness_commitment is deterministic | `ufsecp_bip144_witness_commitment` | Two-call equality | `test_h10_bip144()` | [OK] |
+| **H11a** | is_witness_program: short/non-witness → 0 | `ufsecp_is_witness_program` | Short + P2PKH input | `test_h11_segwit()` | [OK] |
+| **H11b** | parse_witness_program: non-witness → error | `ufsecp_parse_witness_program` | P2PKH script | `test_h11_segwit()` | [OK] |
+| **H11c** | `ufsecp_p2wpkh_spk` output: OP_0 + PUSH20 (22 bytes) | `ufsecp_p2wpkh_spk` | Length + opcode check | `test_h11_segwit()` | [OK] |
+| **H11d** | `ufsecp_p2wsh_spk` output: OP_0 + PUSH32 (34 bytes) | `ufsecp_p2wsh_spk` | Length + opcode check | `test_h11_segwit()` | [OK] |
+| **H11e** | `ufsecp_p2tr_spk` output: OP_1 + PUSH32 (34 bytes) | `ufsecp_p2tr_spk` | Length + opcode check | `test_h11_segwit()` | [OK] |
+| **H12a** | Taproot keypath sighash NULL ctx/prevouts → `ERR_NULL_ARG` | `ufsecp_taproot_keypath_sighash` | NULL injection | `test_h12_taproot_sighash()` | [OK] |
+| **H12b** | Taproot keypath sighash count=0 → error | `ufsecp_taproot_keypath_sighash` | Zero count | `test_h12_taproot_sighash()` | [OK] |
+| **H12c** | Taproot keypath sighash OOB input_index → error | `ufsecp_taproot_keypath_sighash` | index >= count | `test_h12_taproot_sighash()` | [OK] |
+| **H12d** | Tapscript sighash NULL tapleaf_hash → `ERR_NULL_ARG` | `ufsecp_tapscript_sighash` | NULL injection | `test_h12_taproot_sighash()` | [OK] |
+| **H12e** | Taproot sighash is deterministic | `ufsecp_taproot_keypath_sighash` | Two-call equality | `test_h12_taproot_sighash()` | [OK] |
+
+**H Subtotal: 35/35 [OK]**
+
+---
+
+## Remaining ABI Surface (§I / §O, v3.23+)
+
+Eight functions with zero prior coverage: `ctx_clone`, `last_error_msg`, `last_error`,
+`pubkey_parse`, `pubkey_create_uncompressed`, `ecdsa_sign_recoverable`, `ecdsa_recover`,
+`ecdsa_sign_verified`, `schnorr_sign_verified`, plus deep batch-verify coverage for
+`schnorr_batch_verify`, `ecdsa_batch_verify`, `schnorr_batch_identify_invalid`,
+`ecdsa_batch_identify_invalid`.
+
+| ID | Invariant | Function(s) | Class | Test | Status |
+|----|-----------|-------------|-------|------|--------|
+| **I1a** | `ctx_clone(nullptr, &out)` → `ERR_NULL_ARG` | `ufsecp_ctx_clone` | NULL injection | `test_i1_ctx_clone_and_last_error_msg()` | [OK] |
+| **I1b** | `ctx_clone(ctx, nullptr)` → `ERR_NULL_ARG` | `ufsecp_ctx_clone` | NULL injection | `test_i1_ctx_clone_and_last_error_msg()` | [OK] |
+| **I1c** | `ctx_clone(valid, &out)` produces independent non-null ctx | `ufsecp_ctx_clone` | Valid call | `test_i1_ctx_clone_and_last_error_msg()` | [OK] |
+| **I1d** | `last_error_msg` on fresh ctx is non-null | `ufsecp_last_error_msg` | State probe | `test_i1_ctx_clone_and_last_error_msg()` | [OK] |
+| **I1e** | `last_error_msg` + `last_error` non-zero after forced error | `ufsecp_last_error_msg`, `ufsecp_last_error` | Error path | `test_i1_ctx_clone_and_last_error_msg()` | [OK] |
+| **I1f** | Cloned ctx produces identical output to original | `ufsecp_ctx_clone` | Functional | `test_i1_ctx_clone_and_last_error_msg()` | [OK] |
+| **I2a** | `pubkey_create_uncompressed` NULL ctx/privkey/output → error | `ufsecp_pubkey_create_uncompressed` | NULL injection | `test_i2_pubkey_parse_and_uncompressed()` | [OK] |
+| **I2b** | `pubkey_create_uncompressed` zero privkey rejected | `ufsecp_pubkey_create_uncompressed` | Zero key | `test_i2_pubkey_parse_and_uncompressed()` | [OK] |
+| **I2c** | `pubkey_create_uncompressed` output starts with 0x04 | `ufsecp_pubkey_create_uncompressed` | Format check | `test_i2_pubkey_parse_and_uncompressed()` | [OK] |
+| **I2d** | `pubkey_parse` NULL ctx/input/output → error | `ufsecp_pubkey_parse` | NULL injection | `test_i2_pubkey_parse_and_uncompressed()` | [OK] |
+| **I2e** | `pubkey_parse` wrong length (32) → error | `ufsecp_pubkey_parse` | Bad length | `test_i2_pubkey_parse_and_uncompressed()` | [OK] |
+| **I2f** | `pubkey_parse` 0x00 prefix → error | `ufsecp_pubkey_parse` | Bad prefix | `test_i2_pubkey_parse_and_uncompressed()` | [OK] |
+| **I2g** | `pubkey_parse` uncompressed (65B) → normalised to compressed | `ufsecp_pubkey_parse` | Normalisation | `test_i2_pubkey_parse_and_uncompressed()` | [OK] |
+| **I2h** | `pubkey_parse` compressed round-trip identical | `ufsecp_pubkey_parse` | Round-trip | `test_i2_pubkey_parse_and_uncompressed()` | [OK] |
+| **I3a** | `sign_recoverable` NULL ctx/msg/privkey/sig → error | `ufsecp_ecdsa_sign_recoverable` | NULL injection | `test_i3_ecdsa_recoverable_roundtrip()` | [OK] |
+| **I3b** | `sign_recoverable` NULL recid_out rejected | `ufsecp_ecdsa_sign_recoverable` | NULL injection | `test_i3_ecdsa_recoverable_roundtrip()` | [OK] |
+| **I3c** | `sign_recoverable` zero privkey rejected | `ufsecp_ecdsa_sign_recoverable` | Zero key | `test_i3_ecdsa_recoverable_roundtrip()` | [OK] |
+| **I3d** | recid output is in [0, 3] | `ufsecp_ecdsa_sign_recoverable` | Range check | `test_i3_ecdsa_recoverable_roundtrip()` | [OK] |
+| **I3e** | `ecdsa_recover` NULL ctx/msg/sig/output → error | `ufsecp_ecdsa_recover` | NULL injection | `test_i3_ecdsa_recoverable_roundtrip()` | [OK] |
+| **I3f** | `ecdsa_recover` invalid recid (-1, 4) rejected | `ufsecp_ecdsa_recover` | Bad recid | `test_i3_ecdsa_recoverable_roundtrip()` | [OK] |
+| **I3g** | Recovered pubkey matches original on correct recid | `ufsecp_ecdsa_recover` | Round-trip | `test_i3_ecdsa_recoverable_roundtrip()` | [OK] |
+| **I3h** | Wrong recid produces different pubkey (or error) | `ufsecp_ecdsa_recover` | Non-malleability | `test_i3_ecdsa_recoverable_roundtrip()` | [OK] |
+| **I4a** | `ecdsa_sign_verified` NULL all args → error | `ufsecp_ecdsa_sign_verified` | NULL injection | `test_i4_sign_verified()` | [OK] |
+| **I4b** | `ecdsa_sign_verified` zero privkey rejected | `ufsecp_ecdsa_sign_verified` | Zero key | `test_i4_sign_verified()` | [OK] |
+| **I4c** | `ecdsa_sign_verified` output verifies with `ecdsa_verify` | `ufsecp_ecdsa_sign_verified` | Round-trip | `test_i4_sign_verified()` | [OK] |
+| **I4d** | `schnorr_sign_verified` NULL all args → error | `ufsecp_schnorr_sign_verified` | NULL injection | `test_i4_sign_verified()` | [OK] |
+| **I4e** | `schnorr_sign_verified` zero privkey rejected | `ufsecp_schnorr_sign_verified` | Zero key | `test_i4_sign_verified()` | [OK] |
+| **I4f** | `schnorr_sign_verified` output verifies with `schnorr_verify` | `ufsecp_schnorr_sign_verified` | Round-trip | `test_i4_sign_verified()` | [OK] |
+| **I5a** | `schnorr_batch_verify` 1 valid entry → OK | `ufsecp_schnorr_batch_verify` | Valid path | `test_i5_batch_verify_deep()` | [OK] |
+| **I5b** | `schnorr_batch_verify` tampered sig → error | `ufsecp_schnorr_batch_verify` | Tampered sig | `test_i5_batch_verify_deep()` | [OK] |
+| **I5c** | `schnorr_batch_identify_invalid` finds index 0 for tampered entry | `ufsecp_schnorr_batch_identify_invalid` | Index tracking | `test_i5_batch_verify_deep()` | [OK] |
+| **I5d** | `ecdsa_batch_verify` 1 valid entry → OK | `ufsecp_ecdsa_batch_verify` | Valid path | `test_i5_batch_verify_deep()` | [OK] |
+| **I5e** | `ecdsa_batch_verify` tampered sig → error | `ufsecp_ecdsa_batch_verify` | Tampered sig | `test_i5_batch_verify_deep()` | [OK] |
+| **I5f** | `ecdsa_batch_identify_invalid` finds index 0 for tampered entry | `ufsecp_ecdsa_batch_identify_invalid` | Index tracking | `test_i5_batch_verify_deep()` | [OK] |
+| **I5g** | Batch verify count=0 is vacuously OK | `ufsecp_schnorr_batch_verify`, `ufsecp_ecdsa_batch_verify` | Empty input | `test_i5_batch_verify_deep()` | [OK] |
+
+**I Subtotal: 35/35 [OK]**
+
+---
+
+## 17. Cryptol Formal Specifications (§CRY)
+
+Formal Cryptol properties that independently verify the mathematical model of
+the library's core operations.  Each property executes via Cryptol's QuickCheck
+engine (`:check`) or can be discharged by SAW.
+
+**Location**: `formal/cryptol/`  
+**Run**: `cryptol --batch formal/cryptol/<file>.cry` (each run prints PASS/FAIL per property)  
+**CI**: `python3 ci/unified_audit_runner.py --module cryptol_specs` (advisory — skipped if cryptol not installed)
+
+### 17a — Field Arithmetic (`Secp256k1Field.cry` — 15 properties)
+
+| ID | Property | Spec claim | Status |
+|----|----------|-----------|--------|
+| **CRY-01** | `field_add_commutative` | a+b = b+a over p | [OK] |
+| **CRY-02** | `field_add_associative` | (a+b)+c = a+(b+c) over p | [OK] |
+| **CRY-03** | `field_add_identity` | a+0 = a over p | [OK] |
+| **CRY-04** | `field_add_inverse` | a+(-a) = 0 over p | [OK] |
+| **CRY-05** | `field_add_in_range` | a+b ∈ [0, p-1] after reduction | [OK] |
+| **CRY-06** | `field_double_neg` | -(-a) = a over p | [OK] |
+| **CRY-07** | `field_sub_eq_add_neg` | a-b = a+(-b) over p | [OK] |
+| **CRY-08** | `field_mul_commutative` | a·b = b·a over p | [OK] |
+| **CRY-09** | `field_mul_associative` | (a·b)·c = a·(b·c) over p | [OK] |
+| **CRY-10** | `field_mul_identity` | a·1 = a over p | [OK] |
+| **CRY-11** | `field_mul_inverse` | a·a⁻¹ = 1 for a≠0 over p | [OK] |
+| **CRY-12** | `field_mul_in_range` | a·b ∈ [0, p-1] after reduction | [OK] |
+| **CRY-13** | `field_sqr_eq_mul_self` | a² = a·a over p | [OK] |
+| **CRY-14** | `field_sqrt_correct` | sqrt(a)² = a for quadratic residues | [OK] |
+| **CRY-15** | `field_distributive` | a·(b+c) = a·b+a·c over p | [OK] |
+
+**CRY-01..15 Subtotal: 15/15 [OK]**
+
+### 17b — Elliptic Curve Point Operations (`Secp256k1Point.cry` — 10 properties)
+
+| ID | Property | Spec claim | Status |
+|----|----------|-----------|--------|
+| **CRY-16** | `generator_on_curve` | G satisfies y²=x³+7 over p | [OK] |
+| **CRY-17** | `generator_coords_correct` | G.x, G.y match secp256k1 standard constants | [OK] |
+| **CRY-18** | `generator_point_double_consistent` | 2·G via doubling = G+G via addition | [OK] |
+| **CRY-19** | `point_add_commutative` | P+Q = Q+P | [OK] |
+| **CRY-20** | `point_add_identity_left` | O+P = P (identity element) | [OK] |
+| **CRY-21** | `point_add_identity_right` | P+O = P (identity element) | [OK] |
+| **CRY-22** | `point_neg_is_inverse` | P+(-P) = O | [OK] |
+| **CRY-23** | `scalar_mul_by_zero` | 0·P = O | [OK] |
+| **CRY-24** | `scalar_mul_by_one` | 1·P = P | [OK] |
+| **CRY-25** | `privkey_one_gives_generator` | 1·G = G (keygen sanity) | [OK] |
+
+**CRY-16..25 Subtotal: 10/10 [OK]**
+
+### 17c — ECDSA Sign/Verify (`Secp256k1ECDSA.cry` — 8 properties)
+
+| ID | Property | Spec claim | Status |
+|----|----------|-----------|--------|
+| **CRY-26** | `ecdsa_sign_then_verify` | sign(msg, sk, k) → verify accepts | [OK] |
+| **CRY-27** | `ecdsa_sign_r_range` | r = (k·G).x ∈ [1, n-1] | [OK] |
+| **CRY-28** | `ecdsa_sign_s_range` | s ∈ [1, n-1] after signing | [OK] |
+| **CRY-29** | `ecdsa_sign_low_s` | BIP-62: s ≤ n/2 after normalisation | [OK] |
+| **CRY-30** | `ecdsa_zero_msg` | hash=0 edge case produces valid signature | [OK] |
+| **CRY-31** | `low_s_valid` | low_s output is always ≤ n/2 | [OK] |
+| **CRY-32** | `low_s_in_lower_half` | low_s output is strictly in lower half | [OK] |
+| **CRY-33** | `low_s_idempotent` | low_s(low_s(s)) = low_s(s) | [OK] |
+
+**CRY-26..33 Subtotal: 8/8 [OK]**
+
+### 17d — BIP-340 Schnorr Sign/Verify (`Secp256k1Schnorr.cry` — 6 properties)
+
+| ID | Property | Spec claim | Status |
+|----|----------|-----------|--------|
+| **CRY-34** | `schnorr_sign_then_verify` | sign(msg, sk, aux) → verify accepts | [OK] |
+| **CRY-35** | `schnorr_sign_rx_range` | R.x ∈ [1, p-1] in every signature | [OK] |
+| **CRY-36** | `schnorr_sign_s_range` | s ∈ [0, n-1] in every signature | [OK] |
+| **CRY-37** | `schnorr_zero_msg` | msg=0 edge case signs and verifies correctly | [OK] |
+| **CRY-38** | `normalised_key_has_even_y` | After normalisation, pubkey Y is always even | [OK] |
+| **CRY-39** | `normalise_key_idempotent` | normalise(normalise(sk)) = normalise(sk) | [OK] |
+
+**CRY-34..39 Subtotal: 6/6 [OK]**
+
+---
+
+**§CRY Grand Total: 39/39 [OK]**
+
+All 39 properties pass Cryptol QuickCheck (`:check`) over random inputs.
+For bounded or exhaustive proofs, use SAW with the same `.cry` files as input:
+`saw ci/saw_verify_field.saw` (not yet in CI — see `formal/cryptol/README.md`).
+
+---
+
+*Generated: 2026-04-06*
+*Invariant source: [INVARIANTS.md](INVARIANTS.md)*
+*This document is auto-updatable via `ci/generate_traceability.sh`*

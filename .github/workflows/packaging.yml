@@ -1,0 +1,290 @@
+# ============================================================================
+# Linux Package Build & APT/YUM Repository
+# ============================================================================
+# Builds .deb and .rpm packages on release tags, attaches them to the
+# GitHub Release, and maintains a GitHub Pages-hosted APT repository
+# so users can install directly via:
+#
+#   curl -fsSL https://shrec.github.io/UltrafastSecp256k1/KEY.gpg | sudo gpg --dearmor -o /etc/apt/keyrings/ultrafastsecp256k1.gpg
+#   echo "deb [signed-by=/etc/apt/keyrings/ultrafastsecp256k1.gpg] https://shrec.github.io/UltrafastSecp256k1/apt stable main" | sudo tee /etc/apt/sources.list.d/ultrafastsecp256k1.list
+#   sudo apt update && sudo apt install libufsecp-dev
+#
+# ============================================================================
+
+name: Linux Packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to backfill (e.g. v4.5.0)'
+        required: true
+
+concurrency:
+  group: packaging-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Build .deb packages (amd64 + arm64)
+  # --------------------------------------------------------------------------
+  build-deb:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            os: ubuntu-24.04
+            cmake_extra: ""
+          - arch: arm64
+            os: ubuntu-24.04
+            cmake_extra: "-DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-aarch64-linux-gnu.cmake"
+            cross: true
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake ninja-build dpkg-dev fakeroot
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            sudo apt-get install -y g++-aarch64-linux-gnu
+          fi
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSECP256K1_BUILD_TESTS=OFF \
+            -DSECP256K1_BUILD_BENCH=OFF \
+            -DSECP256K1_BUILD_JAVA=OFF \
+            -DSECP256K1_BUILD_SHARED=ON \
+            -DSECP256K1_INSTALL=ON \
+            -DSECP256K1_INSTALL_PKGCONFIG=ON \
+            -DSECP256K1_USE_ASM=ON \
+            ${{ matrix.cmake_extra }}
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Package (.deb via CPack)
+        run: |
+          cd build
+          cpack -G DEB
+          ls -la *.deb
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deb-${{ matrix.arch }}
+          path: build/*.deb
+
+  # --------------------------------------------------------------------------
+  # Build .rpm package (x86_64)
+  # --------------------------------------------------------------------------
+  build-rpm:
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:41@sha256:f1a3fab47bcb3c3ddf3135d5ee7ba8b7b25f2e809a47440936212a3a50957f3d
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y cmake ninja-build gcc-c++ rpm-build git
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSECP256K1_BUILD_TESTS=OFF \
+            -DSECP256K1_BUILD_BENCH=OFF \
+            -DSECP256K1_BUILD_JAVA=OFF \
+            -DSECP256K1_BUILD_SHARED=ON \
+            -DSECP256K1_INSTALL=ON \
+            -DSECP256K1_INSTALL_PKGCONFIG=ON \
+            -DSECP256K1_USE_ASM=ON
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Package (.rpm via CPack)
+        run: |
+          cd build
+          cpack -G RPM
+          ls -la *.rpm
+
+      - name: Upload .rpm artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rpm-x86_64
+          path: build/*.rpm
+
+  # --------------------------------------------------------------------------
+  # Attach packages to GitHub Release + update APT repository
+  # --------------------------------------------------------------------------
+  publish:
+    needs: [build-deb, build-rpm]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write    # upload release assets + push gh-pages
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: gh-pages
+          path: gh-pages
+        continue-on-error: true  # gh-pages may not exist yet
+
+      - name: Download all package artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: packages
+
+      - name: List packages
+        run: find packages -type f | sort
+
+      - name: Attach packages to GitHub Release
+        if: startsWith(env.RELEASE_TAG, 'v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${RELEASE_TAG}"
+
+          # Collect package files
+          mapfile -t PKG_FILES < <(find packages -type f \( -name '*.deb' -o -name '*.rpm' \))
+          if [ ${#PKG_FILES[@]} -eq 0 ]; then
+            echo "::error::No .deb or .rpm packages found"
+            exit 1
+          fi
+          echo "Found ${#PKG_FILES[@]} package(s) to upload"
+
+          # Wait for the release to be created (by manual gh release create or another workflow).
+          # Retry up to 30 times (15 min total) with 30s intervals.
+          RELEASE_EXISTED=false
+          for i in $(seq 1 30); do
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+              echo "Release $TAG found."
+              RELEASE_EXISTED=true
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "Release $TAG not found after 30 retries, creating minimal release..."
+              gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+                --title "UltrafastSecp256k1 $TAG" \
+                --notes "Release created by packaging workflow." \
+                "${PKG_FILES[@]}"
+              echo "Release created with packages attached."
+              exit 0
+            fi
+            echo "Waiting for release $TAG (attempt $i/30)..."
+            sleep 30
+          done
+
+          # Try direct upload (works for mutable releases)
+          if gh release upload "$TAG" "${PKG_FILES[@]}" \
+               --repo "$GITHUB_REPOSITORY" --clobber 2>/dev/null; then
+            echo "Packages uploaded successfully."
+          else
+            echo "Direct upload failed (release may be immutable), recreating..."
+            # Preserve existing release metadata
+            TITLE=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json name -q .name)
+            BODY=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body)
+            # Delete the immutable release (tag is preserved)
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes
+            # Recreate with saved metadata + packages
+            gh release create "$TAG" "${PKG_FILES[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TITLE" \
+              --notes "$BODY"
+            echo "Release recreated with packages attached."
+          fi
+
+      - name: Build APT repository
+        if: startsWith(env.RELEASE_TAG, 'v')
+        run: |
+          # Install APT repo tools
+          sudo apt-get update -qq
+          sudo apt-get install -y dpkg-dev apt-utils gnupg
+
+          # Set up repo directory structure
+          REPO_DIR="${GITHUB_WORKSPACE}/apt-repo"
+          mkdir -p "${REPO_DIR}/pool/main"
+          mkdir -p "${REPO_DIR}/dists/stable/main/binary-amd64"
+          mkdir -p "${REPO_DIR}/dists/stable/main/binary-arm64"
+
+          # Copy existing pool if gh-pages checkout exists
+          if [ -d "gh-pages/apt/pool" ]; then
+            cp -r gh-pages/apt/pool/* "${REPO_DIR}/pool/" 2>/dev/null || true
+          fi
+
+          # Copy new .deb files to pool
+          find packages -name '*.deb' -exec cp {} "${REPO_DIR}/pool/main/" \;
+
+          # Generate Packages indices
+          cd "${REPO_DIR}"
+          for arch in amd64 arm64; do
+            dpkg-scanpackages --arch "${arch}" pool/ > "dists/stable/main/binary-${arch}/Packages"
+            gzip -k "dists/stable/main/binary-${arch}/Packages"
+          done
+
+          # Generate Release file
+          cat > dists/stable/Release <<EOF
+          Origin: UltrafastSecp256k1
+          Label: UltrafastSecp256k1
+          Suite: stable
+          Codename: stable
+          Architectures: amd64 arm64
+          Components: main
+          Description: UltrafastSecp256k1 APT Repository
+          Date: $(date -Ru)
+          EOF
+
+          # Generate hashes for Release
+          cd dists/stable
+          {
+            echo "MD5Sum:"
+            find main -type f | while read -r f; do
+              echo " $(md5sum "$f" | cut -d' ' -f1) $(stat -c%s "$f") $f"
+            done
+            echo "SHA256:"
+            find main -type f | while read -r f; do
+              echo " $(sha256sum "$f" | cut -d' ' -f1) $(stat -c%s "$f") $f"
+            done
+          } >> Release
+
+      - name: Deploy APT repo to GitHub Pages
+        if: startsWith(env.RELEASE_TAG, 'v')
+        uses: peaceiris/actions-gh-pages@4f9cc6602d3f66b9c108549d475ec49e8ef4d45e # v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: apt-repo
+          destination_dir: apt
+          keep_files: true

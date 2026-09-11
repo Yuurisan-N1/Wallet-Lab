@@ -1,0 +1,15 @@
+[package]
+name = "ultrafast-secp256k1-sys"
+# Placeholder — release pipeline rewrites to git-tag version (see .github/workflows/release.yml).
+# Legacy crate name; new releases ship as `ufsecp-sys` (bindings/rust/ufsecp-sys/Cargo.toml).
+version = "0.0.0-dev"
+edition = "2021"
+license = "MIT"
+description = "Raw FFI bindings to ultrafast_secp256k1 C API"
+repository = "https://github.com/UltrafastSecp256k1/UltrafastSecp256k1"
+categories = ["cryptography", "external-ffi-bindings"]
+keywords = ["secp256k1", "ecdsa", "schnorr", "bitcoin", "ffi"]
+links = "ultrafast_secp256k1"
+
+[build-dependencies]
+cc = "1"

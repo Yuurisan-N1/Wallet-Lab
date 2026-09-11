@@ -1,0 +1,870 @@
+# Building UltrafastSecp256k1
+
+Complete build guide for all supported platforms.
+
+---
+
+## Recommended Build Layout (Updated 2026-05-01)
+
+All local builds should go under `out/<profile>` to keep the source tree clean:
+
+```bash
+# Configure a profile
+python3 ci/configure_build.py release       # out/release
+python3 ci/configure_build.py audit         # out/audit
+python3 ci/configure_build.py debug         # out/debug
+
+# List all profiles
+python3 ci/configure_build.py --list
+
+# Clean all local build artifacts (dry-run first)
+bash ci/clean_local_artifacts.sh
+bash ci/clean_local_artifacts.sh --delete
+```
+
+Migration: old `out/release/`, `build-*`, `build_*` dirs are safe to delete.
+
+---
+
+## Table of Contents
+
+1. [Prerequisites](#prerequisites)
+2. [Quick Start](#quick-start)
+3. [Build Options](#build-options)
+4. [Platform-Specific Instructions](#platform-specific-instructions)
+   - [Linux x86-64](#linux-x86-64)
+   - [Windows x86-64](#windows-x86-64)
+   - [macOS](#macos)
+   - [RISC-V 64](#risc-v-64)
+   - [CUDA (NVIDIA GPU)](#cuda)
+   - [ROCm / HIP (AMD GPU)](#rocm--hip-amd-gpu)
+   - [OpenCL](#opencl)
+   - [WebAssembly (Emscripten)](#webassembly-emscripten)
+   - [iOS (XCFramework)](#ios-xcframework)
+   - [Android (NDK)](#android-ndk)
+   - [ESP32 (ESP-IDF)](#esp32-esp-idf)
+   - [STM32 (ARM Cortex-M)](#stm32-arm-cortex-m)
+5. [Cross-Compilation](#cross-compilation)
+6. [CMake Integration](#cmake-integration)
+7. [Troubleshooting](#troubleshooting)
+
+---
+
+## Prerequisites
+
+### Required
+
+- **CMake** 3.18 or later
+- **C++20 compiler**:
+  - GCC 11+ (recommended for Linux)
+  - Clang/LLVM 15+ (recommended, best optimization)
+  - MSVC 2022+ (Windows)
+- **Ninja** (recommended) or Make
+
+### Optional
+
+- **CUDA Toolkit 12.0+** for NVIDIA GPU support
+- **ROCm 5.0+ / HIP SDK** for AMD GPU support (CMake 3.21+)
+- **Emscripten SDK** for WebAssembly builds
+- **Xcode 15+** for iOS builds
+- **Android NDK r27+** for Android builds
+- **ESP-IDF v5.2+** for ESP32 builds
+- **ARM GCC** for STM32 builds
+- **clang-19/21** for best RISC-V optimization
+
+---
+
+## Quick Start
+
+### CPU Only (Default)
+
+```bash
+# Configure
+cmake -S . -B out/release -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+# Build
+cmake --build out/release -j
+
+# Test
+ctest --test-dir out/release --output-on-failure
+```
+
+### With CUDA
+
+```bash
+# Configure
+cmake -S . -B out/release -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSECP256K1_BUILD_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES="75;86;89"
+
+# Build
+cmake --build out/release -j
+```
+
+CUDA builds link the CUDA runtime statically by default
+(`CMAKE_CUDA_RUNTIME_LIBRARY=Static`), so engine binaries do not require a
+separate `libcudart.so` / `cudart64*.dll` at runtime. The NVIDIA driver library
+itself remains a system dependency. Override with
+`-DCMAKE_CUDA_RUNTIME_LIBRARY=Shared` only when a downstream packaging policy
+requires a dynamic CUDA runtime.
+
+### Install: Native Engine vs Optional C ABI
+
+The default top-level install is the native engine package. It installs
+`libfastsecp256k1`, C++ headers, `secp256k1-fast-config.cmake`, and
+`secp256k1-fast.pc`; that pkg-config file links `-lfastsecp256k1`.
+
+```bash
+cmake -S . -B out/install-fast -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build out/install-fast --target install
+```
+
+`libufsecp` is optional. Install it only for C callers, bindings, or explicit
+C ABI / bridge consumers:
+
+```bash
+cmake -S . -B out/install-both -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DSECP256K1_BUILD_CABI=ON \
+  -DSECP256K1_INSTALL_CABI=ON
+cmake --build out/install-both --target install
+```
+
+Native C++ and libsecp256k1-shim integrations should link `secp256k1::fast`
+or the `secp256k1_shim` facade, not `libufsecp`, unless they intentionally use
+the C ABI surface.
+
+### Libbitcoin Profile And Tests
+
+The canonical libbitcoin profile is direct C++ only: engine +
+`secp256k1::fastsecp256k1_libbitcoin`, no shim, no C ABI, no bridge. Enable the
+optional direct tests and benchmark when validating integration changes locally:
+
+```bash
+cmake --preset cpu-release \
+  -DSECP256K1_BUILD_LIBBITCOIN=ON \
+  -DSECP256K1_BUILD_LIBBITCOIN_TESTS=ON \
+  -DSECP256K1_BUILD_LIBBITCOIN_BENCH=ON
+cmake --build --preset cpu-release --target test_lbtc_direct_verify test_lbtc_direct_operations bench_lbtc_direct_batch -j
+ctest --test-dir out/cpu-release -R '^lbtc_direct' --output-on-failure
+```
+
+The legacy bridge/C ABI tests are compatibility-only and require
+`-DSECP256K1_BUILD_LIBBITCOIN_BRIDGE=ON`.
+
+### Coin-Specific Profiles (Minimal Footprint)
+
+Named presets strip unused optional modules to reduce `.text` size and compilation
+time for coin backend deployments. All default to `SECP256K1_BUILD_*=ON`; presets
+override only what that chain does not need.
+
+```bash
+# Bitcoin Core backend (ECDSA+Schnorr+MuSig2+Taproot+BIP-324, no FROST/ZK/Wallet)
+cmake --preset bitcoin-core
+cmake --build --preset bitcoin-core -j
+
+# Litecoin Core backend (same, BIP-324 OFF — LTC has no v2 P2P)
+cmake --preset litecoin
+cmake --build --preset litecoin -j
+
+# Dogecoin Core backend (ECDSA only, no MuSig2/BIP-324)
+cmake --preset dogecoin
+cmake --build --preset dogecoin -j
+
+# BCH wallet (RPA scanning + BIP-32/39 + Pippenger)
+cmake --preset bch-wallet
+cmake --build --preset bch-wallet -j
+
+# Full wallet (BIP-352 + adaptor + HD, no ZK/FROST)
+cmake --preset wallet
+cmake --build --preset wallet -j
+
+# Full audit build — all modules ON (used by CAAS)
+cmake --preset audit
+cmake --build --preset audit -j
+```
+
+### Optional Module Flags
+
+Each optional module can be enabled/disabled individually:
+
+| Flag | Default | Content |
+|---|---|---|
+| `SECP256K1_BUILD_MUSIG2` | ON | MuSig2 multi-signatures (BIP-327) |
+| `SECP256K1_BUILD_FROST` | ON | FROST threshold signatures |
+| `SECP256K1_BUILD_ZK` | ON | ZK proofs (Bulletproofs, Pedersen, DLEQ) |
+| `SECP256K1_BUILD_ECIES` | ON | ECIES authenticated encryption |
+| `SECP256K1_BUILD_BIP352` | ON | BIP-352 Silent Payments |
+| `SECP256K1_BUILD_ADAPTOR` | ON | Adaptor signatures |
+| `SECP256K1_BUILD_WALLET` | ON | HD wallet (BIP-32/39, coin types) |
+| `SECP256K1_BUILD_PIPPENGER` | ON | Pippenger MSM + comb generator |
+| `SECP256K1_BUILD_BIP324` | ON | BIP-324 v2 encrypted P2P |
+| `SECP256K1_BUILD_ETHEREUM` | OFF | Ethereum (Keccak-256, EIP-55/155) |
+| `SECP256K1_BUILD_BCH` | OFF | BCH RPA + CashAddr module |
+| `SECP256K1_BUILD_LTC_SP` | ON | LTC Silent Payments (ltcsp1... paycodes) |
+
+Downstream code can check availability via the generated header:
+```cpp
+#include "secp256k1/secp256k1_features.h"
+#if SECP256K1_HAS_FROST
+  // FROST code
+#endif
+```
+
+### Canonical GPU Audit Build
+
+Use the preset-based path below when you want the GPU C ABI tests to appear in
+`ctest` and produce the reproducible "49-test" GPU-enabled validation run.
+
+```bash
+# Configure + build the canonical CUDA audit tree
+cmake --preset cuda-audit-5060ti
+cmake --build --preset cuda-audit-5060ti -j
+
+# Verify the GPU audit tests are present
+ctest --test-dir out/release/cuda-release-5060ti -N
+
+# Run the GPU ABI + equivalence audit slice
+ctest --preset cuda-audit-5060ti
+```
+
+Expected additional tests in a GPU-enabled build:
+
+- `gpu_abi_gate`
+- `gpu_ops_equivalence`
+- `gpu_host_api_negative`
+- `gpu_backend_matrix`
+
+If these tests do not appear, the build is still CPU-only and the GPU host layer
+was not configured into the active build tree.
+
+### Audit / Exploit Targets In Test Builds
+
+When `SECP256K1_BUILD_TESTS=ON`, the generated CTest surface also includes standalone
+audit and exploit binaries registered from the build scripts. Recent additions such
+as transcript-splice, stale-commitment-replay, DER confusion, and hostile-caller
+regression targets are expected to appear automatically in `ctest -N` for audit
+or CI-oriented build trees.
+
+---
+
+## Build Options
+
+> **📋 Complete reference:** [BUILD_OPTIONS.md](BUILD_OPTIONS.md) lists **every** build
+> flag (auto-generated from the CMake `option()` declarations — always complete and in
+> sync). The table below is a hand-picked quick subset of the most common flags.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `SECP256K1_USE_ASM` | ON | Assembly optimizations (x64/RISC-V) |
+| `SECP256K1_BUILD_CUDA` | OFF | Build CUDA GPU library |
+| `SECP256K1_BUILD_OPENCL` | OFF | Build OpenCL GPU support |
+| `SECP256K1_BUILD_ROCM` | OFF | Build ROCm/HIP GPU support (AMD) |
+| `SECP256K1_BUILD_TESTS` | ON | Build test suite |
+| `SECP256K1_BUILD_BENCH` | ON | Build benchmarks |
+| `SECP256K1_BUILD_EXAMPLES` | ON | Build example programs |
+| `SECP256K1_USE_LTO` | ON | Link-Time Optimization |
+| `SECP256K1_SPEED_FIRST` | OFF | Reserved — sets `SECP256K1_FAST_NO_SECURITY_CHECKS` compile definition (currently has no effect; CT guards are always enabled) |
+| `SECP256K1_GLV_WINDOW_WIDTH` | platform | GLV window width (4-7); default 5 on x86/ARM/RISC-V, 4 on ESP32/WASM |
+| `SECP256K1_BUILD_ETHEREUM` | ON | Ethereum/EVM signing layer (Keccak-256, EIP-155, ecrecover). OFF for Bitcoin-only builds |
+| `SECP256K1_INSTALL` | ON | Generate install target |
+| `SECP256K1_INSTALL_CABI` | OFF | Install optional `libufsecp` C ABI package from the top-level install |
+
+### RISC-V Specific
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `SECP256K1_RISCV_USE_VECTOR` | ON | RVV vector extension |
+| `SECP256K1_RISCV_USE_PREFETCH` | ON | Memory prefetch hints |
+
+### CUDA Specific
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `SECP256K1_CUDA_USE_MONTGOMERY` | OFF | Montgomery domain arithmetic |
+| `SECP256K1_CUDA_LIMBS_32` | OFF | 8x32-bit limbs (experimental) |
+| `CMAKE_CUDA_ARCHITECTURES` | 89 | Target GPU architectures |
+
+---
+
+## Platform-Specific Instructions
+
+### Linux x86-64
+
+#### Using Clang (Recommended)
+
+```bash
+# Install dependencies
+sudo apt install cmake ninja-build clang-19 lld-19
+
+# Configure with Clang
+cmake -S . -B out/release -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang-19 \
+  -DCMAKE_CXX_COMPILER=clang++-19
+
+# Build
+cmake --build out/release -j$(nproc)
+```
+
+#### Using GCC
+
+```bash
+# Install dependencies
+sudo apt install cmake ninja-build g++-11
+
+# Configure with GCC
+cmake -S . -B out/release -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=gcc-11 \
+  -DCMAKE_CXX_COMPILER=g++-11
+
+# Build
+cmake --build out/release -j$(nproc)
+```
+
+---
+
+### Windows x86-64
+
+#### Using Clang/LLVM (Recommended)
+
+```powershell
+# Install LLVM from https://llvm.org/builds/
+# Or via winget:
+winget install LLVM.LLVM
+
+# Configure
+cmake -S . -B out/release -G Ninja `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_C_COMPILER=clang `
+  -DCMAKE_CXX_COMPILER=clang++
+
+# Build
+cmake --build out/release -j
+```
+
+#### Using MSVC (Not Recommended)
+
+```powershell
+# Open Visual Studio Developer Command Prompt
+# Then:
+cmake -S . -B out/release -G "Visual Studio 17 2022"
+
+cmake --build out/release --config Release
+```
+
+> [!] **Warning**: MSVC produces slower code compared to Clang/GCC.
+
+---
+
+### macOS
+
+```bash
+# AppleClang (default)
+cmake -S . -B out/release -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build out/release -j
+
+# Or with Homebrew LLVM (for latest optimizations)
+brew install llvm ninja
+cmake -S . -B out/release -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=$(brew --prefix llvm)/bin/clang \
+  -DCMAKE_CXX_COMPILER=$(brew --prefix llvm)/bin/clang++
+cmake --build out/release -j
+```
+
+ARM64 (Apple Silicon) inline assembly is automatically enabled on aarch64.
+
+---
+
+### RISC-V 64
+
+#### Native Build
+
+```bash
+# On RISC-V machine with Clang 19+
+cmake -S . -B out/release -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang-21 \
+  -DCMAKE_CXX_COMPILER=clang++-21
+
+cmake --build out/release -j$(nproc)
+```
+
+#### Cross-Compilation (from x86-64)
+
+```bash
+# Install toolchain
+sudo apt install gcc-riscv64-linux-gnu g++-riscv64-linux-gnu
+
+# Configure for cross-compilation
+cmake -S . -B out/riscv -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_SYSTEM_NAME=Linux \
+  -DCMAKE_SYSTEM_PROCESSOR=riscv64 \
+  -DCMAKE_C_COMPILER=riscv64-linux-gnu-gcc \
+  -DCMAKE_CXX_COMPILER=riscv64-linux-gnu-g++
+
+cmake --build out/release-riscv -j$(nproc)
+```
+
+#### Expected Performance (RISC-V)
+
+| Operation | Time |
+|-----------|------|
+| Field Mul | ~198 ns |
+| Field Square | ~177 ns |
+| Field Add | ~34 ns |
+| Point Scalar Mul | ~672 us |
+| Generator Mul | ~40 us |
+
+---
+
+### CUDA
+
+#### Prerequisites
+
+1. Install [CUDA Toolkit 12.0+](https://developer.nvidia.com/cuda-downloads)
+2. Ensure `nvcc` is in PATH
+
+#### Build
+
+```bash
+# Configure
+cmake -S . -B out/release -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSECP256K1_BUILD_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES="75;86;89"
+
+# Build
+cmake --build out/release -j
+```
+
+#### GPU Architecture Reference
+
+| Architecture | GPUs | Flag |
+|--------------|------|------|
+| sm_75 | RTX 2060-2080, T4 | 75 |
+| sm_80 | A100 | 80 |
+| sm_86 | RTX 3060-3090, A6000 | 86 |
+| sm_89 | RTX 4060-4090, L4, L40 | 89 |
+| sm_90 | H100 | 90 |
+
+Example for RTX 4090:
+```bash
+cmake -DCMAKE_CUDA_ARCHITECTURES=89 ...
+```
+
+---
+
+### ROCm / HIP (AMD GPU)
+
+#### Prerequisites
+
+1. Install [ROCm 5.0+](https://rocm.docs.amd.com/en/latest/deploy/linux/quick_start.html) or HIP SDK
+2. CMake 3.21+ (native HIP language support)
+
+#### Build
+
+```bash
+cmake -S . -B out/rocm -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSECP256K1_BUILD_ROCM=ON \
+  -DCMAKE_HIP_ARCHITECTURES="gfx1030;gfx1100"
+
+cmake --build out/release-rocm -j
+```
+
+#### AMD GPU Architecture Reference
+
+| Architecture | GPUs | Flag |
+|--------------|------|------|
+| gfx906 | Radeon VII, MI50 | gfx906 |
+| gfx908 | MI100 | gfx908 |
+| gfx90a | MI210, MI250 | gfx90a |
+| gfx1030 | RX 6800/6900 | gfx1030 |
+| gfx1100 | RX 7900 XTX | gfx1100 |
+
+> **Note**: PTX inline asm is automatically replaced with portable `__int128` fallbacks on HIP. The hybrid 32-bit mul backend is disabled on HIP (PTX-dependent).
+
+#### Docker Build
+
+```bash
+docker run --rm -v $(pwd):/src rocm/dev-ubuntu-22.04:6.3 \
+  bash -c "cd /src && cmake -S . -B out/release -G Ninja \
+    -DSECP256K1_BUILD_ROCM=ON && cmake --build out/release -j"
+```
+
+---
+
+### OpenCL
+
+#### Prerequisites
+
+- OpenCL 3.0 runtime (GPU drivers typically provide this)
+- OpenCL headers (`apt install opencl-headers` on Linux)
+
+#### Build
+
+```bash
+cmake -S . -B out/release -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSECP256K1_BUILD_OPENCL=ON
+
+cmake --build out/release -j
+```
+
+On Windows, CMake auto-detects `OpenCL.lib` from the GPU driver in `C:\Windows\System32`.
+
+---
+
+### WebAssembly (Emscripten)
+
+#### Prerequisites
+
+```bash
+# Install Emscripten SDK
+git clone https://github.com/emscripten-core/emsdk.git
+cd emsdk && ./emsdk install latest && ./emsdk activate latest
+source emsdk_env.sh
+```
+
+#### Build
+
+```bash
+# Using the build script (recommended)
+./ci/build_wasm.sh
+
+# Or manually:
+emcmake cmake -S wasm -B out/wasm -DCMAKE_BUILD_TYPE=Release
+cmake --build out/release-wasm -j
+```
+
+#### Output
+
+| File | Description |
+|------|-------------|
+| `build-wasm/dist/secp256k1_wasm.wasm` | WebAssembly binary |
+| `build-wasm/dist/secp256k1_wasm.js` | Emscripten ES6 loader |
+| `build-wasm/dist/secp256k1.mjs` | High-level JS wrapper |
+| `build-wasm/dist/secp256k1.d.ts` | TypeScript declarations |
+
+See [bindings/wasm/README.md](../bindings/wasm/README.md) for JS/TS usage and npm publishing.
+
+---
+
+### iOS (XCFramework)
+
+#### Prerequisites
+
+- macOS with Xcode 15+
+- CMake 3.18+
+
+#### Build
+
+```bash
+# Build universal XCFramework (device + simulator)
+./ci/build_xcframework.sh
+```
+
+Output: `build-xcframework/output/UltrafastSecp256k1.xcframework`
+
+#### Integration
+
+**Swift Package Manager:**
+```swift
+// Package.swift
+dependencies: [
+    .package(url: "https://github.com/shrec/UltrafastSecp256k1.git", from: "4.5.0")
+]
+```
+
+**CocoaPods:**
+```ruby
+# Podfile
+pod 'UltrafastSecp256k1', '~> 3.0.0'
+```
+
+**Manual XCFramework:**
+1. Drag `UltrafastSecp256k1.xcframework` into Xcode
+2. Add to target's "Frameworks, Libraries, and Embedded Content"
+3. Include headers:
+   ```cpp
+   #include <secp256k1/field.hpp>
+   #include <secp256k1/ecdsa.hpp>
+   ```
+
+---
+
+### Android (NDK)
+
+#### Prerequisites
+
+- [Android NDK r27+](https://developer.android.com/ndk/downloads)
+- CMake 3.18+
+
+#### Build
+
+```bash
+# Set NDK path
+export ANDROID_NDK=$HOME/Android/Sdk/ndk/27.2.12479018
+
+# Build for arm64-v8a
+cmake -S . -B out/android -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/out/release/cmake/android.toolchain.cmake \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=android-24 \
+  -DCMAKE_BUILD_TYPE=Release
+
+cmake --build out/release-android -j
+```
+
+The library produces `libfastsecp256k1.a` for linking into Android apps via JNI.
+
+---
+
+### ESP32 (ESP-IDF)
+
+#### Prerequisites
+
+- [ESP-IDF v5.2+](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/get-started/)
+- Supported targets: ESP32-S3 (Xtensa LX7), ESP32 (Xtensa LX6)
+
+#### Build & Flash
+
+```bash
+cd examples/esp32_test
+
+# Set target (esp32s3 or esp32)
+idf.py set-target esp32s3
+
+# Build, flash and monitor
+idf.py -p /dev/ttyUSB0 build flash monitor
+```
+
+See [docs/ESP32_SETUP.md](ESP32_SETUP.md) for detailed CLion/IDE integration.
+
+> **Note**: ESP32 uses portable C++ (no `__int128`, no platform assembly). All 35 library self-tests pass on both ESP32-S3 and ESP32-PICO-D4.
+
+---
+
+### STM32 (ARM Cortex-M)
+
+#### Prerequisites
+
+- ARM GCC toolchain (`arm-none-eabi-gcc` 13+)
+- STM32CubeMX or raw Makefile
+
+#### Build
+
+```bash
+cd examples/stm32_test
+make -j
+```
+
+The STM32 port uses ARM Cortex-M3 inline assembly (`UMULL/ADDS/ADCS`) for field multiplication and squaring. Portable C++ for field add/sub.
+
+See [examples/stm32_test/](../examples/stm32_test/) for the complete project.
+
+---
+
+---
+
+## Cross-Compilation
+
+### RISC-V from x86-64
+
+See [RISC-V 64](#risc-v-64) section above.
+
+### Windows from Linux
+
+```bash
+# Using MinGW-w64
+sudo apt install mingw-w64
+
+cmake -S . -B out/win -G Ninja \
+  -DCMAKE_SYSTEM_NAME=Windows \
+  -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+  -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++
+
+cmake --build out/release-win -j
+```
+
+---
+
+## Troubleshooting
+
+### LTO Not Working on RISC-V
+
+LTO requires `LLVMgold.so` plugin. If missing:
+
+```bash
+# Install LLVM with gold plugin
+sudo apt install llvm-19-dev
+
+# Or disable LTO
+cmake -DSECP256K1_USE_LTO=OFF ...
+```
+
+### CUDA Compilation Errors
+
+1. **"nvcc not found"**: Add CUDA to PATH
+   ```bash
+   export PATH=/usr/local/cuda/bin:$PATH
+   ```
+
+2. **"unsupported architecture"**: Update `CMAKE_CUDA_ARCHITECTURES`:
+   ```bash
+   cmake -DCMAKE_CUDA_ARCHITECTURES=89 ...
+   ```
+
+3. **`gpu_audit_runner` OpenMP link errors**: CUDA audit builds link the CPU
+   differential library into the GPU audit runner. When the CPU library is built
+   with OpenMP, the audit runner must also link `OpenMP::OpenMP_CXX`; the CMake
+   target does this automatically in current builds.
+
+### Assembly Errors on RISC-V
+
+If you see "symbol already defined" errors:
+```bash
+# Rebuild clean
+rm -rf build
+cmake -S . -B out/release -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build out/release -j
+```
+
+### MSVC Link Errors
+
+MSVC is not fully supported. Use Clang instead:
+```powershell
+# Install LLVM from https://llvm.org/builds/
+cmake -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ ...
+```
+
+---
+
+## CMake Integration
+
+### As a Subdirectory
+
+```cmake
+add_subdirectory(path/to/UltrafastSecp256k1)
+target_link_libraries(your_target PRIVATE secp256k1::fast)
+```
+
+### After Installation
+
+```bash
+# Install to system (Linux)
+sudo cmake --install build --prefix /usr/local
+
+# Install to custom location
+cmake --install build --prefix /opt/secp256k1
+```
+
+```cmake
+# In your CMakeLists.txt
+find_package(secp256k1-fast REQUIRED)
+target_link_libraries(your_target PRIVATE secp256k1::fastsecp256k1)
+```
+
+### pkg-config
+
+```bash
+pkg-config --cflags --libs secp256k1-fast
+```
+
+### libbitcoin Compatibility Bridge
+
+The libbitcoin bridge links against the public `ufsecp` C ABI and no longer
+requires private C++ engine headers. Standalone bridge builds should point CMake
+at the built C ABI library and header directory:
+
+```bash
+cmake -S compat/libbitcoin_bridge -B out/lbtc-bridge -G Ninja \
+  -DUFSECP_LIBRARY=/absolute/path/to/libufsecp.so \
+  -DUFSECP_INCLUDE_DIR=/absolute/path/to/include/ufsecp
+cmake --build out/lbtc-bridge
+```
+
+ECDSA batch rows in the bridge use the public opaque-row verification ABI, so
+libbitcoin-style `msg32 || pubkey33 || copied secp256k1_ecdsa_signature64`
+records can be passed without bridge-side compact table staging.
+
+The bridge CMake also exposes the engine's public C++ include root for
+non-ECDSA helper code such as Taproot commitment batching. Installed layouts can
+override that path with `-DUFSECP_CPU_INCLUDE_DIR=/path/to/src/cpu/include`.
+
+---
+
+## Verification
+
+After building, run tests to verify correctness:
+
+```bash
+# Run all tests
+ctest --test-dir out/release --output-on-failure
+
+# Run benchmarks
+./out/release/cpu/bench_unified
+./out/release/cuda/secp256k1_cuda_bench  # If CUDA enabled
+```
+
+---
+
+## Install from Linux Packages
+
+Pre-built packages are available for each [GitHub Release](https://github.com/shrec/UltrafastSecp256k1/releases).
+
+### Debian / Ubuntu (APT)
+
+```bash
+# Add the repository
+curl -fsSL https://shrec.github.io/UltrafastSecp256k1/apt/KEY.gpg \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/ultrafastsecp256k1.gpg
+echo "deb [signed-by=/etc/apt/keyrings/ultrafastsecp256k1.gpg] \
+  https://shrec.github.io/UltrafastSecp256k1/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/ultrafastsecp256k1.list
+
+sudo apt update
+sudo apt install libufsecp-dev   # headers + static + shared
+```
+
+### Fedora / RHEL (RPM)
+
+```bash
+# Download the latest .rpm from GitHub Releases
+curl -LO "https://github.com/shrec/UltrafastSecp256k1/releases/latest/download/\
+UltrafastSecp256k1-$(rpm -E %{_arch}).rpm"
+sudo dnf install ./UltrafastSecp256k1-*.rpm
+```
+
+### Arch Linux (AUR)
+
+```bash
+yay -S libufsecp
+```
+
+### Docker (build from source)
+
+```bash
+docker build -t ultrafastsecp256k1 -f Dockerfile .
+docker run --rm ultrafastsecp256k1 ctest --output-on-failure
+```
+
+---
+
+## Version
+
+Current version is read from `VERSION.txt` at configure time.
+
+## Security Hardening Flags (2026-04-28)
+
+The release build automatically enables supply-chain hardening flags:
+
+- `-fstack-protector-strong` — stack canaries for all functions with vulnerable stack frames
+- `-D_FORTIFY_SOURCE=2` (Release builds only) — fortified glibc function wrappers
+- `-fPIE` / `-fPIC` — position-independent code (ASLR support). CMake applies `-fPIC` to shared libraries and `-fPIE` to executables automatically via `CMAKE_POSITION_INDEPENDENT_CODE=ON`; do not pass `-fPIE` globally as it breaks shared library linking.
+
+These are required by the CAAS supply-chain gate (`ci/supply_chain_gate.py`). To override for embedded/no-OS targets, pass `-DCMAKE_C_FLAGS=-fno-stack-protector` explicitly.

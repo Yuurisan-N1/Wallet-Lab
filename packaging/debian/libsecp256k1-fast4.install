@@ -1,0 +1,2 @@
+usr/lib/*/libfastsecp256k1.so.*
+usr/lib/*/libufsecp.so.*

@@ -1,0 +1,20 @@
+name: ufsecp
+description: >-
+  High-performance secp256k1 elliptic curve cryptography via dart:ffi.
+  Context-based ufsecp C ABI v1 -- ECDSA, Schnorr, ECDH, BIP-32, Taproot, addresses.
+version: 0.0.0-dev
+homepage: https://github.com/shrec/UltrafastSecp256k1
+repository: https://github.com/shrec/UltrafastSecp256k1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  ffi: ^2.1.0
+
+topics:
+  - secp256k1
+  - ecdsa
+  - schnorr
+  - bitcoin
+  - cryptography

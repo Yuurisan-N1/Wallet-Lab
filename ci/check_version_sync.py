@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""
+check_version_sync.py — CI gate: verify all canonical numbers match their sources.
+
+Exit 0  = all sources agree.
+Exit 1  = one or more mismatches (prints diff table).
+
+Usage:
+    python3 ci/check_version_sync.py [--root DIR] [--counts-only] [--version-only]
+
+Version checks (canonical: VERSION.txt):
+    include/ufsecp/ufsecp_version.h
+    CITATION.cff
+    packaging/cocoapods/UltrafastSecp256k1.podspec
+    packaging/rpm/libufsecp.spec
+    packaging/arch/PKGBUILD
+    conanfile.py        (REL9-001: previously uncovered .py package metadata)
+    vcpkg.json          (REL9-002: previously uncovered .json package metadata)
+    .zenodo.json        (REL9-003: minted into the release DOI)
+
+Count checks (canonical: computed from source):
+    Exploit PoC count  → count "exploit_poc" in audit/unified_audit_runner.cpp
+    Total audit modules → count all _run entries in unified_audit_runner.cpp
+    GPU ABI functions  → count ufsecp_error_t ufsecp_gpu_* declarations in ufsecp_gpu.h
+
+Intentionally skipped (build-time templated or historical):
+    packaging/nuget/UltrafastSecp256k1.Native.nuspec  (0.0.0-dev)
+    packaging/debian/changelog                          (historical log)
+"""
+
+from __future__ import annotations
+import re
+import sys
+import argparse
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Extractors: each returns (version_string | None, description_of_location)
+# ---------------------------------------------------------------------------
+
+def _extract_version_txt(root: Path) -> str | None:
+    p = root / 'VERSION.txt'
+    if not p.exists():
+        return None
+    return p.read_text().strip().lstrip('v')
+
+
+def _extract_ufsecp_header(root: Path) -> str | None:
+    p = root / 'include' / 'ufsecp' / 'ufsecp_version.h'
+    if not p.exists():
+        return None
+    text = p.read_text(encoding='utf-8')
+    major = re.search(r'^#define\s+UFSECP_VERSION_MAJOR\s+(\d+)', text, re.MULTILINE)
+    minor = re.search(r'^#define\s+UFSECP_VERSION_MINOR\s+(\d+)', text, re.MULTILINE)
+    patch = re.search(r'^#define\s+UFSECP_VERSION_PATCH\s+(\d+)', text, re.MULTILINE)
+    if not (major and minor and patch):
+        return None
+    return f'{major.group(1)}.{minor.group(1)}.{patch.group(1)}'
+
+
+def _extract_header_string_macro(root: Path) -> str | None:
+    p = root / 'include' / 'ufsecp' / 'ufsecp_version.h'
+    if not p.exists():
+        return None
+    text = p.read_text(encoding='utf-8')
+    m = re.search(r'^#define\s+UFSECP_VERSION_STRING\s+"(\d+\.\d+\.\d+)"', text, re.MULTILINE)
+    return m.group(1) if m else None
+
+
+def _extract_citation_cff(root: Path) -> str | None:
+    p = root / 'CITATION.cff'
+    if not p.exists():
+        return None
+    text = p.read_text(encoding='utf-8')
+    m = re.search(r'^version:\s*"(\d+\.\d+\.\d+)"', text, re.MULTILINE)
+    return m.group(1) if m else None
+
+
+def _extract_podspec(root: Path) -> str | None:
+    for p in (root / 'packaging' / 'cocoapods').glob('*.podspec'):
+        text = p.read_text(encoding='utf-8')
+        m = re.search(r's\.version\s*=\s*"(\d+\.\d+\.\d+)"', text)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _extract_rpm_spec(root: Path) -> str | None:
+    for p in (root / 'packaging' / 'rpm').glob('*.spec'):
+        text = p.read_text(encoding='utf-8')
+        m = re.search(r'^Version:\s+(\d+\.\d+\.\d+)', text, re.MULTILINE)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _extract_rpm_soversion(root: Path) -> str | None:
+    for p in (root / 'packaging' / 'rpm').glob('*.spec'):
+        text = p.read_text(encoding='utf-8')
+        m = re.search(r'^%global\s+soversion\s+(\d+)', text, re.MULTILINE)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _extract_pkgbuild(root: Path) -> str | None:
+    p = root / 'packaging' / 'arch' / 'PKGBUILD'
+    if not p.exists():
+        return None
+    text = p.read_text(encoding='utf-8')
+    m = re.search(r'^pkgver=(\d+\.\d+\.\d+)', text, re.MULTILINE)
+    return m.group(1) if m else None
+
+
+def _extract_docs_readme_header(root: Path) -> str | None:
+    # docs/README.md header line: "> **Version 4.1.0** -- ..."
+    # (bold version with a space, no colon). Synced by sync_version_refs.py.
+    p = root / 'docs' / 'README.md'
+    if not p.exists():
+        return None
+    text = p.read_text(encoding='utf-8')
+    m = re.search(r'\*\*Version\s+(\d+\.\d+\.\d+)\*\*', text)
+    return m.group(1) if m else None
+
+
+def _extract_package_swift_example(root: Path) -> str | None:
+    # Package.swift SPM usage example: '.package(url: "...", from: "4.1.0")'.
+    # Synced by sync_version_refs.py (requires '.swift' in its target_suffixes).
+    p = root / 'Package.swift'
+    if not p.exists():
+        return None
+    text = p.read_text(encoding='utf-8')
+    m = re.search(r'\.package\(url:[^)]*from:\s*"(\d+\.\d+\.\d+)"', text)
+    return m.group(1) if m else None
+
+
+def _extract_conanfile(root: Path) -> str | None:
+    # REL9-001: conanfile.py was stuck at 4.1.0 because no extractor covered .py
+    # package files. A `set_version()` that loads VERSION.txt is correct by
+    # construction (return canonical); otherwise read the static `version = "x.y.z"`.
+    p = root / 'conanfile.py'
+    if not p.exists():
+        return None
+    text = p.read_text(encoding='utf-8')
+    if re.search(r'def\s+set_version\b', text) and 'VERSION.txt' in text:
+        return _extract_version_txt(root)
+    m = re.search(r'^\s*version\s*=\s*"(\d+\.\d+\.\d+)"', text, re.MULTILINE)
+    return m.group(1) if m else None
+
+
+def _extract_vcpkg(root: Path) -> str | None:
+    # REL9-002: vcpkg manifest version (JSON, was uncovered by .json scanning).
+    import json
+    p = root / 'vcpkg.json'
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding='utf-8'))
+    except Exception:
+        return None
+    v = data.get('version') or data.get('version-semver') or data.get('version-string')
+    return str(v) if v else None
+
+
+def _extract_zenodo(root: Path) -> str | None:
+    # REL9-003: Zenodo deposition version (JSON) — minted into the DOI on release.
+    import json
+    p = root / '.zenodo.json'
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding='utf-8'))
+    except Exception:
+        return None
+    v = data.get('version')
+    return str(v) if v else None
+
+
+# ---------------------------------------------------------------------------
+# Count extractors (from docs, to compare against authoritative source)
+# ---------------------------------------------------------------------------
+
+_SKIP_COUNT_FILES = {
+    'CHANGELOG.md', 'AUDIT_CHANGELOG.md', 'ROADMAP.md',
+    'AUDIT_REPORT.md', 'RELEASE_NOTES.md',
+}
+_SKIP_COUNT_DIRS = {'archive', 'build', '.git'}
+
+
+def _scan_docs_for_count(root: Path, pattern: re.Pattern) -> list[tuple[str, int]]:
+    """Find all doc files containing pattern; return list of (relpath, found_int)."""
+    hits = []
+    scan_dirs = [root / 'docs', root / 'include', root]
+    for scan_dir in scan_dirs:
+        if not scan_dir.exists():
+            continue
+        glob_pat = '*.md' if scan_dir == root else '**/*.md'
+        for p in sorted(scan_dir.glob(glob_pat)):
+            if p.name in _SKIP_COUNT_FILES:
+                continue
+            if any(part in _SKIP_COUNT_DIRS for part in p.parts):
+                continue
+            try:
+                text = p.read_text(encoding='utf-8')
+            except Exception:
+                continue
+            for m in pattern.finditer(text):
+                hits.append((str(p.relative_to(root)), int(m.group(1))))
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# Main check
+# ---------------------------------------------------------------------------
+
+def _print_table(rows: list[tuple[str, str, str, str]], col_w: int) -> bool:
+    ok = True
+    header = f'{"Location":<{col_w}}  {"Found":<12}  {"Expected":<12}  Status'
+    print(header)
+    print('-' * len(header))
+    for label, found, expected, status in rows:
+        if status != 'OK':
+            ok = False
+        marker = '' if status == 'OK' else ' <--'
+        print(f'{label:<{col_w}}  {found:<12}  {expected:<12}  {status}{marker}')
+    return ok
+
+
+def check_version_sync(root: Path) -> bool:
+    canonical = _extract_version_txt(root)
+    if not canonical:
+        print('ERROR: VERSION.txt not found or empty', file=sys.stderr)
+        return False
+
+    expected_major = canonical.split('.')[0]
+
+    raw_checks = [
+        ('VERSION.txt (canonical)',             canonical),
+        ('ufsecp_version.h  MAJOR/MINOR/PATCH', _extract_ufsecp_header(root)),
+        ('ufsecp_version.h  VERSION_STRING',    _extract_header_string_macro(root)),
+        ('CITATION.cff  version',               _extract_citation_cff(root)),
+        ('cocoapods podspec  s.version',        _extract_podspec(root)),
+        ('rpm spec  Version:',                  _extract_rpm_spec(root)),
+        ('arch PKGBUILD  pkgver',               _extract_pkgbuild(root)),
+        ('docs/README.md  **Version** header',  _extract_docs_readme_header(root)),
+        ('Package.swift  SPM example from:',     _extract_package_swift_example(root)),
+        ('conanfile.py  version',                _extract_conanfile(root)),
+        ('vcpkg.json  version',                  _extract_vcpkg(root)),
+        ('.zenodo.json  version',                _extract_zenodo(root)),
+        ('rpm spec  soversion (expect major)',  _extract_rpm_soversion(root)),
+    ]
+
+    rows = []
+    for label, found in raw_checks:
+        expected = expected_major if 'soversion' in label else canonical
+        if found is None:
+            status = 'MISSING'
+        elif found == expected:
+            status = 'OK'
+        else:
+            status = 'MISMATCH'
+        rows.append((label, found or 'N/A', expected, status))
+
+    col_w = max(len(r[0]) for r in rows) + 2
+    print('\n── Version sync ────────────────────────────────────────────────')
+    ok = _print_table(rows, col_w)
+    if ok:
+        print(f'\n  All version declarations match {canonical}.')
+    else:
+        print('\n  FAIL — run: python3 ci/sync_version_refs.py --dry-run')
+    return ok
+
+
+def check_count_sync(root: Path) -> bool:
+    """Check that canonical counts (exploit PoC, GPU ABI, etc.) match doc references."""
+    runner = root / 'audit' / 'unified_audit_runner.cpp'
+    gpu_hdr = root / 'include' / 'ufsecp' / 'ufsecp_gpu.h'
+
+    auth_exploit = 0
+    auth_gpu = 0
+    if runner.exists():
+        t = runner.read_text(encoding='utf-8')
+        # Count only within the ALL_MODULES[] block (mirrors build_canonical_data.py logic).
+        # Counting the full file includes SECTIONS[] definitions and comments which are
+        # not module entries, producing a 2-unit overcounting vs. the canonical count.
+        start = t.find("static const AuditModule ALL_MODULES")
+        if start == -1:
+            start = t.find("ALL_MODULES[] =")
+        end = t.find("};\n\nstatic constexpr int NUM_MODULES", start)
+        block = t[start:end] if start != -1 and end != -1 else t
+        auth_exploit = len(re.findall(r'"exploit_poc"', block))
+    if gpu_hdr.exists():
+        t = gpu_hdr.read_text(encoding='utf-8')
+        # Count stable GPU batch-op functions: only ufsecp_error_t-returning
+        # ufsecp_gpu_* declarations.  This deliberately excludes utility functions
+        # that return int/void/const-char* (is_ready, last_error_msg, backend_name,
+        # backend_count, device_count, error_str) and the CPU-side prepare helper
+        # (ufsecp_bip352_prepare_scan_plan) which is not a GPU kernel dispatch.
+        # NOTE: the macro name is UFSECP_API, not UFSECP_GPU_API (which does not
+        # exist in this header). The pattern below is the authoritative count source.
+        # Exclude lifecycle/context functions (device_info, ctx_create, last_error)
+        # which are not batch-op dispatch functions.
+        _gpu_fns = re.findall(
+            r'^UFSECP_API\s+ufsecp_error_t\s+(ufsecp_gpu_\w+)\s*\(',
+            t, re.MULTILINE)
+        _lifecycle_fns = {'ufsecp_gpu_device_info', 'ufsecp_gpu_ctx_create', 'ufsecp_gpu_last_error'}
+        auth_gpu = len([fn for fn in _gpu_fns if fn not in _lifecycle_fns])
+
+    # Scan docs for stale exploit counts (3+ digit numbers only — small counts
+    # like "14 new exploit PoCs" are incremental changelog entries, not totals)
+    exploit_pattern = re.compile(r'\b(\d{3,})\s+exploit[- ]PoC[s]?\b', re.IGNORECASE)
+    stale = [(p, n) for p, n in _scan_docs_for_count(root, exploit_pattern)
+             if n != auth_exploit]
+
+    # CLAIM-GPU-ABI-COUNT: the header's documented "stable batch-op surface" count is
+    # authoritative for doc-facing GPU op claims. (auth_gpu above counts
+    # ufsecp_error_t declarations — a different, lower-level metric — and was printed
+    # but never enforced against docs, a false-green.) Scan docs for GPU op-count
+    # claims and require they match the header's documented number.
+    auth_gpu_doc = None
+    if gpu_hdr.exists():
+        # The phrase wraps across a comment-continuation line ("stable batch-op\n
+        # *   surface currently includes 13 ..."), so allow whitespace + '*' between
+        # tokens.
+        m = re.search(r'stable batch-op[\s*]+surface currently includes\s+(\d+)\s+backend-neutral',
+                      gpu_hdr.read_text(encoding='utf-8'))
+        if m:
+            auth_gpu_doc = int(m.group(1))
+    gpu_stale = []
+    if auth_gpu_doc is not None:
+        _gpu_patterns = [
+            re.compile(r'(\d+)-op GPU C ABI'),
+            re.compile(r'(\d+)-op FFI'),
+            re.compile(r'stable\s+(\d+)-op\b'),
+            re.compile(r'(\d+)\s+backend-neutral (?:batch )?operations?'),
+            re.compile(r'(\d+)\s+stable batch ops'),
+        ]
+        for _pat in _gpu_patterns:
+            for path, n in _scan_docs_for_count(root, _pat):
+                if n != auth_gpu_doc:
+                    gpu_stale.append((path, n))
+
+    col_w = 55
+    print('\n── Canonical count sync ─────────────────────────────────────────')
+    print(f'  Authoritative exploit PoC count (unified_audit_runner.cpp): {auth_exploit}')
+    print(f'  GPU declared error_t fns (ufsecp_gpu.h, lower-level metric): {auth_gpu}')
+    print(f'  Authoritative GPU stable batch ops (header prose):          {auth_gpu_doc}')
+
+    ok = True
+    if stale:
+        ok = False
+        print(f'\n  STALE exploit PoC references ({len(stale)} locations):')
+        for path, n in stale[:10]:
+            print(f'    {path}: found {n}, expected {auth_exploit}')
+        print(f'\n  Fix: python3 ci/sync_version_refs.py --sync-exploit --dry-run')
+    else:
+        print(f'\n  All exploit PoC count references match {auth_exploit}. OK')
+
+    if gpu_stale:
+        ok = False
+        print(f'\n  STALE GPU op-count references ({len(gpu_stale)} locations, '
+              f'expected {auth_gpu_doc} per ufsecp_gpu.h prose):')
+        for path, n in sorted(set(gpu_stale))[:10]:
+            print(f'    {path}: found {n}, expected {auth_gpu_doc}')
+        print('\n  Fix: reconcile the doc GPU op-count to the header\'s documented '
+              'stable batch-op surface.')
+    elif auth_gpu_doc is not None:
+        print(f'  All GPU op-count references match {auth_gpu_doc}. OK')
+    return ok
+
+
+def check_sync(root: Path, version_only: bool = False, counts_only: bool = False) -> bool:
+    ok = True
+    if not counts_only:
+        ok = check_version_sync(root) and ok
+    if not version_only:
+        ok = check_count_sync(root) and ok
+    return ok
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description='CI gate: verify all canonical numbers match their source of truth')
+    parser.add_argument('--root', default=None, help='Repo root (default: parent of ci/)')
+    parser.add_argument('--version-only', action='store_true',
+                        help='Only check version declarations')
+    parser.add_argument('--counts-only', action='store_true',
+                        help='Only check canonical counts (exploit PoC, GPU ABI)')
+    args = parser.parse_args()
+
+    script_dir = Path(__file__).parent
+    root = Path(args.root) if args.root else script_dir.parent
+
+    ok = check_sync(root, version_only=args.version_only, counts_only=args.counts_only)
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == '__main__':
+    main()

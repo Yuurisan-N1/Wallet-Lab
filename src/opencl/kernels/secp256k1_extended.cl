@@ -1,0 +1,2941 @@
+// =============================================================================
+// UltrafastSecp256k1 OpenCL — Extended Scalar, Crypto & MSM Operations
+// =============================================================================
+// This file extends the OpenCL kernels with all missing functionality:
+//
+// Layer 1: Serialization (scalar_from_bytes, scalar_to_bytes, field_to_bytes)
+//          + field_sqrt (modular square root)
+// Layer 2: Scalar mod-n algebra (negate, mul, inverse, add, sub, eq, ge, etc.)
+//          + GLV endomorphism (decompose + dual scalar mul)
+// Layer 3: SHA-256 streaming + HMAC-SHA256 + RFC 6979
+// Layer 4: ECDSA sign/verify + precomputed generator mul
+// Layer 5: Schnorr BIP-340 + ECDH + Key Recovery + MSM/Pippenger
+//
+// Depends on: secp256k1_point.cl (which includes secp256k1_field.cl)
+// Uses 4×64-bit limbs (ulong) — matching existing OpenCL convention.
+// =============================================================================
+
+#include "secp256k1_point.cl"
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+// Order n in 64-bit LE limbs
+#define ORDER_N0 0xBFD25E8CD0364141UL
+#define ORDER_N1 0xBAAEDCE6AF48A03BUL
+#define ORDER_N2 0xFFFFFFFFFFFFFFFEUL
+#define ORDER_N3 0xFFFFFFFFFFFFFFFFUL
+
+// n/2 (half order for low-S check) LE limbs
+#define HALF_ORDER_0 0xDFE92F46681B20A0UL
+#define HALF_ORDER_1 0x5D576E7357A4501DUL
+#define HALF_ORDER_2 0xFFFFFFFFFFFFFFFFUL
+#define HALF_ORDER_3 0x7FFFFFFFFFFFFFFFUL
+
+// n - 2 (for Fermat little theorem inversion mod n)
+#define ORDER_N_MINUS2_0 0xBFD25E8CD036413FUL
+#define ORDER_N_MINUS2_1 0xBAAEDCE6AF48A03BUL
+#define ORDER_N_MINUS2_2 0xFFFFFFFFFFFFFFFEUL
+#define ORDER_N_MINUS2_3 0xFFFFFFFFFFFFFFFFUL
+
+// Barrett constant mu = floor(2^512 / n), 5×64-bit LE
+#define BARRETT_MU0 0x402DA1732FC9BEC0UL
+#define BARRETT_MU1 0x4551231950B75FC4UL
+#define BARRETT_MU2 0x0000000000000001UL
+#define BARRETT_MU3 0x0000000000000000UL
+#define BARRETT_MU4 0x0000000000000001UL
+
+// beta (GLV endomorphism field constant: cube root of unity in Fp)
+// BETA = 0x7ae96a2b657c0710_6e64479eac3434e9_9cf0497512f58995_c1396c28719501ee
+// Stored in LE limb order (limb[0] = LSW)
+#define GLV_BETA0 0xC1396C28719501EEUL
+#define GLV_BETA1 0x9CF0497512F58995UL
+#define GLV_BETA2 0x6E64479EAC3434E9UL
+#define GLV_BETA3 0x7AE96A2B657C0710UL
+
+// lambda (GLV endomorphism scalar: [lambda]*P = (beta*x, y) for any point P on secp256k1)
+// LAMBDA = 0x5363ad4cc05c30e0_a5261c028812645a_122e22ea20816678_df02967c1b23bd72
+// Stored in LE limb order (limb[0] = LSW)
+#define GLV_LAMBDA0 0xDF02967C1B23BD72UL
+#define GLV_LAMBDA1 0x122E22EA20816678UL
+#define GLV_LAMBDA2 0xA5261C028812645AUL
+#define GLV_LAMBDA3 0x5363AD4CC05C30E0UL
+
+// GLV lattice vectors g1, g2 (full 256-bit, for mul_shift_384)
+__constant ulong GLV_G1[4] = {
+    0xE893209A45DBB031UL, 0x3DAA8A1471E8CA7FUL,
+    0xE86C90E49284EB15UL, 0x3086D221A7D46BCDUL
+};
+__constant ulong GLV_G2[4] = {
+    0x1571B4AE8AC47F71UL, 0x221208AC9DF506C6UL,
+    0x6F547FA90ABFE4C4UL, 0xE4437ED6010E8828UL
+};
+// -b1 and -b2 vectors (full 256-bit)
+__constant ulong GLV_MINUS_B1[4] = {
+    0x6F547FA90ABFE4C3UL, 0xE4437ED6010E8828UL, 0x0UL, 0x0UL
+};
+__constant ulong GLV_MINUS_B2[4] = {
+    0xD765CDA83DB1562CUL, 0x8A280AC50774346DUL,
+    0xFFFFFFFFFFFFFFFEUL, 0xFFFFFFFFFFFFFFFFUL
+};
+
+// SHA-256 round constants
+__constant uint K256[64] = {
+    0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
+    0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
+    0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u,
+    0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
+    0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu,
+    0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+    0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u,
+    0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
+    0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u,
+    0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+    0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u,
+    0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+    0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u,
+    0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+    0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
+    0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u
+};
+
+// =============================================================================
+// LAYER 1: Serialization + field_sqrt
+// =============================================================================
+
+// BE 32 bytes → Scalar (4×64 LE limbs) with branchless mod n reduction
+inline void scalar_from_bytes_impl(const uchar bytes[32], Scalar* out) {
+    for (int i = 0; i < 4; i++) {
+        ulong limb = 0;
+        int base = (3 - i) * 8;
+        for (int j = 0; j < 8; j++)
+            limb = (limb << 8) | (ulong)bytes[base + j];
+        out->limbs[i] = limb;
+    }
+    // Branchless reduction: if scalar >= n, subtract n
+    ulong borrow = 0, tmp[4];
+    ulong n[4] = { ORDER_N0, ORDER_N1, ORDER_N2, ORDER_N3 };
+    for (int i = 0; i < 4; i++)
+        tmp[i] = sub_with_borrow(out->limbs[i], n[i], borrow, &borrow);
+    ulong mask = -(ulong)(borrow == 0); // if no borrow, scalar >= n
+    for (int i = 0; i < 4; i++)
+        out->limbs[i] = (tmp[i] & mask) | (out->limbs[i] & ~mask);
+}
+
+// Scalar → BE 32 bytes
+inline void scalar_to_bytes_impl(const Scalar* s, uchar out[32]) {
+    for (int i = 0; i < 4; i++) {
+        ulong limb = s->limbs[3 - i];
+        for (int j = 0; j < 8; j++)
+            out[i * 8 + j] = (uchar)(limb >> (56 - j * 8));
+    }
+}
+
+// FieldElement → BE 32 bytes (normalizes mod p before serialization)
+inline void field_to_bytes_impl(const FieldElement* f, uchar out[32]) {
+    // p = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+    const ulong P[4] = {
+        0xFFFFFFFEFFFFFC2FUL, 0xFFFFFFFFFFFFFFFFUL,
+        0xFFFFFFFFFFFFFFFFUL, 0xFFFFFFFFFFFFFFFFUL
+    };
+    // Three branchless conditional subtractions to handle magnitude <= 4.
+    // A single subtraction is insufficient when the input has accumulated
+    // magnitude > 1 (value >= 2p) through field_add / jacobian_to_affine
+    // intermediate computations (issue #225).
+    ulong cur[4];
+    for (int i = 0; i < 4; i++) cur[i] = f->limbs[i];
+
+    for (int pass = 0; pass < 3; pass++) {
+        ulong tmp[4];
+        ulong borrow = 0;
+        for (int i = 0; i < 4; i++) {
+            ulong a = cur[i];
+            ulong b = P[i] + borrow;
+            ulong underflow = (borrow && b == 0) ? 1UL : 0UL;
+            tmp[i] = a - b;
+            borrow = (a < b || underflow) ? 1UL : 0UL;
+        }
+        ulong mask = (borrow == 0) ? ~0UL : 0UL;
+        for (int i = 0; i < 4; i++)
+            cur[i] = (tmp[i] & mask) | (cur[i] & ~mask);
+    }
+
+    for (int i = 0; i < 4; i++) {
+        ulong limb = cur[3 - i];
+        for (int j = 0; j < 8; j++)
+            out[i * 8 + j] = (uchar)(limb >> (56 - j * 8));
+    }
+}
+
+// Field square root: a^((p+1)/4) via optimized addition chain (269 ops)
+// p ≡ 3 (mod 4) ⇒ sqrt(a) = a^((p+1)/4)
+inline void field_sqrt_impl(const FieldElement* a, FieldElement* r) {
+    FieldElement x2, x3, x6, x9, x11, x22, x44, x88, x176, x220, x222, t;
+
+    // x2 = a^(2^2-1)
+    field_sqr_impl(&x2, a);         // a^2
+    field_mul_impl(&x2, &x2, a);    // a^3 = a^(2^2-1)
+
+    // x3 = a^(2^3-1)
+    field_sqr_impl(&x3, &x2);       // a^6
+    field_mul_impl(&x3, &x3, a);    // a^7 = a^(2^3-1)
+
+    // x6 = a^(2^6-1)
+    t = x3;
+    field_sqr_n_impl(&t, 3);
+    field_mul_impl(&x6, &t, &x3);
+
+    // x9 = a^(2^9-1)
+    t = x6;
+    field_sqr_n_impl(&t, 3);
+    field_mul_impl(&x9, &t, &x3);
+
+    // x11 = a^(2^11-1)
+    t = x9;
+    field_sqr_n_impl(&t, 2);
+    field_mul_impl(&x11, &t, &x2);
+
+    // x22 = a^(2^22-1)
+    t = x11;
+    field_sqr_n_impl(&t, 11);
+    field_mul_impl(&x22, &t, &x11);
+
+    // x44 = a^(2^44-1)
+    t = x22;
+    field_sqr_n_impl(&t, 22);
+    field_mul_impl(&x44, &t, &x22);
+
+    // x88 = a^(2^88-1)
+    t = x44;
+    field_sqr_n_impl(&t, 44);
+    field_mul_impl(&x88, &t, &x44);
+
+    // x176 = a^(2^176-1)
+    t = x88;
+    field_sqr_n_impl(&t, 88);
+    field_mul_impl(&x176, &t, &x88);
+
+    // x220 = a^(2^220-1)
+    t = x176;
+    field_sqr_n_impl(&t, 44);
+    field_mul_impl(&x220, &t, &x44);
+
+    // x222 = a^(2^222-1)
+    t = x220;
+    field_sqr_n_impl(&t, 2);
+    field_mul_impl(&x222, &t, &x2);
+
+    // Tail: bits 10 1^22 0000 11 00
+    // x223 = x222 * a after one squaring
+    t = x222;
+    field_sqr_impl(&t, &t);
+    field_mul_impl(&t, &t, a);
+
+    // shift left 1 (just square)
+    field_sqr_impl(&t, &t);
+
+    // shift left 22, multiply by x22
+    field_sqr_n_impl(&t, 22);
+    field_mul_impl(&t, &t, &x22);
+
+    // compute a^12 = (a^3)^4 = x2 squared twice
+    FieldElement a12;
+    field_sqr_impl(&a12, &x2);
+    field_sqr_impl(&a12, &a12);
+
+    // shift left 8, multiply by a^12
+    field_sqr_n_impl(&t, 8);
+    field_mul_impl(r, &t, &a12);
+}
+
+// =============================================================================
+// LAYER 2: Scalar mod-n Algebra
+// =============================================================================
+
+// Scalar negate: r = n - a (if a != 0)
+inline void scalar_negate_impl(const Scalar* a, Scalar* r) {
+    ulong n[4] = { ORDER_N0, ORDER_N1, ORDER_N2, ORDER_N3 };
+    int is_zero_flag = scalar_is_zero(a);
+
+    ulong borrow = 0;
+    for (int i = 0; i < 4; i++)
+        r->limbs[i] = sub_with_borrow(n[i], a->limbs[i], borrow, &borrow);
+    // If a was zero, result should be zero too
+    ulong mask = -(ulong)(!is_zero_flag);
+    for (int i = 0; i < 4; i++) r->limbs[i] &= mask;
+}
+
+// Helper: branchless conditional subtract n (r -= n if r >= n)
+inline void scalar_cond_sub_n(Scalar* r) {
+    ulong n[4] = { ORDER_N0, ORDER_N1, ORDER_N2, ORDER_N3 };
+    ulong borrow = 0;
+    ulong tmp[4];
+    for (int i = 0; i < 4; i++)
+        tmp[i] = sub_with_borrow(r->limbs[i], n[i], borrow, &borrow);
+    // borrow==0 means r >= n, use subtracted result
+    ulong mask = -(ulong)(borrow == 0);
+    for (int i = 0; i < 4; i++)
+        r->limbs[i] = (tmp[i] & mask) | (r->limbs[i] & ~mask);
+}
+
+// Scalar add mod n: r = (a + b) mod n
+inline void scalar_add_mod_n_impl(const Scalar* a, const Scalar* b, Scalar* r) {
+    ulong carry = 0;
+    for (int i = 0; i < 4; i++)
+        r->limbs[i] = add_with_carry(a->limbs[i], b->limbs[i], carry, &carry);
+    // CONSTANT-TIME: was `if (carry) sub n; else scalar_cond_sub_n` — a
+    // data-dependent branch on a secret-derived carry. Reduce branchlessly:
+    // t = r - n; (carry:r) >= n  iff  carry==1 OR r >= n (borrow_n==0). Select t
+    // in that case, else keep r. a,b < n => a+b < 2n, so one subtraction suffices
+    // (matches scalar_cond_sub_n's masked-select style, used above).
+    ulong n[4] = { ORDER_N0, ORDER_N1, ORDER_N2, ORDER_N3 };
+    ulong borrow_n = 0;
+    ulong t[4];
+    for (int i = 0; i < 4; i++)
+        t[i] = sub_with_borrow(r->limbs[i], n[i], borrow_n, &borrow_n);
+    ulong mask = (ulong)0 - ((ulong)(carry != 0) | (ulong)(borrow_n == 0));
+    for (int i = 0; i < 4; i++)
+        r->limbs[i] = (t[i] & mask) | (r->limbs[i] & ~mask);
+}
+
+// Scalar sub mod n: r = (a - b) mod n
+inline void scalar_sub_mod_n_impl(const Scalar* a, const Scalar* b, Scalar* r) {
+    ulong borrow = 0;
+    for (int i = 0; i < 4; i++)
+        r->limbs[i] = sub_with_borrow(a->limbs[i], b->limbs[i], borrow, &borrow);
+    // CONSTANT-TIME: was `if (borrow) add n` — a data-dependent branch on a
+    // secret-derived borrow. Add n masked by borrow (0 when no borrow -> no-op).
+    ulong n[4] = { ORDER_N0, ORDER_N1, ORDER_N2, ORDER_N3 };
+    ulong mask = (ulong)0 - (ulong)(borrow != 0);
+    ulong carry2 = 0;
+    for (int i = 0; i < 4; i++)
+        r->limbs[i] = add_with_carry(r->limbs[i], n[i] & mask, carry2, &carry2);
+}
+
+// Scalar multiply mod n: r = (a * b) mod n
+// Uses 2^256 ≡ NC (mod n) reduction where NC = 2^256 - n
+inline void scalar_mul_mod_n_impl(const Scalar* a, const Scalar* b, Scalar* r) {
+    // NC = 2^256 - n = {0x402DA1732FC9BEBF, 0x4551231950B75FC4, 1, 0}
+    ulong NC[3] = { 0x402DA1732FC9BEBFUL, 0x4551231950B75FC4UL, 0x1UL };
+
+    // Step 1: Full 512-bit schoolbook multiplication
+    ulong prod[8] = {0,0,0,0,0,0,0,0};
+    for (int i = 0; i < 4; i++) {
+        ulong carry = 0;
+        for (int j = 0; j < 4; j++) {
+            ulong2 full = mul64_full(a->limbs[i], b->limbs[j]);
+            ulong c1, c2;
+            ulong s = add_with_carry(full.x, prod[i+j], 0, &c1);
+            s = add_with_carry(s, carry, 0, &c2);
+            prod[i+j] = s;
+            carry = full.y + c1 + c2;
+        }
+        prod[i+4] = carry;
+    }
+
+    // Step 2: Reduce high 256 bits. acc = prod[0..3] + prod[4..7] * NC
+    // prod[4..7] * NC has at most 256+129 = 385 bits.
+    // CT-P2-01: BRANCHLESS. The previous version had `if (prod[4+i]==0) continue;`
+    // and a data-dependent `&& carry` loop bound — both branch on the secret-derived
+    // product, producing key-dependent warp divergence (the same leak class fixed in
+    // CUDA scalar_mul_mod_n). Multiplying by a zero limb is a no-op, and propagating
+    // carry over a FIXED span (adding carry==0 is a no-op) is identical to the
+    // early-exit — so removing the branches preserves the result exactly.
+    ulong acc[7] = {prod[0], prod[1], prod[2], prod[3], 0, 0, 0};
+    for (int i = 0; i < 4; i++) {
+        ulong carry = 0;
+        for (int j = 0; j < 3; j++) {
+            ulong2 full = mul64_full(prod[4+i], NC[j]);
+            ulong c1, c2;
+            ulong s = add_with_carry(full.x, acc[i+j], 0, &c1);
+            s = add_with_carry(s, carry, 0, &c2);
+            acc[i+j] = s;
+            carry = full.y + c1 + c2;
+        }
+        // Propagate remaining carry over a fixed span (k upper bound is constant;
+        // start i+3 is a public loop index). add_with_carry(.,0,.) is a no-op.
+        for (int k = i+3; k < 7; k++) {
+            acc[k] = add_with_carry(acc[k], carry, 0, &carry);
+        }
+    }
+
+    // Step 3: Reduce again. res = acc[0..3] + acc[4..6] * NC (branchless).
+    ulong res[5] = {acc[0], acc[1], acc[2], acc[3], 0};
+    for (int i = 0; i < 3; i++) {
+        ulong carry = 0;
+        for (int j = 0; j < 3; j++) {
+            if (i+j >= 5) break;   // public loop-index bound — constant-time
+            ulong2 full = mul64_full(acc[4+i], NC[j]);
+            ulong c1, c2;
+            ulong s = add_with_carry(full.x, res[i+j], 0, &c1);
+            s = add_with_carry(s, carry, 0, &c2);
+            res[i+j] = s;
+            carry = full.y + c1 + c2;
+        }
+        for (int k = i+3; k < 5; k++) {
+            res[k] = add_with_carry(res[k], carry, 0, &carry);
+        }
+    }
+
+    // Step 4: Handle res[4] overflow (branchless — res[4]==0 → multiply by 0 no-op).
+    r->limbs[0] = res[0]; r->limbs[1] = res[1];
+    r->limbs[2] = res[2]; r->limbs[3] = res[3];
+    {
+        ulong carry = 0;
+        for (int j = 0; j < 3; j++) {
+            ulong2 full = mul64_full(res[4], NC[j]);
+            ulong c1, c2;
+            ulong s = add_with_carry(full.x, r->limbs[j], 0, &c1);
+            s = add_with_carry(s, carry, 0, &c2);
+            r->limbs[j] = s;
+            carry = full.y + c1 + c2;
+        }
+        r->limbs[3] += carry;
+    }
+
+    // Step 5: Conditional subtract n (at most 3 times to ensure < n)
+    scalar_cond_sub_n(r);
+    scalar_cond_sub_n(r);
+    scalar_cond_sub_n(r);
+}
+
+// Scalar inverse mod n via binary exponentiation: a^(n-2) mod n
+inline void scalar_inverse_impl(const Scalar* a, Scalar* r) {
+    ulong exp[4] = { ORDER_N_MINUS2_0, ORDER_N_MINUS2_1, ORDER_N_MINUS2_2, ORDER_N_MINUS2_3 };
+    Scalar base = *a;
+    Scalar result;
+    result.limbs[0] = 1; result.limbs[1] = 0;
+    result.limbs[2] = 0; result.limbs[3] = 0;
+
+    for (int i = 0; i < 4; i++) {
+        for (int bit = 0; bit < 64; bit++) {
+            if ((exp[i] >> bit) & 1UL) {
+                scalar_mul_mod_n_impl(&result, &base, &result);
+            }
+            scalar_mul_mod_n_impl(&base, &base, &base);
+        }
+    }
+    *r = result;
+}
+
+// Scalar is even: test bit 0
+inline int scalar_is_even_impl(const Scalar* s) {
+    return (s->limbs[0] & 1UL) == 0;
+}
+
+// Scalar equality
+inline int scalar_eq_impl(const Scalar* a, const Scalar* b) {
+    ulong diff = 0;
+    for (int i = 0; i < 4; i++) diff |= (a->limbs[i] ^ b->limbs[i]);
+    return diff == 0;
+}
+
+// Scalar bit length
+inline int scalar_bitlen_impl(const Scalar* s) {
+    for (int i = 3; i >= 0; i--) {
+        if (s->limbs[i] != 0) {
+            int bits = 64;
+            ulong v = s->limbs[i];
+            while (!(v >> 63)) { v <<= 1; bits--; }
+            return i * 64 + bits;
+        }
+    }
+    return 0;
+}
+
+// Scalar greater-or-equal
+inline int scalar_ge_impl(const Scalar* a, const Scalar* b) {
+    for (int i = 3; i >= 0; i--) {
+        if (a->limbs[i] > b->limbs[i]) return 1;
+        if (a->limbs[i] < b->limbs[i]) return 0;
+    }
+    return 1; // equal
+}
+
+// low-S check (BIP-62)
+inline int scalar_is_low_s_impl(const Scalar* s) {
+    Scalar half_n;
+    half_n.limbs[0] = HALF_ORDER_0; half_n.limbs[1] = HALF_ORDER_1;
+    half_n.limbs[2] = HALF_ORDER_2; half_n.limbs[3] = HALF_ORDER_3;
+
+    for (int i = 3; i >= 0; i--) {
+        if (s->limbs[i] > half_n.limbs[i]) return 0;
+        if (s->limbs[i] < half_n.limbs[i]) return 1;
+    }
+    return 1; // equal = low
+}
+
+// Branchless mask: returns all-ones if s > n/2, all-zeros otherwise.
+// No early-exit — avoids warp divergence on secret-derived values of s.
+inline ulong scalar_is_high_mask_impl(const Scalar* s) {
+    const ulong half_order[4] = { HALF_ORDER_0, HALF_ORDER_1, HALF_ORDER_2, HALF_ORDER_3 };
+    ulong gt = 0;
+    ulong eq_so_far = ~(ulong)0;
+    for (int i = 3; i >= 0; --i) {
+        ulong a_gt_h = -(ulong)(s->limbs[i] > half_order[i]);
+        ulong a_eq_h = -(ulong)(s->limbs[i] == half_order[i]);
+        gt |= (a_gt_h & eq_so_far);
+        eq_so_far &= a_eq_h;
+    }
+    return gt;
+}
+
+// =============================================================================
+// GLV Endomorphism
+// =============================================================================
+
+inline void apply_endomorphism_impl(const JacobianPoint* p, JacobianPoint* r) {
+    FieldElement beta;
+    beta.limbs[0] = 0x7AE96A2B657C0710UL;
+    beta.limbs[1] = 0x6E64479EAC3434E9UL;
+    beta.limbs[2] = 0x9CF0497512F58995UL;
+    beta.limbs[3] = 0xC1396C28719501EEUL;
+
+    field_mul_impl(&r->x, &p->x, &beta);
+    r->y = p->y;
+    r->z = p->z;
+    r->infinity = p->infinity;
+}
+
+// Field negation: r = p - a (mod p)
+inline void field_negate_impl(FieldElement* r, const FieldElement* a) {
+    FieldElement zero;
+    zero.limbs[0] = 0; zero.limbs[1] = 0; zero.limbs[2] = 0; zero.limbs[3] = 0;
+    field_sub_impl(r, &zero, a);
+}
+
+// GLV decomposition: k = k1 + k2*lambda (mod n), |k1|,|k2| ~ 128 bits
+// Uses full lattice-based decomposition with Babai rounding.
+
+// (a * b) >> 384 with rounding (bit 383)
+inline void glv_mul_shift_384_impl(const ulong a[4], __constant const ulong b[4], ulong result[4]) {
+    ulong prod[8] = {0,0,0,0,0,0,0,0};
+    for (int i = 0; i < 4; i++) {
+        ulong carry = 0;
+        for (int j = 0; j < 4; j++) {
+            ulong2 full = mul64_full(a[i], b[j]);
+            ulong c1 = 0, c2 = 0;
+            ulong s = add_with_carry(full.x, prod[i+j], 0, &c1);
+            s = add_with_carry(s, carry, 0, &c2);
+            prod[i+j] = s;
+            carry = full.y + c1 + c2;
+        }
+        prod[i+4] = carry;
+    }
+    result[0] = prod[6];  result[1] = prod[7];
+    result[2] = 0;        result[3] = 0;
+    if (prod[5] >> 63) {  // rounding bit 383
+        result[0]++;
+        if (result[0] == 0) result[1]++;
+    }
+}
+
+inline void glv_decompose_impl(const Scalar* k, Scalar* k1, Scalar* k2,
+                                 int* k1_neg, int* k2_neg) {
+    // c1 = round(k * g1 / 2^384), c2 = round(k * g2 / 2^384)
+    ulong c1_limbs[4], c2_limbs[4];
+    glv_mul_shift_384_impl(k->limbs, GLV_G1, c1_limbs);
+    glv_mul_shift_384_impl(k->limbs, GLV_G2, c2_limbs);
+
+    Scalar c1, c2;
+    for (int i = 0; i < 4; i++) { c1.limbs[i] = c1_limbs[i]; c2.limbs[i] = c2_limbs[i]; }
+
+    // Reduce c1, c2 mod n if needed
+    Scalar order;
+    order.limbs[0] = ORDER_N0; order.limbs[1] = ORDER_N1;
+    order.limbs[2] = ORDER_N2; order.limbs[3] = ORDER_N3;
+    if (scalar_ge_impl(&c1, &order)) scalar_sub_mod_n_impl(&c1, &order, &c1);
+    if (scalar_ge_impl(&c2, &order)) scalar_sub_mod_n_impl(&c2, &order, &c2);
+
+    // k2_mod = c1*(-b1) + c2*(-b2) mod n
+    Scalar minus_b1, minus_b2;
+    for (int i = 0; i < 4; i++) {
+        minus_b1.limbs[i] = GLV_MINUS_B1[i];
+        minus_b2.limbs[i] = GLV_MINUS_B2[i];
+    }
+    Scalar t1, t2, k2_mod;
+    scalar_mul_mod_n_impl(&c1, &minus_b1, &t1);
+    scalar_mul_mod_n_impl(&c2, &minus_b2, &t2);
+    scalar_add_mod_n_impl(&t1, &t2, &k2_mod);
+
+    // Pick shorter k2: compare |k2_mod| vs |n - k2_mod|
+    Scalar k2_neg_val;
+    scalar_negate_impl(&k2_mod, &k2_neg_val);
+    int k2_is_neg = (scalar_bitlen_impl(&k2_neg_val) < scalar_bitlen_impl(&k2_mod));
+    Scalar k2_abs = k2_is_neg ? k2_neg_val : k2_mod;
+
+    // For computing k1: need the signed k2
+    Scalar k2_signed;
+    if (k2_is_neg) { scalar_negate_impl(&k2_abs, &k2_signed); }
+    else           { k2_signed = k2_abs; }
+
+    // k1 = k - lambda*k2_signed mod n
+    Scalar lambda_s;
+    lambda_s.limbs[0] = GLV_LAMBDA0; lambda_s.limbs[1] = GLV_LAMBDA1;
+    lambda_s.limbs[2] = GLV_LAMBDA2; lambda_s.limbs[3] = GLV_LAMBDA3;
+    Scalar lk2;
+    scalar_mul_mod_n_impl(&lambda_s, &k2_signed, &lk2);
+    Scalar k1_mod;
+    scalar_sub_mod_n_impl(k, &lk2, &k1_mod);
+
+    // Pick shorter k1
+    Scalar k1_neg_val;
+    scalar_negate_impl(&k1_mod, &k1_neg_val);
+    int k1_is_neg = (scalar_bitlen_impl(&k1_neg_val) < scalar_bitlen_impl(&k1_mod));
+    Scalar k1_abs = k1_is_neg ? k1_neg_val : k1_mod;
+
+    *k1 = k1_abs;  *k2 = k2_abs;
+    *k1_neg = k1_is_neg;  *k2_neg = k2_is_neg;
+}
+
+// GLV-accelerated scalar multiplication: k*P using Shamir's trick
+// with endomorphism phi(P) = (beta*x, y) where phi corresponds to lambda.
+// Uses interleaved wNAF w=5 for both half-scalars k1, k2.
+inline void build_wnaf_table_zr_impl(const AffinePoint* base, AffinePoint table[8],
+                                     FieldElement* globalz) {
+    JacobianPoint base_jac;
+    point_from_affine(&base_jac, base);
+
+    JacobianPoint doubled;
+    point_double_unchecked(&doubled, &base_jac);
+
+    FieldElement c = doubled.z;
+    FieldElement c2, c3;
+    field_sqr_impl(&c2, &c);
+    field_mul_impl(&c3, &c2, &c);
+
+    AffinePoint doubled_affine;
+    doubled_affine.x = doubled.x;
+    doubled_affine.y = doubled.y;
+
+    JacobianPoint accum;
+    field_mul_impl(&accum.x, &base->x, &c2);
+    field_mul_impl(&accum.y, &base->y, &c3);
+    accum.z.limbs[0] = 1UL;
+    accum.z.limbs[1] = 0UL;
+    accum.z.limbs[2] = 0UL;
+    accum.z.limbs[3] = 0UL;
+    accum.infinity = 0;
+
+    table[0].x = accum.x;
+    table[0].y = accum.y;
+
+    FieldElement zr[8];
+    zr[0] = c;
+
+    for (int i = 1; i < 8; ++i) {
+        FieldElement h;
+        point_add_mixed_h_impl(&accum, &accum, &doubled_affine, &h);
+        table[i].x = accum.x;
+        table[i].y = accum.y;
+        zr[i] = h;
+    }
+
+    field_mul_impl(globalz, &accum.z, &c);
+
+    FieldElement zs = zr[7];
+    for (int idx = 6; idx >= 0; --idx) {
+        if (idx != 6) {
+            FieldElement tmp;
+            field_mul_impl(&tmp, &zs, &zr[idx + 1]);
+            zs = tmp;
+        }
+
+        FieldElement zs2, zs3;
+        field_sqr_impl(&zs2, &zs);
+        field_mul_impl(&zs3, &zs2, &zs);
+
+        FieldElement tx, ty;
+        field_mul_impl(&tx, &table[idx].x, &zs2);
+        field_mul_impl(&ty, &table[idx].y, &zs3);
+        table[idx].x = tx;
+        table[idx].y = ty;
+    }
+}
+
+inline void derive_endo_table_impl(const AffinePoint table[8], AffinePoint endo_table[8],
+                                   int negate_y) {
+    FieldElement beta;
+    beta.limbs[0] = GLV_BETA0; beta.limbs[1] = GLV_BETA1;
+    beta.limbs[2] = GLV_BETA2; beta.limbs[3] = GLV_BETA3;
+
+    for (int i = 0; i < 8; ++i) {
+        field_mul_impl(&endo_table[i].x, &table[i].x, &beta);
+        if (negate_y) {
+            field_negate_impl(&endo_table[i].y, &table[i].y);
+        } else {
+            endo_table[i].y = table[i].y;
+        }
+    }
+}
+
+// Forward declaration required because shamir_double_mul_glv_impl calls
+// scalar_mul_glv_impl as a degenerate-case fallback, but the full definition
+// of scalar_mul_glv_impl appears later in this file.
+inline void scalar_mul_glv_impl(JacobianPoint* r, const Scalar* k, const AffinePoint* p);
+
+// =============================================================================
+// Shamir's trick double-scalar multiplication with 4-scalar GLV decomposition.
+// Computes r = a*P + b*Q  (both P and Q are affine inputs).
+// Uses a 16-entry precomputed affine table + a single batch field_inv (Montgomery
+// trick for 11 intermediate Z values). Main loop iterates ~129 half-width bits.
+// Expected cost vs two separate scalar_mul_glv_impl calls:
+//   2×(~130 D + ~65 MA) + 1 J+J = ~260 D + ~131 MA
+//   Shamir: ~1 field_inv + ~129 D + ~120 MA  → saves ~130 doubles
+// =============================================================================
+inline void shamir_double_mul_glv_impl(
+    const AffinePoint* P, const Scalar* a,
+    const AffinePoint* Q, const Scalar* b,
+    JacobianPoint* r)
+{
+    // Degenerate fallback: one or both scalars zero
+    if (scalar_is_zero(a) && scalar_is_zero(b)) {
+        point_set_infinity(r); return;
+    }
+    if (scalar_is_zero(a)) { scalar_mul_glv_impl(r, b, Q); return; }
+    if (scalar_is_zero(b)) { scalar_mul_glv_impl(r, a, P); return; }
+
+    // GLV decompose both scalars: a → (a1,a2), b → (b1,b2), each ~128 bits
+    Scalar a1, a2, b1, b2;
+    int a1_neg, a2_neg, b1_neg, b2_neg;
+    glv_decompose_impl(a, &a1, &a2, &a1_neg, &a2_neg);
+    glv_decompose_impl(b, &b1, &b2, &b1_neg, &b2_neg);
+
+    // Build 4 signed base affine points:
+    //   pts[0] = ±P        (for a1)  pts[1] = ±endo(P) (for a2)
+    //   pts[2] = ±Q        (for b1)  pts[3] = ±endo(Q) (for b2)
+    AffinePoint pts[4];
+    FieldElement beta;
+    beta.limbs[0] = GLV_BETA0; beta.limbs[1] = GLV_BETA1;
+    beta.limbs[2] = GLV_BETA2; beta.limbs[3] = GLV_BETA3;
+
+    pts[0] = *P;
+    if (a1_neg) field_negate_impl(&pts[0].y, &pts[0].y);
+    field_mul_impl(&pts[1].x, &P->x, &beta);
+    pts[1].y = P->y;
+    if (a2_neg) field_negate_impl(&pts[1].y, &pts[1].y);
+
+    pts[2] = *Q;
+    if (b1_neg) field_negate_impl(&pts[2].y, &pts[2].y);
+    field_mul_impl(&pts[3].x, &Q->x, &beta);
+    pts[3].y = Q->y;
+    if (b2_neg) field_negate_impl(&pts[3].y, &pts[3].y);
+
+    // Precompute 15 non-zero combos into a 16-entry affine table.
+    // Index encoding: bit0=a1, bit1=a2, bit2=b1, bit3=b2.
+    AffinePoint table[16];
+    table[1]  = pts[0];   // P1
+    table[2]  = pts[1];   // P2
+    table[4]  = pts[2];   // Q1
+    table[8]  = pts[3];   // Q2
+
+    // Compute 11 pairwise/triple/quad combos as Jacobian points
+    JacobianPoint jc[11];
+    JacobianPoint tmp_j;
+
+    point_from_affine(&tmp_j, &pts[0]);
+    point_add_mixed_impl(&jc[0], &tmp_j, &pts[1]);  // P1+P2  → table[3]
+    point_from_affine(&tmp_j, &pts[0]);
+    point_add_mixed_impl(&jc[1], &tmp_j, &pts[2]);  // P1+Q1  → table[5]
+    point_from_affine(&tmp_j, &pts[1]);
+    point_add_mixed_impl(&jc[2], &tmp_j, &pts[2]);  // P2+Q1  → table[6]
+    point_from_affine(&tmp_j, &pts[0]);
+    point_add_mixed_impl(&jc[3], &tmp_j, &pts[3]);  // P1+Q2  → table[9]
+    point_from_affine(&tmp_j, &pts[1]);
+    point_add_mixed_impl(&jc[4], &tmp_j, &pts[3]);  // P2+Q2  → table[10]
+    point_from_affine(&tmp_j, &pts[2]);
+    point_add_mixed_impl(&jc[5], &tmp_j, &pts[3]);  // Q1+Q2  → table[12]
+
+    point_add_mixed_impl(&jc[6],  &jc[0], &pts[2]);  // P1+P2+Q1   → table[7]
+    point_add_mixed_impl(&jc[7],  &jc[0], &pts[3]);  // P1+P2+Q2   → table[11]
+    point_add_mixed_impl(&jc[8],  &jc[1], &pts[3]);  // P1+Q1+Q2   → table[13]
+    point_add_mixed_impl(&jc[9],  &jc[2], &pts[3]);  // P2+Q1+Q2   → table[14]
+    point_add_mixed_impl(&jc[10], &jc[6], &pts[3]);  // P1+P2+Q1+Q2→ table[15]
+
+    // Safety: check for degenerate (infinity) combo -- fallback if any
+    int has_degen = 0;
+    for (int i = 0; i < 11; i++) {
+        if (point_is_infinity(&jc[i])) { has_degen = 1; break; }
+    }
+
+    if (has_degen) {
+        // Fallback: 4-point binary accumulation (no batch inversion needed)
+        int max_len = scalar_bitlen_impl(&a1);
+        int l2 = scalar_bitlen_impl(&a2); if (l2 > max_len) max_len = l2;
+        int l3 = scalar_bitlen_impl(&b1); if (l3 > max_len) max_len = l3;
+        int l4 = scalar_bitlen_impl(&b2); if (l4 > max_len) max_len = l4;
+
+        point_set_infinity(r);
+        for (int i = max_len - 1; i >= 0; --i) {
+            if (!point_is_infinity(r)) point_double_unchecked(r, r);
+            if (scalar_bit(&a1, i)) {
+                if (point_is_infinity(r)) point_from_affine(r, &pts[0]);
+                else point_add_mixed_unchecked(r, r, &pts[0]);
+            }
+            if (scalar_bit(&a2, i)) {
+                if (point_is_infinity(r)) point_from_affine(r, &pts[1]);
+                else point_add_mixed_unchecked(r, r, &pts[1]);
+            }
+            if (scalar_bit(&b1, i)) {
+                if (point_is_infinity(r)) point_from_affine(r, &pts[2]);
+                else point_add_mixed_unchecked(r, r, &pts[2]);
+            }
+            if (scalar_bit(&b2, i)) {
+                if (point_is_infinity(r)) point_from_affine(r, &pts[3]);
+                else point_add_mixed_unchecked(r, r, &pts[3]);
+            }
+        }
+        return;
+    }
+
+    // Batch inversion: Montgomery's trick — 1 field_inv for 11 Z values
+    FieldElement prefix[11];
+    prefix[0] = jc[0].z;
+    for (int i = 1; i < 11; i++) {
+        field_mul_impl(&prefix[i], &prefix[i-1], &jc[i].z);
+    }
+
+    FieldElement inv_prod;
+    field_inv_impl(&inv_prod, &prefix[10]);
+
+    FieldElement z_inv[11];
+    for (int i = 10; i > 0; --i) {
+        field_mul_impl(&z_inv[i], &inv_prod, &prefix[i-1]);
+        FieldElement tmp;
+        field_mul_impl(&tmp, &inv_prod, &jc[i].z);
+        inv_prod = tmp;
+    }
+    z_inv[0] = inv_prod;
+
+    // Convert combo Jacobian points to affine and store in table
+    const int tbl_map[11] = {3, 5, 6, 9, 10, 12, 7, 11, 13, 14, 15};
+    for (int i = 0; i < 11; i++) {
+        FieldElement zi2, zi3;
+        field_sqr_impl(&zi2, &z_inv[i]);
+        field_mul_impl(&zi3, &zi2, &z_inv[i]);
+        field_mul_impl(&table[tbl_map[i]].x, &jc[i].x, &zi2);
+        field_mul_impl(&table[tbl_map[i]].y, &jc[i].y, &zi3);
+    }
+
+    // Main loop: ~129 half-width bits, 4-bit index → 16-entry table lookup
+    int max_len = scalar_bitlen_impl(&a1);
+    int l2 = scalar_bitlen_impl(&a2); if (l2 > max_len) max_len = l2;
+    int l3 = scalar_bitlen_impl(&b1); if (l3 > max_len) max_len = l3;
+    int l4 = scalar_bitlen_impl(&b2); if (l4 > max_len) max_len = l4;
+
+    point_set_infinity(r);
+    for (int i = max_len - 1; i >= 0; --i) {
+        if (!point_is_infinity(r)) point_double_unchecked(r, r);
+
+        int idx = scalar_bit(&a1, i)
+                | (scalar_bit(&a2, i) << 1)
+                | (scalar_bit(&b1, i) << 2)
+                | (scalar_bit(&b2, i) << 3);
+
+        if (idx != 0) {
+            if (point_is_infinity(r)) point_from_affine(r, &table[idx]);
+            else                      point_add_mixed_unchecked(r, r, &table[idx]);
+        }
+    }
+}
+
+inline void scalar_mul_glv_impl(JacobianPoint* r, const Scalar* k, const AffinePoint* p) {
+    Scalar k1, k2;
+    int k1_neg, k2_neg;
+    glv_decompose_impl(k, &k1, &k2, &k1_neg, &k2_neg);
+
+    // Build base point, negate if k1 is negative
+    AffinePoint base = *p;
+    if (k1_neg) field_negate_impl(&base.y, &base.y);
+
+    AffinePoint table[8];
+    FieldElement globalz;
+    build_wnaf_table_zr_impl(&base, table, &globalz);
+
+    AffinePoint endo_table[8];
+    derive_endo_table_impl(table, endo_table, (k1_neg != k2_neg));
+
+    // wNAF encode both half-width scalars
+    int wnaf1[130] = {0};
+    int wnaf2[130] = {0};
+    scalar_to_wnaf(&k1, wnaf1);
+    scalar_to_wnaf(&k2, wnaf2);
+
+    // Shamir interleaved loop
+    point_set_infinity(r);
+    for (int i = 129; i >= 0; --i) {
+        if (!point_is_infinity(r)) point_double_unchecked(r, r);
+
+        int d1 = wnaf1[i];
+        if (d1 != 0) {
+            int idx = (((d1 > 0) ? d1 : -d1) - 1) >> 1;
+            AffinePoint pt = table[idx];
+            if (d1 < 0) field_negate_impl(&pt.y, &pt.y);
+            if (point_is_infinity(r)) { point_from_affine(r, &pt); }
+            else { point_add_mixed_unchecked(r, r, &pt); }
+        }
+
+        int d2 = wnaf2[i];
+        if (d2 != 0) {
+            int idx = (((d2 > 0) ? d2 : -d2) - 1) >> 1;
+            AffinePoint pt = endo_table[idx];
+            if (d2 < 0) field_negate_impl(&pt.y, &pt.y);
+            if (point_is_infinity(r)) { point_from_affine(r, &pt); }
+            else { point_add_mixed_unchecked(r, r, &pt); }
+        }
+    }
+
+    if (!point_is_infinity(r)) {
+        FieldElement corrected_z;
+        field_mul_impl(&corrected_z, &r->z, &globalz);
+        r->z = corrected_z;
+    }
+}
+
+// Precomputed generator multiplication using fixed window w=4.
+// Uses a hard-coded affine table of {0G..15G} — eliminates per-thread table
+// construction and uses mixed (J+A) additions instead of J+J (saves ~5 field_muls per add).
+inline void scalar_mul_generator_windowed_impl(JacobianPoint* r, const Scalar* k) {
+    // Precomputed affine table: table[i] = i*G for i = 1..15.
+    AffinePoint table[16];
+    table[0].x.limbs[0] = 0; table[0].x.limbs[1] = 0; table[0].x.limbs[2] = 0; table[0].x.limbs[3] = 0;
+    table[0].y.limbs[0] = 0; table[0].y.limbs[1] = 0; table[0].y.limbs[2] = 0; table[0].y.limbs[3] = 0;
+    table[1].x.limbs[0] = 0x59F2815B16F81798UL; table[1].x.limbs[1] = 0x029BFCDB2DCE28D9UL;
+    table[1].x.limbs[2] = 0x55A06295CE870B07UL; table[1].x.limbs[3] = 0x79BE667EF9DCBBACUL;
+    table[1].y.limbs[0] = 0x9C47D08FFB10D4B8UL; table[1].y.limbs[1] = 0xFD17B448A6855419UL;
+    table[1].y.limbs[2] = 0x5DA4FBFC0E1108A8UL; table[1].y.limbs[3] = 0x483ADA7726A3C465UL;
+    table[2].x.limbs[0] = 0xABAC09B95C709EE5UL; table[2].x.limbs[1] = 0x5C778E4B8CEF3CA7UL;
+    table[2].x.limbs[2] = 0x3045406E95C07CD8UL; table[2].x.limbs[3] = 0xC6047F9441ED7D6DUL;
+    table[2].y.limbs[0] = 0x236431A950CFE52AUL; table[2].y.limbs[1] = 0xF7F632653266D0E1UL;
+    table[2].y.limbs[2] = 0xA3C58419466CEAEEUL; table[2].y.limbs[3] = 0x1AE168FEA63DC339UL;
+    table[3].x.limbs[0] = 0x8601F113BCE036F9UL; table[3].x.limbs[1] = 0xB531C845836F99B0UL;
+    table[3].x.limbs[2] = 0x49344F85F89D5229UL; table[3].x.limbs[3] = 0xF9308A019258C310UL;
+    table[3].y.limbs[0] = 0x6CB9FD7584B8E672UL; table[3].y.limbs[1] = 0x6500A99934C2231BUL;
+    table[3].y.limbs[2] = 0x0FE337E62A37F356UL; table[3].y.limbs[3] = 0x388F7B0F632DE814UL;
+    table[4].x.limbs[0] = 0x74FA94ABE8C4CD13UL; table[4].x.limbs[1] = 0xCC6C13900EE07584UL;
+    table[4].x.limbs[2] = 0x581E4904930B1404UL; table[4].x.limbs[3] = 0xE493DBF1C10D80F3UL;
+    table[4].y.limbs[0] = 0xCFE97BDC47739922UL; table[4].y.limbs[1] = 0xD967AE33BFBDFE40UL;
+    table[4].y.limbs[2] = 0x5642E2098EA51448UL; table[4].y.limbs[3] = 0x51ED993EA0D455B7UL;
+    table[5].x.limbs[0] = 0xCBA8D569B240EFE4UL; table[5].x.limbs[1] = 0xE88B84BDDC619AB7UL;
+    table[5].x.limbs[2] = 0x55B4A7250A5C5128UL; table[5].x.limbs[3] = 0x2F8BDE4D1A072093UL;
+    table[5].y.limbs[0] = 0xDCA87D3AA6AC62D6UL; table[5].y.limbs[1] = 0xF788271BAB0D6840UL;
+    table[5].y.limbs[2] = 0xD4DBA9DDA6C9C426UL; table[5].y.limbs[3] = 0xD8AC222636E5E3D6UL;
+    table[6].x.limbs[0] = 0x2F057A1460297556UL; table[6].x.limbs[1] = 0x82F6472F8568A18BUL;
+    table[6].x.limbs[2] = 0x20453A14355235D3UL; table[6].x.limbs[3] = 0xFFF97BD5755EEEA4UL;
+    table[6].y.limbs[0] = 0x3C870C36B075F297UL; table[6].y.limbs[1] = 0xDE80F0F6518FE4A0UL;
+    table[6].y.limbs[2] = 0xF3BE96017F45C560UL; table[6].y.limbs[3] = 0xAE12777AACFBB620UL;
+    table[7].x.limbs[0] = 0xE92BDDEDCAC4F9BCUL; table[7].x.limbs[1] = 0x3D419B7E0330E39CUL;
+    table[7].x.limbs[2] = 0xA398F365F2EA7A0EUL; table[7].x.limbs[3] = 0x5CBDF0646E5DB4EAUL;
+    table[7].y.limbs[0] = 0xA5082628087264DAUL; table[7].y.limbs[1] = 0xA813D0B813FDE7B5UL;
+    table[7].y.limbs[2] = 0xA3178D6D861A54DBUL; table[7].y.limbs[3] = 0x6AEBCA40BA255960UL;
+    table[8].x.limbs[0] = 0x67784EF3E10A2A01UL; table[8].x.limbs[1] = 0x0A1BDD05E5AF888AUL;
+    table[8].x.limbs[2] = 0xAFF3843FB70F3C2FUL; table[8].x.limbs[3] = 0x2F01E5E15CCA351DUL;
+    table[8].y.limbs[0] = 0xB5DA2CB76CBDE904UL; table[8].y.limbs[1] = 0xC2E213D6BA5B7617UL;
+    table[8].y.limbs[2] = 0x293D082A132D13B4UL; table[8].y.limbs[3] = 0x5C4DA8A741539949UL;
+    table[9].x.limbs[0] = 0xC35F110DFC27CCBEUL; table[9].x.limbs[1] = 0xE09796974C57E714UL;
+    table[9].x.limbs[2] = 0x09AD178A9F559ABDUL; table[9].x.limbs[3] = 0xACD484E2F0C7F653UL;
+    table[9].y.limbs[0] = 0x05CC262AC64F9C37UL; table[9].y.limbs[1] = 0xADD888A4375F8E0FUL;
+    table[9].y.limbs[2] = 0x64380971763B61E9UL; table[9].y.limbs[3] = 0xCC338921B0A7D9FDUL;
+    table[10].x.limbs[0] = 0x52A68E2A47E247C7UL; table[10].x.limbs[1] = 0x3442D49B1943C2B7UL;
+    table[10].x.limbs[2] = 0x35477C7B1AE6AE5DUL; table[10].x.limbs[3] = 0xA0434D9E47F3C862UL;
+    table[10].y.limbs[0] = 0x3CBEE53B037368D7UL; table[10].y.limbs[1] = 0x6F794C2ED877A159UL;
+    table[10].y.limbs[2] = 0xA3B6C7E693A24C69UL; table[10].y.limbs[3] = 0x893ABA425419BC27UL;
+    table[11].x.limbs[0] = 0xBBEC17895DA008CBUL; table[11].x.limbs[1] = 0x5649980BE5C17891UL;
+    table[11].x.limbs[2] = 0x5EF4246B70C65AACUL; table[11].x.limbs[3] = 0x774AE7F858A9411EUL;
+    table[11].y.limbs[0] = 0x301D74C9C953C61BUL; table[11].y.limbs[1] = 0x372DB1E2DFF9D6A8UL;
+    table[11].y.limbs[2] = 0x0243DD56D7B7B365UL; table[11].y.limbs[3] = 0xD984A032EB6B5E19UL;
+    table[12].x.limbs[0] = 0xC5B0F47070AFE85AUL; table[12].x.limbs[1] = 0x687CF4419620095BUL;
+    table[12].x.limbs[2] = 0x15C38F004D734633UL; table[12].x.limbs[3] = 0xD01115D548E7561BUL;
+    table[12].y.limbs[0] = 0x6B051B13F4062327UL; table[12].y.limbs[1] = 0x79238C5DD9A86D52UL;
+    table[12].y.limbs[2] = 0xA8B64537E17BD815UL; table[12].y.limbs[3] = 0xA9F34FFDC815E0D7UL;
+    table[13].x.limbs[0] = 0xDEEDDF8F19405AA8UL; table[13].x.limbs[1] = 0xB075FBC6610E58CDUL;
+    table[13].x.limbs[2] = 0xC7D1D205C3748651UL; table[13].x.limbs[3] = 0xF28773C2D975288BUL;
+    table[13].y.limbs[0] = 0x29B5CB52DB03ED81UL; table[13].y.limbs[1] = 0x3A1A06DA521FA91FUL;
+    table[13].y.limbs[2] = 0x758212EB65CDAF47UL; table[13].y.limbs[3] = 0x0AB0902E8D880A89UL;
+    table[14].x.limbs[0] = 0xE49B241A60E823E4UL; table[14].x.limbs[1] = 0x26AA7B63678949E6UL;
+    table[14].x.limbs[2] = 0xFD64E67F07D38E32UL; table[14].x.limbs[3] = 0x499FDF9E895E719CUL;
+    table[14].y.limbs[0] = 0xC65F40D403A13F5BUL; table[14].y.limbs[1] = 0x464279C27A3F95BCUL;
+    table[14].y.limbs[2] = 0x90F044E4A7B3D464UL; table[14].y.limbs[3] = 0xCAC2F6C4B54E8551UL;
+    table[15].x.limbs[0] = 0x44ADBCF8E27E080EUL; table[15].x.limbs[1] = 0x31E5946F3C85F79EUL;
+    table[15].x.limbs[2] = 0x5A465AE3095FF411UL; table[15].x.limbs[3] = 0xD7924D4F7D43EA96UL;
+    table[15].y.limbs[0] = 0xC504DC9FF6A26B58UL; table[15].y.limbs[1] = 0xEA40AF2BD896D3A5UL;
+    table[15].y.limbs[2] = 0x83842EC228CC6DEFUL; table[15].y.limbs[3] = 0x581E2872A86C72A6UL;
+
+    // Process scalar 4 bits at a time (MSB first)
+    point_set_infinity(r);
+    int started = 0;
+
+    for (int limb = 3; limb >= 0; limb--) {
+        ulong w = k->limbs[limb];
+        for (int nib = 15; nib >= 0; nib--) {
+            uint idx = (uint)((w >> (nib * 4)) & 0xFUL);
+
+            if (started) {
+                point_double_unchecked(r, r);
+                point_double_unchecked(r, r);
+                point_double_unchecked(r, r);
+                point_double_unchecked(r, r);
+            }
+
+            if (idx != 0) {
+                if (!started) {
+                    point_from_affine(r, &table[idx]);
+                    started = 1;
+                } else {
+                    point_add_mixed_unchecked(r, r, &table[idx]);
+                }
+            }
+        }
+    }
+}
+
+// Generator multiplication via precomputed LUT in __global memory.
+// lut: 16 slices x 65536 AffinePoints. lut[win*65536+idx] = idx * 2^(16*win) * G.
+// 15 mixed additions, 0 doublings.
+inline void scalar_mul_generator_lut_impl(JacobianPoint* r, const Scalar* k,
+                                          __global const AffinePoint* lut) {
+    point_set_infinity(r);
+    for (int win = 0; win < 16; win++) {
+        uint idx = (uint)((k->limbs[win >> 2] >> ((win & 3) * 16)) & 0xFFFFUL);
+        if (idx != 0) {
+            AffinePoint pt = lut[(uint)win * 65536 + idx];
+            if (point_is_infinity(r)) {
+                point_from_affine(r, &pt);
+            } else {
+                point_add_mixed_unchecked(r, r, &pt);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// LAYER 3: SHA-256 Streaming + HMAC + RFC 6979
+// =============================================================================
+
+typedef struct {
+    uint h[8];
+    uchar buf[64];
+    uint buf_len;
+    ulong total_len;
+} SHA256Ctx;
+
+inline uint sha256_rotr(uint x, uint n) { return (x >> n) | (x << (32 - n)); }
+inline uint sha256_ch(uint x, uint y, uint z)  { return (x & y) ^ (~x & z); }
+inline uint sha256_maj(uint x, uint y, uint z) { return (x & y) ^ (x & z) ^ (y & z); }
+inline uint sha256_bsig0(uint x) { return sha256_rotr(x,2) ^ sha256_rotr(x,13) ^ sha256_rotr(x,22); }
+inline uint sha256_bsig1(uint x) { return sha256_rotr(x,6) ^ sha256_rotr(x,11) ^ sha256_rotr(x,25); }
+inline uint sha256_ssig0(uint x) { return sha256_rotr(x,7) ^ sha256_rotr(x,18) ^ (x >> 3); }
+inline uint sha256_ssig1(uint x) { return sha256_rotr(x,17) ^ sha256_rotr(x,19) ^ (x >> 10); }
+
+inline void sha256_compress(SHA256Ctx* ctx, const uchar block[64]) {
+    uint w[64];
+    for (int i = 0; i < 16; i++)
+        w[i] = ((uint)block[i*4] << 24) | ((uint)block[i*4+1] << 16)
+             | ((uint)block[i*4+2] << 8) | (uint)block[i*4+3];
+    for (int i = 16; i < 64; i++)
+        w[i] = sha256_ssig1(w[i-2]) + w[i-7] + sha256_ssig0(w[i-15]) + w[i-16];
+
+    uint a=ctx->h[0], b=ctx->h[1], c=ctx->h[2], d=ctx->h[3];
+    uint e=ctx->h[4], f=ctx->h[5], g=ctx->h[6], h=ctx->h[7];
+
+    for (int i = 0; i < 64; i++) {
+        uint t1 = h + sha256_bsig1(e) + sha256_ch(e,f,g) + K256[i] + w[i];
+        uint t2 = sha256_bsig0(a) + sha256_maj(a,b,c);
+        h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+    }
+
+    ctx->h[0]+=a; ctx->h[1]+=b; ctx->h[2]+=c; ctx->h[3]+=d;
+    ctx->h[4]+=e; ctx->h[5]+=f; ctx->h[6]+=g; ctx->h[7]+=h;
+}
+
+inline void sha256_init(SHA256Ctx* ctx) {
+    ctx->h[0]=0x6a09e667u; ctx->h[1]=0xbb67ae85u;
+    ctx->h[2]=0x3c6ef372u; ctx->h[3]=0xa54ff53au;
+    ctx->h[4]=0x510e527fu; ctx->h[5]=0x9b05688cu;
+    ctx->h[6]=0x1f83d9abu; ctx->h[7]=0x5be0cd19u;
+    ctx->buf_len = 0; ctx->total_len = 0;
+}
+
+inline void sha256_update(SHA256Ctx* ctx, const uchar* data, uint len) {
+    ctx->total_len += len;
+    uint i = 0;
+    if (ctx->buf_len > 0) {
+        while (ctx->buf_len < 64 && i < len) ctx->buf[ctx->buf_len++] = data[i++];
+        if (ctx->buf_len == 64) { sha256_compress(ctx, ctx->buf); ctx->buf_len = 0; }
+    }
+    while (i + 64 <= len) { sha256_compress(ctx, data + i); i += 64; }
+    while (i < len) ctx->buf[ctx->buf_len++] = data[i++];
+}
+
+/* sha256_update variant that reads directly from __global memory using a
+ * fixed 64-byte __private scratch buffer per block, so private/register cost
+ * is O(1) regardless of total row length (rows can be multi-MB, e.g. real
+ * Bitcoin transactions). Reuses the existing sha256_compress unchanged.
+ * Mirrors sha256_update's own partial-buffer folding logic exactly. */
+inline void sha256_update_global(SHA256Ctx* ctx, __global const uchar* data, uint len) {
+    ctx->total_len += len;
+    uint i = 0;
+    if (ctx->buf_len > 0) {
+        while (ctx->buf_len < 64 && i < len) ctx->buf[ctx->buf_len++] = data[i++];
+        if (ctx->buf_len == 64) { sha256_compress(ctx, ctx->buf); ctx->buf_len = 0; }
+    }
+    uchar blk[64];
+    while (i + 64 <= len) {
+        for (uint j = 0; j < 64; ++j) blk[j] = data[i + j];
+        sha256_compress(ctx, blk);
+        i += 64;
+    }
+    while (i < len) ctx->buf[ctx->buf_len++] = data[i++];
+}
+
+inline void sha256_final(SHA256Ctx* ctx, uchar out[32]) {
+    ulong bits = ctx->total_len * 8;
+    uchar pad = 0x80;
+    sha256_update(ctx, &pad, 1);
+    uchar zero = 0;
+    while (ctx->buf_len != 56) sha256_update(ctx, &zero, 1);
+    uchar len_bytes[8];
+    for (int i = 0; i < 8; i++) len_bytes[i] = (uchar)(bits >> (56 - i*8));
+    sha256_update(ctx, len_bytes, 8);
+
+    for (int i = 0; i < 8; i++) {
+        out[i*4+0] = (uchar)(ctx->h[i] >> 24);
+        out[i*4+1] = (uchar)(ctx->h[i] >> 16);
+        out[i*4+2] = (uchar)(ctx->h[i] >> 8);
+        out[i*4+3] = (uchar)(ctx->h[i]);
+    }
+}
+
+inline void hmac_sha256_impl(const uchar* key, uint key_len,
+                              const uchar* msg, uint msg_len,
+                              uchar out[32]) {
+    uchar k_pad[64];
+    // If key > 64 bytes, hash it
+    uchar key_hash[32];
+    if (key_len > 64) {
+        SHA256Ctx kctx; sha256_init(&kctx);
+        sha256_update(&kctx, key, key_len);
+        sha256_final(&kctx, key_hash);
+        key = key_hash; key_len = 32;
+    }
+
+    // ipad = 0x36, opad = 0x5c
+    for (uint i = 0; i < 64; i++) k_pad[i] = (i < key_len ? key[i] : 0) ^ 0x36;
+
+    SHA256Ctx ictx; sha256_init(&ictx);
+    sha256_update(&ictx, k_pad, 64);
+    sha256_update(&ictx, msg, msg_len);
+    uchar inner[32];
+    sha256_final(&ictx, inner);
+
+    for (uint i = 0; i < 64; i++) k_pad[i] = (i < key_len ? key[i] : 0) ^ 0x5c;
+
+    SHA256Ctx octx; sha256_init(&octx);
+    sha256_update(&octx, k_pad, 64);
+    sha256_update(&octx, inner, 32);
+    sha256_final(&octx, out);
+}
+
+inline void rfc6979_nonce_impl(const Scalar* priv, const uchar msg_hash[32], Scalar* k_out) {
+    uchar priv_bytes[32];
+    scalar_to_bytes_impl(priv, priv_bytes);
+
+    // V = 0x01 * 32, K = 0x00 * 32
+    uchar V[32], K_[32];
+    for (int i = 0; i < 32; i++) { V[i] = 0x01; K_[i] = 0x00; }
+
+    // K = HMAC_K(V || 0x00 || x || h)
+    uchar hmac_input[97];
+    for (int i = 0; i < 32; i++) hmac_input[i] = V[i];
+    hmac_input[32] = 0x00;
+    for (int i = 0; i < 32; i++) hmac_input[33+i] = priv_bytes[i];
+    for (int i = 0; i < 32; i++) hmac_input[65+i] = msg_hash[i];
+    hmac_sha256_impl(K_, 32, hmac_input, 97, K_);
+
+    // V = HMAC_K(V)
+    hmac_sha256_impl(K_, 32, V, 32, V);
+
+    // K = HMAC_K(V || 0x01 || x || h)
+    for (int i = 0; i < 32; i++) hmac_input[i] = V[i];
+    hmac_input[32] = 0x01;
+    hmac_sha256_impl(K_, 32, hmac_input, 97, K_);
+
+    // V = HMAC_K(V)
+    hmac_sha256_impl(K_, 32, V, 32, V);
+
+    // Generate k — CT-GPU-002 fix: replaced data-dependent goto with break.
+    // Logic unchanged: accept k iff k != 0 AND k < order (strict RFC 6979).
+    int _found = 0;
+    for (int attempt = 0; attempt < 100; attempt++) {
+        hmac_sha256_impl(K_, 32, V, 32, V);
+        scalar_from_bytes_impl(V, k_out);
+        if (!scalar_is_zero(k_out)) {
+            Scalar order;
+            order.limbs[0] = ORDER_N0; order.limbs[1] = ORDER_N1;
+            order.limbs[2] = ORDER_N2; order.limbs[3] = ORDER_N3;
+            if (!scalar_ge_impl(k_out, &order)) { _found = 1; break; }
+        }
+        // Retry: K = HMAC_K(V || 0x00), V = HMAC_K(V)
+        uchar retry_input[33];
+        for (int i = 0; i < 32; i++) retry_input[i] = V[i];
+        retry_input[32] = 0x00;
+        hmac_sha256_impl(K_, 32, retry_input, 33, K_);
+        hmac_sha256_impl(K_, 32, V, 32, V);
+    }
+    (void)_found;  // caller checks k_out == 0 on failure
+    // Erase private key material from stack (Guardrail #10)
+    for (int _i = 0; _i < 32; _i++) { priv_bytes[_i] = 0; }
+    for (int _i = 0; _i < 32; _i++) { hmac_input[33 + _i] = 0; }
+    for (int _i = 0; _i < 32; _i++) { K_[_i] = 0; V[_i] = 0; }
+}
+
+// =============================================================================
+// CT Primitives (needed for constant-time signing paths — Guardrails #8, #14)
+// =============================================================================
+// Include order matters: ct_ops → ct_field → ct_scalar → ct_point
+#include "secp256k1_ct_ops.cl"
+#include "secp256k1_ct_field.cl"
+#include "secp256k1_ct_scalar.cl"
+#include "secp256k1_ct_point.cl"
+
+// =============================================================================
+// LAYER 4: ECDSA Sign / Verify
+// =============================================================================
+
+typedef struct {
+    Scalar r;
+    Scalar s;
+} ECDSASignature;
+
+inline int lift_x_impl(const uchar x_bytes[32], JacobianPoint* p);
+
+inline int lbtc_be32_lt_field_p(__global const uchar* x) {
+    const uchar P[32] = {
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xfe, 0xff, 0xff, 0xfc, 0x2f
+    };
+    for (int i = 0; i < 32; ++i) {
+        if (x[i] < P[i]) return 1;
+        if (x[i] > P[i]) return 0;
+    }
+    return 0;
+}
+
+inline int lbtc_point_from_compressed(__global const uchar* pub, JacobianPoint* p) {
+    const uchar prefix = pub[0];
+    if (prefix != 0x02 && prefix != 0x03) return 0;
+    if (!lbtc_be32_lt_field_p(pub + 1)) return 0;
+
+    uchar x_bytes[32];
+    for (int i = 0; i < 32; ++i) x_bytes[i] = pub[1 + i];
+    if (!lift_x_impl(x_bytes, p)) return 0;
+
+    if (prefix == 0x03)
+        field_neg_impl(&p->y, &p->y);
+    return 1;
+}
+
+inline int lbtc_scalar_ge_order(const Scalar* s) {
+    const ulong n[4] = { ORDER_N0, ORDER_N1, ORDER_N2, ORDER_N3 };
+    for (int i = 3; i >= 0; --i) {
+        if (s->limbs[i] > n[i]) return 1;
+        if (s->limbs[i] < n[i]) return 0;
+    }
+    return 1;
+}
+
+inline int lbtc_parse_opaque_scalar(__global const uchar* opaque, Scalar* out) {
+    for (int i = 0; i < 4; ++i) {
+        ulong limb = 0;
+        for (int j = 0; j < 8; ++j)
+            limb |= ((ulong)opaque[i * 8 + j]) << (j * 8);
+        out->limbs[i] = limb;
+    }
+    return !scalar_is_zero(out) && !lbtc_scalar_ge_order(out);
+}
+
+inline int lbtc_parse_compact_scalar(__global const uchar* be, Scalar* out) {
+    for (int limb = 0; limb < 4; ++limb) {
+        ulong v = 0;
+        const int base = (3 - limb) * 8;
+        for (int j = 0; j < 8; ++j)
+            v = (v << 8) | (ulong)be[base + j];
+        out->limbs[limb] = v;
+    }
+    return !scalar_is_zero(out) && !lbtc_scalar_ge_order(out);
+}
+
+inline int lbtc_parse_compact_signature(__global const uchar* sig64,
+                                        ECDSASignature* sig) {
+    if (!lbtc_parse_compact_scalar(sig64, &sig->r)) return 0;
+    if (!lbtc_parse_compact_scalar(sig64 + 32, &sig->s)) return 0;
+    return 1;
+}
+
+inline int lbtc_parse_opaque_signature(__global const uchar* opaque,
+                                       ECDSASignature* sig) {
+    if (!lbtc_parse_opaque_scalar(opaque, &sig->r)) return 0;
+    if (!lbtc_parse_opaque_scalar(opaque + 32, &sig->s)) return 0;
+
+    // Libbitcoin consensus/direct opaque verification accepts both low-S and
+    // high-S ECDSA forms. Low-S standardness belongs above this path; the device
+    // parser must reject only non-scalars/zero scalars, not a valid high-S twin.
+    return 1;
+}
+
+inline int ecdsa_sign_impl(const uchar msg_hash[32], const Scalar* priv, ECDSASignature* sig) {
+    if (scalar_is_zero(priv)) return 0;
+
+    Scalar z;
+    scalar_from_bytes_impl(msg_hash, &z);
+
+    Scalar k;
+    rfc6979_nonce_impl(priv, msg_hash, &k);
+    if (scalar_is_zero(&k)) return 0;
+
+    // CT: k*G using constant-time GLV windowed mul (Guardrail #8)
+    CTJacobianPoint R_ct;
+    ct_generator_mul_impl(&k, &R_ct);
+    JacobianPoint R = ct_point_to_jacobian(&R_ct);
+    if (point_is_infinity(&R)) return 0;
+
+    // r = R.x mod n
+    FieldElement z_inv, z_inv2, rx_aff;
+    field_inv_impl(&z_inv, &R.z);
+    field_sqr_impl(&z_inv2, &z_inv);
+    field_mul_impl(&rx_aff, &R.x, &z_inv2);
+
+    uchar rx_bytes[32];
+    field_to_bytes_impl(&rx_aff, rx_bytes);
+    scalar_from_bytes_impl(rx_bytes, &sig->r);
+    if (scalar_is_zero(&sig->r)) return 0;
+
+    // s = k⁻¹ * (z + r*d) mod n  (CT: fixed-trace Fermat inverse — Guardrail #8)
+    Scalar k_inv;
+    ct_scalar_inverse_impl(&k, &k_inv);
+
+    Scalar rd;
+    scalar_mul_mod_n_impl(&sig->r, priv, &rd);
+
+    Scalar z_plus_rd;
+    scalar_add_mod_n_impl(&z, &rd, &z_plus_rd);
+
+    scalar_mul_mod_n_impl(&k_inv, &z_plus_rd, &sig->s);
+    if (scalar_is_zero(&sig->s)) return 0;
+
+    // Low-S normalization — fully branchless CT conditional negate (P1-SEC-002 fix).
+    // scalar_is_high_mask_impl returns all-ones mask without early-exit returns,
+    // eliminating warp divergence on secret-derived s = f(k, d).
+    {
+        Scalar neg_s;
+        scalar_negate_impl(&neg_s, &sig->s);
+        const ulong mask = scalar_is_high_mask_impl(&sig->s);
+        sig->s.limbs[0] = (sig->s.limbs[0] & ~mask) | (neg_s.limbs[0] & mask);
+        sig->s.limbs[1] = (sig->s.limbs[1] & ~mask) | (neg_s.limbs[1] & mask);
+        sig->s.limbs[2] = (sig->s.limbs[2] & ~mask) | (neg_s.limbs[2] & mask);
+        sig->s.limbs[3] = (sig->s.limbs[3] & ~mask) | (neg_s.limbs[3] & mask);
+    }
+
+    return 1;
+}
+
+inline int ecdsa_verify_impl(const uchar msg_hash[32], const JacobianPoint* pubkey, const ECDSASignature* sig) {
+    if (scalar_is_zero(&sig->r) || scalar_is_zero(&sig->s)) return 0;
+
+    Scalar z;
+    scalar_from_bytes_impl(msg_hash, &z);
+
+    Scalar s_inv;
+    scalar_inverse_impl(&sig->s, &s_inv);
+
+    Scalar u1, u2;
+    scalar_mul_mod_n_impl(&z, &s_inv, &u1);
+    scalar_mul_mod_n_impl(&sig->r, &s_inv, &u2);
+
+    AffinePoint G; get_generator(&G);
+
+    // Convert pubkey to affine: fast-path when Z==1 (common case)
+    AffinePoint pub_aff;
+    if (pubkey->z.limbs[0] == 1 && pubkey->z.limbs[1] == 0 &&
+        pubkey->z.limbs[2] == 0 && pubkey->z.limbs[3] == 0) {
+        pub_aff.x = pubkey->x; pub_aff.y = pubkey->y;
+    } else {
+        FieldElement pz_inv, pz_inv2, pz_inv3;
+        field_inv_impl(&pz_inv, &pubkey->z);
+        field_sqr_impl(&pz_inv2, &pz_inv);
+        field_mul_impl(&pz_inv3, &pz_inv2, &pz_inv);
+        field_mul_impl(&pub_aff.x, &pubkey->x, &pz_inv2);
+        field_mul_impl(&pub_aff.y, &pubkey->y, &pz_inv3);
+    }
+
+    // R = u1*G + u2*Q  using Shamir's trick (one interleaved loop)
+    JacobianPoint R;
+    shamir_double_mul_glv_impl(&G, &u1, &pub_aff, &u2, &R);
+    if (point_is_infinity(&R)) return 0;
+
+    // Check R.x mod n == r
+    FieldElement rz_inv, rz_inv2, rx_aff;
+    field_inv_impl(&rz_inv, &R.z);
+    field_sqr_impl(&rz_inv2, &rz_inv);
+    field_mul_impl(&rx_aff, &R.x, &rz_inv2);
+
+    uchar rx_bytes[32];
+    field_to_bytes_impl(&rx_aff, rx_bytes);
+    Scalar rx_scalar;
+    scalar_from_bytes_impl(rx_bytes, &rx_scalar);
+
+    return scalar_eq_impl(&rx_scalar, &sig->r);
+}
+
+// =============================================================================
+// LAYER 5a: Tagged Hash + Schnorr BIP-340
+// =============================================================================
+
+inline void tagged_hash_impl(const uchar* tag, uint tag_len,
+                              const uchar* data, uint data_len,
+                              uchar out[32]) {
+    // H_tag(msg) = SHA256(SHA256(tag) || SHA256(tag) || msg)
+    uchar tag_hash[32];
+    SHA256Ctx ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, tag, tag_len);
+    sha256_final(&ctx, tag_hash);
+
+    sha256_init(&ctx);
+    sha256_update(&ctx, tag_hash, 32);
+    sha256_update(&ctx, tag_hash, 32);
+    sha256_update(&ctx, data, data_len);
+    sha256_final(&ctx, out);
+}
+
+// BIP-340 tagged hash midstate precomputation.
+// SHA256(tag||tag) for each BIP-340 tag is exactly 64 bytes (one block).
+// These midstates are the SHA-256 internal state after compressing that block,
+// saving 2 compressions per tagged_hash call.
+#define BIP340_TAG_AUX       0
+#define BIP340_TAG_NONCE     1
+#define BIP340_TAG_CHALLENGE 2
+
+__constant uint BIP340_MIDSTATES[3][8] = {
+    // "BIP0340/aux"
+    {0x24dd3219U, 0x4eba7e70U, 0xca0fabb9U, 0x0fa3166dU,
+     0x3afbe4b1U, 0x4c44df97U, 0x4aac2739U, 0x249e850aU},
+    // "BIP0340/nonce"
+    {0x46615b35U, 0xf4bfbff7U, 0x9f8dc671U, 0x83627ab3U,
+     0x60217180U, 0x57358661U, 0x21a29e54U, 0x68b07b4cU},
+    // "BIP0340/challenge"
+    {0x9cecba11U, 0x23925381U, 0x11679112U, 0xd1627e0fU,
+     0x97c87550U, 0x003cc765U, 0x90f61164U, 0x33e9b66aU},
+};
+
+inline void tagged_hash_fast_impl(int tag_idx,
+                                  const uchar* data, uint data_len,
+                                  uchar out[32]) {
+    SHA256Ctx ctx;
+    for (int i = 0; i < 8; i++) ctx.h[i] = BIP340_MIDSTATES[tag_idx][i];
+    ctx.buf_len = 0;
+    ctx.total_len = 64;  // 64 bytes already processed (tag_hash||tag_hash)
+    sha256_update(&ctx, data, data_len);
+    sha256_final(&ctx, out);
+}
+
+// Lift x to curve point with even Y
+inline int lift_x_impl(const uchar x_bytes[32], JacobianPoint* p) {
+    FieldElement x;
+    for (int i = 0; i < 4; i++) {
+        ulong limb = 0;
+        int base = (3 - i) * 8;
+        for (int j = 0; j < 8; j++) limb = (limb << 8) | (ulong)x_bytes[base + j];
+        x.limbs[i] = limb;
+    }
+
+    FieldElement x2, x3, y2, seven, y;
+    field_sqr_impl(&x2, &x);
+    field_mul_impl(&x3, &x2, &x);
+    seven.limbs[0] = 7; seven.limbs[1] = 0; seven.limbs[2] = 0; seven.limbs[3] = 0;
+    field_add_impl(&y2, &x3, &seven);
+
+    field_sqrt_impl(&y2, &y);
+
+    // Verify: y² == y2 (compare via normalized bytes to handle unreduced limbs)
+    FieldElement y_check;
+    field_sqr_impl(&y_check, &y);
+    uchar yc_bytes[32], y2_bytes[32];
+    field_to_bytes_impl(&y_check, yc_bytes);
+    field_to_bytes_impl(&y2, y2_bytes);
+    int valid = 1;
+    for (int i = 0; i < 32; i++)
+        if (yc_bytes[i] != y2_bytes[i]) valid = 0;
+    if (!valid) return 0;
+
+    // Ensure even Y
+    uchar y_bytes[32];
+    field_to_bytes_impl(&y, y_bytes);
+    if (y_bytes[31] & 1) {
+        field_neg_impl(&y, &y);
+    }
+
+    p->x = x; p->y = y;
+    p->z.limbs[0] = 1; p->z.limbs[1] = 0; p->z.limbs[2] = 0; p->z.limbs[3] = 0;
+    p->infinity = 0;
+    return 1;
+}
+
+typedef struct {
+    uchar r[32];
+    Scalar s;
+} SchnorrSignature;
+
+inline int schnorr_sign_impl(const Scalar* priv, const uchar msg[32],
+                               const uchar aux_rand[32], SchnorrSignature* sig) {
+    if (scalar_is_zero(priv)) return 0;
+
+    // P = d' * G  (CT: Guardrail #8)
+    CTJacobianPoint P_ct;
+    ct_generator_mul_impl(priv, &P_ct);
+    JacobianPoint P = ct_point_to_jacobian(&P_ct);
+    if (point_is_infinity(&P)) return 0;
+
+    // Convert to affine
+    FieldElement z_inv, z_inv2, z_inv3, px, py;
+    field_inv_impl(&z_inv, &P.z);
+    field_sqr_impl(&z_inv2, &z_inv);
+    field_mul_impl(&z_inv3, &z_inv2, &z_inv);
+    field_mul_impl(&px, &P.x, &z_inv2);
+    field_mul_impl(&py, &P.y, &z_inv3);
+
+    // If Y is odd, negate d (MEDIUM-4: branchless cmov to avoid warp divergence)
+    uchar py_bytes[32];
+    field_to_bytes_impl(&py, py_bytes);
+    Scalar d = *priv;
+    Scalar neg_d;
+    scalar_negate_impl(priv, &neg_d);
+    {
+        ulong mask = -(ulong)((py_bytes[31] & 1) != 0);
+        for (int _i = 0; _i < 4; _i++)
+            d.limbs[_i] = (neg_d.limbs[_i] & mask) | (d.limbs[_i] & ~mask);
+    }
+
+    uchar px_bytes[32];
+    field_to_bytes_impl(&px, px_bytes);
+
+    // t = d XOR tagged_hash("BIP0340/aux", aux_rand)
+    uchar t_hash[32];
+    tagged_hash_fast_impl(BIP340_TAG_AUX, aux_rand, 32, t_hash);
+
+    uchar d_bytes[32];
+    scalar_to_bytes_impl(&d, d_bytes);
+
+    uchar t[32];
+    for (int i = 0; i < 32; i++) t[i] = d_bytes[i] ^ t_hash[i];
+
+    // rand = tagged_hash("BIP0340/nonce", t || px || msg)
+    uchar nonce_input[96];
+    for (int i = 0; i < 32; i++) nonce_input[i] = t[i];
+    for (int i = 0; i < 32; i++) nonce_input[32+i] = px_bytes[i];
+    for (int i = 0; i < 32; i++) nonce_input[64+i] = msg[i];
+
+    uchar rand_hash[32];
+    tagged_hash_fast_impl(BIP340_TAG_NONCE, nonce_input, 96, rand_hash);
+
+    Scalar k_prime;
+    scalar_from_bytes_impl(rand_hash, &k_prime);
+    if (scalar_is_zero(&k_prime)) return 0;
+
+    // R = k' * G  (CT: Guardrail #8)
+    CTJacobianPoint R_schnorr_ct;
+    ct_generator_mul_impl(&k_prime, &R_schnorr_ct);
+    JacobianPoint R = ct_point_to_jacobian(&R_schnorr_ct);
+
+    FieldElement rz_inv, rz_inv2, rz_inv3, rx, ry;
+    field_inv_impl(&rz_inv, &R.z);
+    field_sqr_impl(&rz_inv2, &rz_inv);
+    field_mul_impl(&rz_inv3, &rz_inv2, &rz_inv);
+    field_mul_impl(&rx, &R.x, &rz_inv2);
+    field_mul_impl(&ry, &R.y, &rz_inv3);
+
+    uchar ry_bytes[32];
+    field_to_bytes_impl(&ry, ry_bytes);
+    // MEDIUM-4: branchless cmov to avoid warp divergence on secret nonce parity
+    Scalar k = k_prime;
+    Scalar neg_k;
+    scalar_negate_impl(&k_prime, &neg_k);
+    {
+        ulong mask = -(ulong)((ry_bytes[31] & 1) != 0);
+        for (int _i = 0; _i < 4; _i++)
+            k.limbs[_i] = (neg_k.limbs[_i] & mask) | (k.limbs[_i] & ~mask);
+    }
+
+    field_to_bytes_impl(&rx, sig->r);
+
+    // e = tagged_hash("BIP0340/challenge", R.x || px || msg) mod n
+    uchar challenge_input[96];
+    for (int i = 0; i < 32; i++) challenge_input[i] = sig->r[i];
+    for (int i = 0; i < 32; i++) challenge_input[32+i] = px_bytes[i];
+    for (int i = 0; i < 32; i++) challenge_input[64+i] = msg[i];
+
+    uchar e_hash[32];
+    tagged_hash_fast_impl(BIP340_TAG_CHALLENGE, challenge_input, 96, e_hash);
+
+    Scalar e;
+    scalar_from_bytes_impl(e_hash, &e);
+
+    // s = k + e * d mod n  (CT: apply value barriers to secret operands d and k)
+    Scalar ed;
+    {
+        Scalar d_ct = d, k_ct = k;
+        for (int _i = 0; _i < 4; ++_i) {
+            volatile ulong _vb_d = d_ct.limbs[_i]; d_ct.limbs[_i] = _vb_d;
+            volatile ulong _vb_k = k_ct.limbs[_i]; k_ct.limbs[_i] = _vb_k;
+        }
+        scalar_mul_mod_n_impl(&e, &d_ct, &ed);
+        scalar_add_mod_n_impl(&k_ct, &ed, &sig->s);
+    }
+
+    /* Reject s == 0 (BIP-340) */
+    if (scalar_is_zero(&sig->s)) return 0;
+
+    /* Reject r == all-zeros (Guardrail #14: must check BOTH r and s) */
+    {
+        int _r_zero = 1;
+        for (int _i = 0; _i < 32; _i++) { if (sig->r[_i]) { _r_zero = 0; break; } }
+        if (_r_zero) return 0;
+    }
+
+    return 1;
+}
+
+inline int schnorr_verify_impl(const uchar pubkey_x[32], const uchar msg[32],
+                                 const SchnorrSignature* sig) {
+    if (scalar_is_zero(&sig->s)) return 0;
+
+    JacobianPoint P;
+    if (!lift_x_impl(pubkey_x, &P)) return 0;
+
+    uchar challenge_input[96];
+    for (int i = 0; i < 32; i++) challenge_input[i] = sig->r[i];
+    for (int i = 0; i < 32; i++) challenge_input[32+i] = pubkey_x[i];
+    for (int i = 0; i < 32; i++) challenge_input[64+i] = msg[i];
+
+    uchar e_hash[32];
+    tagged_hash_fast_impl(BIP340_TAG_CHALLENGE, challenge_input, 96, e_hash);
+
+    Scalar e;
+    scalar_from_bytes_impl(e_hash, &e);
+
+    // R = s*G - e*P  using Shamir's trick (one interleaved loop, saves ~130 doubles)
+    AffinePoint G; get_generator(&G);
+
+    // lift_x_impl returns Z=1, so P is already affine -- no field_inv needed
+    AffinePoint p_aff; p_aff.x = P.x; p_aff.y = P.y;
+
+    // Negate e for: R = s*G + (-e)*P
+    Scalar neg_e;
+    scalar_negate_impl(&e, &neg_e);
+
+    JacobianPoint Rpt;
+    shamir_double_mul_glv_impl(&G, &sig->s, &p_aff, &neg_e, &Rpt);
+    if (point_is_infinity(&Rpt)) return 0;
+
+    FieldElement rz_inv, rz_inv2, rz_inv3, rx_aff, ry_aff;
+    field_inv_impl(&rz_inv, &Rpt.z);
+    field_sqr_impl(&rz_inv2, &rz_inv);
+    field_mul_impl(&rz_inv3, &rz_inv2, &rz_inv);
+    field_mul_impl(&rx_aff, &Rpt.x, &rz_inv2);
+    field_mul_impl(&ry_aff, &Rpt.y, &rz_inv3);
+
+    uchar ry_bytes[32];
+    field_to_bytes_impl(&ry_aff, ry_bytes);
+    if (ry_bytes[31] & 1) return 0; // must have even Y
+
+    uchar rx_bytes[32];
+    field_to_bytes_impl(&rx_aff, rx_bytes);
+    for (int i = 0; i < 32; i++)
+        if (rx_bytes[i] != sig->r[i]) return 0;
+
+    return 1;
+}
+
+// =============================================================================
+// LAYER 5b: ECDH
+// =============================================================================
+
+// P1-SEC-001 FIX: constant-time scalar multiplication for ECDH on a variable
+// base point (AffinePoint input).  The GLV/wNAF path (scalar_mul_glv_impl) is
+// variable-time and MUST NOT be used when the scalar is a private key.
+// This replicates the same bit-by-bit double-and-add CT loop used by
+// ct_ecdh_scalar_mul() in secp256k1_ecdh.cl, adapted for the AffinePoint type
+// used by the extended kernel.  No GLV, no wNAF, no data-dependent branches on
+// the scalar value.
+inline void ct_ecdh_scalar_mul_affine(JacobianPoint* r,
+                                       const AffinePoint* pk,
+                                       const Scalar* sk)
+{
+    // Lift the affine peer pubkey to Jacobian (Z=1).
+    JacobianPoint P;
+    point_from_affine(&P, pk);
+
+    JacobianPoint R, T;
+    point_set_infinity(&R);
+
+    for (int i = 255; i >= 0; --i) {
+        point_double_impl(&R, &R);
+        point_add_impl(&T, &R, &P);
+
+        // CT select: if bit i of sk is 1, R = T; else R = R.
+        int word = i >> 6;
+        int bit  = (int)((sk->limbs[word] >> (i & 63)) & 1UL);
+        ulong mask = -(ulong)bit;
+        for (int j = 0; j < 4; ++j) {
+            R.x.limbs[j] ^= mask & (R.x.limbs[j] ^ T.x.limbs[j]);
+            R.y.limbs[j] ^= mask & (R.y.limbs[j] ^ T.y.limbs[j]);
+            R.z.limbs[j] ^= mask & (R.z.limbs[j] ^ T.z.limbs[j]);
+        }
+        R.infinity = (int)(((uint)R.infinity & (uint)~(uint)mask) |
+                           ((uint)T.infinity & (uint)mask));
+    }
+    *r = R;
+}
+
+inline int ecdh_compute_raw_impl(const Scalar* priv, const AffinePoint* peer, uchar out[32]) {
+    JacobianPoint shared;
+    ct_ecdh_scalar_mul_affine(&shared, peer, priv);  // P1-SEC-001: CT path
+    if (point_is_infinity(&shared)) return 0;
+
+    FieldElement z_inv, z_inv2, x_aff;
+    field_inv_impl(&z_inv, &shared.z);
+    field_sqr_impl(&z_inv2, &z_inv);
+    field_mul_impl(&x_aff, &shared.x, &z_inv2);
+    field_to_bytes_impl(&x_aff, out);
+    return 1;
+}
+
+inline int ecdh_compute_xonly_impl(const Scalar* priv, const AffinePoint* peer, uchar out[32]) {
+    uchar x_bytes[32];
+    if (!ecdh_compute_raw_impl(priv, peer, x_bytes)) return 0;
+
+    SHA256Ctx ctx; sha256_init(&ctx);
+    sha256_update(&ctx, x_bytes, 32);
+    sha256_final(&ctx, out);
+    return 1;
+}
+
+inline int ecdh_compute_impl(const Scalar* priv, const AffinePoint* peer, uchar out[32]) {
+    // BUG-3 FIX: cannot use ecdh_compute_raw_impl here — it discards y_aff, making it
+    // impossible to derive the correct compressed-point prefix.  Inline the computation
+    // so we have y_aff and can determine Y parity.  Previously hardcoded 0x02 produced
+    // wrong output for ~50% of key pairs (odd-Y shared point).
+    // P1-SEC-001 FIX: use CT path — private key is secret, VT wNAF is banned here.
+    JacobianPoint shared;
+    ct_ecdh_scalar_mul_affine(&shared, peer, priv);  // P1-SEC-001: CT path
+    if (point_is_infinity(&shared)) return 0;
+
+    FieldElement z_inv, z_inv2, z_inv3, x_aff, y_aff;
+    field_inv_impl(&z_inv, &shared.z);
+    field_sqr_impl(&z_inv2, &z_inv);
+    field_mul_impl(&z_inv3, &z_inv, &z_inv2);
+    field_mul_impl(&x_aff, &shared.x, &z_inv2);
+    field_mul_impl(&y_aff, &shared.y, &z_inv3);
+
+    uchar x_bytes[32];
+    field_to_bytes_impl(&x_aff, x_bytes);
+
+    // limbs[0] is the least-significant 64-bit word; bit 0 is the Y parity.
+    uchar prefix = (y_aff.limbs[0] & 1UL) ? 0x03 : 0x02;
+    SHA256Ctx ctx; sha256_init(&ctx);
+    sha256_update(&ctx, &prefix, 1);
+    sha256_update(&ctx, x_bytes, 32);
+    sha256_final(&ctx, out);
+    return 1;
+}
+
+// =============================================================================
+// LAYER 5c: Key Recovery
+// =============================================================================
+
+typedef struct {
+    ECDSASignature sig;
+    int recid;
+} RecoverableSignature;
+
+inline int ecdsa_sign_recoverable_impl(const uchar msg_hash[32], const Scalar* priv,
+                                         RecoverableSignature* rsig) {
+    if (scalar_is_zero(priv)) return 0;
+
+    Scalar z;
+    scalar_from_bytes_impl(msg_hash, &z);
+
+    Scalar k;
+    rfc6979_nonce_impl(priv, msg_hash, &k);
+    if (scalar_is_zero(&k)) return 0;
+
+    // CT: R = k*G (no secret-dependent branches on nonce k)
+    CTJacobianPoint R_ct;
+    ct_generator_mul_impl(&k, &R_ct);
+    FieldElement rx_aff, ry_aff;
+    ct_jacobian_to_affine(&R_ct, &rx_aff, &ry_aff);
+
+    uchar rx_bytes[32];
+    field_to_bytes_impl(&rx_aff, rx_bytes);
+    scalar_from_bytes_impl(rx_bytes, &rsig->sig.r);
+    if (scalar_is_zero(&rsig->sig.r)) return 0;
+
+    int recid = 0;
+    uchar ry_bytes[32];
+    field_to_bytes_impl(&ry_aff, ry_bytes);
+    if (ry_bytes[31] & 1) recid |= 1;
+
+    // Check overflow (R.x >= n) — branchless MSB-cascade, no early exit
+    {
+        uchar order_be[32] = {
+            0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF,
+            0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFE,
+            0xBA,0xAE,0xDC,0xE6, 0xAF,0x48,0xA0,0x3B,
+            0xBF,0xD2,0x5E,0x8C, 0xD0,0x36,0x41,0x41
+        };
+        uint gt = 0u, eq_run = 1u;
+        for (int i = 0; i < 32; i++) {
+            uint rb = (uint)rx_bytes[i], ob = (uint)order_be[i];
+            uint byte_gt = ((ob - rb) >> 31) & 1u;
+            uint byte_lt = ((rb - ob) >> 31) & 1u;
+            gt     = gt | (eq_run & byte_gt);
+            eq_run = eq_run & (1u - byte_gt) & (1u - byte_lt);
+        }
+        recid |= (int)(gt << 1);
+    }
+
+    // s = k⁻¹(z + r*d) mod n
+    Scalar k_inv;
+    scalar_inverse_impl(&k, &k_inv);
+    Scalar rd;
+    scalar_mul_mod_n_impl(&rsig->sig.r, priv, &rd);
+    Scalar z_plus_rd;
+    scalar_add_mod_n_impl(&z, &rd, &z_plus_rd);
+    scalar_mul_mod_n_impl(&k_inv, &z_plus_rd, &rsig->sig.s);
+    if (scalar_is_zero(&rsig->sig.s)) return 0;
+
+    if (!scalar_is_low_s_impl(&rsig->sig.s)) {
+        scalar_negate_impl(&rsig->sig.s, &rsig->sig.s);
+        recid ^= 1;
+    }
+
+    rsig->recid = recid;
+    return 1;
+}
+
+// Lift x as FieldElement with parity control
+inline int lift_x_field_impl(const FieldElement* x_fe, int parity, JacobianPoint* p) {
+    FieldElement x2, x3, y2, seven, y;
+    field_sqr_impl(&x2, x_fe);
+    field_mul_impl(&x3, &x2, x_fe);
+    seven.limbs[0]=7; seven.limbs[1]=0; seven.limbs[2]=0; seven.limbs[3]=0;
+    field_add_impl(&y2, &x3, &seven);
+    field_sqrt_impl(&y2, &y);
+
+    // Verify: y² == y2 (compare via normalized bytes to handle unreduced limbs)
+    FieldElement y_check;
+    field_sqr_impl(&y_check, &y);
+    uchar yc_bytes2[32], y2_bytes2[32];
+    field_to_bytes_impl(&y_check, yc_bytes2);
+    field_to_bytes_impl(&y2, y2_bytes2);
+    int valid = 1;
+    for (int i = 0; i < 32; i++)
+        if (yc_bytes2[i] != y2_bytes2[i]) valid = 0;
+    if (!valid) return 0;
+
+    uchar y_bytes[32];
+    field_to_bytes_impl(&y, y_bytes);
+    int y_is_odd = (y_bytes[31] & 1) != 0;
+    if ((parity != 0) != y_is_odd) {
+        field_neg_impl(&y, &y);
+    }
+
+    p->x = *x_fe; p->y = y;
+    p->z.limbs[0]=1; p->z.limbs[1]=0; p->z.limbs[2]=0; p->z.limbs[3]=0;
+    p->infinity = 0;
+    return 1;
+}
+
+inline int ecdsa_recover_impl(const uchar msg_hash[32], const ECDSASignature* sig,
+                                int recid, JacobianPoint* Q) {
+    if (recid < 0 || recid > 3) return 0;
+    if (scalar_is_zero(&sig->r) || scalar_is_zero(&sig->s)) return 0;
+
+    // Reconstruct R.x
+    FieldElement rx_fe;
+    uchar r_bytes[32];
+    scalar_to_bytes_impl(&sig->r, r_bytes);
+    for (int i = 0; i < 4; i++) {
+        ulong limb = 0;
+        int base = (3 - i) * 8;
+        for (int j = 0; j < 8; j++) limb = (limb << 8) | (ulong)r_bytes[base + j];
+        rx_fe.limbs[i] = limb;
+    }
+
+    if (recid & 2) {
+        // bbhunt-001: reject r >= (p - n), else r+n wraps mod p to a wrong x and
+        // could yield a bogus pubkey as success where upstream returns 0.
+        // p - n little-endian 64-bit limbs (recid/sig are public data):
+        const ulong PMN0 = 0x402DA1722FC9BAEEUL;
+        const ulong PMN1 = 0x4551231950B75FC4UL;
+        const ulong PMN2 = 0x0000000000000001UL;
+        const ulong PMN3 = 0x0000000000000000UL;
+        int r_ge_pmn;
+        if      (rx_fe.limbs[3] != PMN3) r_ge_pmn = (rx_fe.limbs[3] > PMN3);
+        else if (rx_fe.limbs[2] != PMN2) r_ge_pmn = (rx_fe.limbs[2] > PMN2);
+        else if (rx_fe.limbs[1] != PMN1) r_ge_pmn = (rx_fe.limbs[1] > PMN1);
+        else                             r_ge_pmn = (rx_fe.limbs[0] >= PMN0);
+        if (r_ge_pmn) return 0;
+
+        FieldElement n_fe;
+        n_fe.limbs[0] = ORDER_N0; n_fe.limbs[1] = ORDER_N1;
+        n_fe.limbs[2] = ORDER_N2; n_fe.limbs[3] = ORDER_N3;
+        field_add_impl(&rx_fe, &rx_fe, &n_fe);
+    }
+
+    int y_parity = recid & 1;
+    JacobianPoint Rpt;
+    if (!lift_x_field_impl(&rx_fe, y_parity, &Rpt)) return 0;
+
+    // Q = r⁻¹ * (s*R - z*G)
+    Scalar z;
+    scalar_from_bytes_impl(msg_hash, &z);
+
+    Scalar r_inv;
+    scalar_inverse_impl(&sig->r, &r_inv);
+
+    // s*R  (need affine for scalar_mul_impl)
+    FieldElement pz_inv, pz_inv2, pz_inv3;
+    field_inv_impl(&pz_inv, &Rpt.z);
+    field_sqr_impl(&pz_inv2, &pz_inv);
+    field_mul_impl(&pz_inv3, &pz_inv2, &pz_inv);
+    AffinePoint r_aff;
+    field_mul_impl(&r_aff.x, &Rpt.x, &pz_inv2);
+    field_mul_impl(&r_aff.y, &Rpt.y, &pz_inv3);
+
+    JacobianPoint sR;
+    scalar_mul_glv_impl(&sR, &sig->s, &r_aff);
+
+    AffinePoint G; get_generator(&G);
+    JacobianPoint zG;
+    scalar_mul_glv_impl(&zG, &z, &G);
+
+    point_negate_y(&zG);
+    JacobianPoint sR_minus_zG;
+    point_add_impl(&sR_minus_zG, &sR, &zG);
+
+    // Convert to affine for final scalar_mul
+    FieldElement qz_inv, qz_inv2, qz_inv3;
+    field_inv_impl(&qz_inv, &sR_minus_zG.z);
+    field_sqr_impl(&qz_inv2, &qz_inv);
+    field_mul_impl(&qz_inv3, &qz_inv2, &qz_inv);
+    AffinePoint diff_aff;
+    field_mul_impl(&diff_aff.x, &sR_minus_zG.x, &qz_inv2);
+    field_mul_impl(&diff_aff.y, &sR_minus_zG.y, &qz_inv3);
+
+    scalar_mul_glv_impl(Q, &r_inv, &diff_aff);
+
+    if (point_is_infinity(Q)) return 0;
+    return 1;
+}
+
+// =============================================================================
+// LAYER 5d: MSM (Multi-Scalar Multiplication)
+// =============================================================================
+
+// Extract c-bit window from scalar
+inline uint scalar_get_window_impl(const Scalar* s, int window_idx, int c) {
+    int bit_offset = window_idx * c;
+    int limb_idx = bit_offset / 64;
+    int bit_idx = bit_offset % 64;
+    if (limb_idx >= 4) return 0;
+
+    uint val = (uint)((s->limbs[limb_idx] >> bit_idx) & ((1UL << c) - 1));
+    int bits_from_first = 64 - bit_idx;
+    if (bits_from_first < c && limb_idx + 1 < 4) {
+        int remaining = c - bits_from_first;
+        val |= (uint)(s->limbs[limb_idx+1] & ((1UL << remaining) - 1)) << bits_from_first;
+    }
+    return val;
+}
+
+// Naive MSM: sum of individual scalar multiplications
+inline void msm_naive_impl(const Scalar* scalars, const AffinePoint* points,
+                             int n, JacobianPoint* result) {
+    point_set_infinity(result);
+    for (int i = 0; i < n; i++) {
+        if (scalar_is_zero(&scalars[i])) continue;
+        JacobianPoint tmp;
+        scalar_mul_glv_impl(&tmp, &scalars[i], &points[i]);
+        if (point_is_infinity(result)) {
+            *result = tmp;
+        } else {
+            JacobianPoint sum;
+            point_add_impl(&sum, result, &tmp);
+            *result = sum;
+        }
+    }
+}
+
+// Pippenger bucket MSM
+inline void msm_pippenger_impl(const Scalar* scalars, const AffinePoint* points,
+                                 int n, JacobianPoint* result,
+                                 JacobianPoint* buckets, int c) {
+    int num_buckets = 1 << c;
+    int num_windows = (256 + c - 1) / c;
+
+    point_set_infinity(result);
+
+    for (int w = num_windows - 1; w >= 0; w--) {
+        if (!point_is_infinity(result)) {
+            for (int d = 0; d < c; d++) {
+                JacobianPoint dbl;
+                point_double_impl(&dbl, result);
+                *result = dbl;
+            }
+        }
+
+        for (int b = 0; b < num_buckets; b++) point_set_infinity(&buckets[b]);
+
+        for (int i = 0; i < n; i++) {
+            uint digit = scalar_get_window_impl(&scalars[i], w, c);
+            if (digit == 0) continue;
+            if (point_is_infinity(&buckets[digit])) {
+                point_from_affine(&buckets[digit], &points[i]);
+            } else {
+                JacobianPoint sum;
+                point_add_mixed_impl(&sum, &buckets[digit], &points[i]);
+                buckets[digit] = sum;
+            }
+        }
+
+        JacobianPoint running_sum, partial_sum;
+        point_set_infinity(&running_sum);
+        point_set_infinity(&partial_sum);
+
+        for (int b = num_buckets - 1; b >= 1; b--) {
+            if (!point_is_infinity(&buckets[b])) {
+                if (point_is_infinity(&running_sum)) {
+                    running_sum = buckets[b];
+                } else {
+                    JacobianPoint sum;
+                    point_add_impl(&sum, &running_sum, &buckets[b]);
+                    running_sum = sum;
+                }
+            }
+            if (!point_is_infinity(&running_sum)) {
+                if (point_is_infinity(&partial_sum)) {
+                    partial_sum = running_sum;
+                } else {
+                    JacobianPoint sum;
+                    point_add_impl(&sum, &partial_sum, &running_sum);
+                    partial_sum = sum;
+                }
+            }
+        }
+
+        if (!point_is_infinity(&partial_sum)) {
+            if (point_is_infinity(result)) {
+                *result = partial_sum;
+            } else {
+                JacobianPoint sum;
+                point_add_impl(&sum, result, &partial_sum);
+                *result = sum;
+            }
+        }
+    }
+}
+
+// =============================================================================
+// OpenCL Dispatch Kernels — Extended Operations
+// =============================================================================
+
+#ifndef SECP256K1_CT_SIGN_KERNELS
+// Variable-time signing kernel — superseded by secp256k1_ct_extended.cl when
+// SECP256K1_CT_SIGN_KERNELS is defined. Do NOT dispatch on secret inputs.
+__kernel void ecdsa_sign(
+    __global const uchar* msg_hashes,       // n * 32 bytes
+    __global const Scalar* private_keys,
+    __global ECDSASignature* signatures,
+    __global int* success_flags,
+    const uint count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+
+    uchar msg[32];
+    for (int i = 0; i < 32; i++) msg[i] = msg_hashes[gid * 32 + i];
+
+    Scalar priv = private_keys[gid];
+    ECDSASignature sig;
+    success_flags[gid] = ecdsa_sign_impl(msg, &priv, &sig);
+    signatures[gid] = sig;
+}
+#endif /* SECP256K1_CT_SIGN_KERNELS */
+
+__kernel void ecdsa_verify(
+    __global const uchar* msg_hashes,
+    __global const JacobianPoint* pubkeys,
+    __global const ECDSASignature* signatures,
+    __global int* results,
+    const uint count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+
+    uchar msg[32];
+    for (int i = 0; i < 32; i++) msg[i] = msg_hashes[gid * 32 + i];
+
+    JacobianPoint pub = pubkeys[gid];
+    ECDSASignature sig = signatures[gid];
+    results[gid] = ecdsa_verify_impl(msg, &pub, &sig);
+}
+
+/* ecdsa_verify_compressed — GPU-side pubkey decompression variant.
+ * Takes 33-byte SEC1 compressed pubkeys directly (no CPU decompress).
+ * Decompresses in registers via lbtc_point_from_compressed → verify.
+ * Eliminates CPU sqrt+parity, host JacobianPoint buffer, and 3.2x PCIe data. */
+__kernel void ecdsa_verify_compressed(
+    __global const uchar* msg_hashes,
+    __global const uchar* pubkeys33,
+    __global const uchar* signatures,
+    __global int* results,
+    const uint count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+
+    uchar msg[32];
+    for (int i = 0; i < 32; i++) msg[i] = msg_hashes[gid * 32 + i];
+
+    JacobianPoint pub;
+    if (!lbtc_point_from_compressed(pubkeys33 + gid * 33, &pub)) {
+        results[gid] = 0;
+        return;
+    }
+
+    ECDSASignature sig;
+    int ok = lbtc_parse_compact_signature(signatures + gid * 64, &sig);
+    results[gid] = ok ? ecdsa_verify_impl(msg, &pub, &sig) : 0;
+}
+
+__kernel void ecdsa_verify_lbtc_rows(
+    __global const uchar* rows,
+    const ulong stride,
+    __global int* results,
+    const uint count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+
+    __global const uchar* row = rows + ((ulong)gid * stride);
+    uchar msg[32];
+    for (int i = 0; i < 32; ++i) msg[i] = row[i];
+
+    JacobianPoint pub;
+    ECDSASignature sig;
+    int ok = lbtc_point_from_compressed(row + 32, &pub) &&
+             lbtc_parse_opaque_signature(row + 65, &sig);
+    results[gid] = ok ? ecdsa_verify_impl(msg, &pub, &sig) : 0;
+}
+
+/* libbitcoin ECDSA COLUMN verify — Structure-of-Arrays sibling of
+ * ecdsa_verify_lbtc_rows. Three separate column spans; opaque-LE signature and
+ * 33-byte compressed pubkey parsed device-side. 64-bit (ulong) row offsets. */
+__kernel void ecdsa_verify_lbtc_columns(
+    __global const uchar* digests32,
+    __global const uchar* pubkeys33,
+    __global const uchar* sigs64,
+    __global int* results,
+    const uint count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+
+    uchar msg[32];
+    for (int i = 0; i < 32; ++i) msg[i] = digests32[(ulong)gid * 32 + i];
+
+    JacobianPoint pub;
+    ECDSASignature sig;
+    int ok = lbtc_point_from_compressed(pubkeys33 + (ulong)gid * 33, &pub) &&
+             lbtc_parse_opaque_signature(sigs64 + (ulong)gid * 64, &sig);
+    results[gid] = ok ? ecdsa_verify_impl(msg, &pub, &sig) : 0;
+}
+
+/* libbitcoin Schnorr COLUMN verify — digests32 | xonly32 | sigs64 (BIP-340).
+ * The BIP-340 signature is parsed device-side: r is the raw 32 big-endian R.x
+ * bytes; s is a big-endian scalar loaded into 4 little-endian limbs (identical to
+ * the host be32_to_le_limbs used by schnorr_verify_batch). 64-bit row offsets. */
+__kernel void schnorr_verify_lbtc_columns(
+    __global const uchar* digests32,
+    __global const uchar* xonly32,
+    __global const uchar* sigs64,
+    __global int* results,
+    const uint count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+
+    uchar pk[32], msg[32];
+    for (int i = 0; i < 32; ++i) {
+        pk[i]  = xonly32[(ulong)gid * 32 + i];
+        msg[i] = digests32[(ulong)gid * 32 + i];
+    }
+
+    SchnorrSignature sig;
+    const ulong base = (ulong)gid * 64;
+    for (int i = 0; i < 32; ++i) sig.r[i] = sigs64[base + i];
+    for (int limb = 0; limb < 4; ++limb) {
+        ulong v = 0;
+        const int b = 32 + (3 - limb) * 8;
+        for (int j = 0; j < 8; ++j) v = (v << 8) | (ulong)sigs64[base + b + j];
+        sig.s.limbs[limb] = v;
+    }
+    // BIP-340 strict: reject s == 0 and s >= n before verifying so the column
+    // verdict matches the CPU reference (SchnorrSignature::parse_strict). Without
+    // this, s' = s + n (>= n) maps to the same point as a valid s and would be a
+    // false-accept on GPU while the CPU rejects it (signature malleability).
+    if (scalar_is_zero(&sig.s) || lbtc_scalar_ge_order(&sig.s)) {
+        results[gid] = 0;
+        return;
+    }
+    results[gid] = schnorr_verify_impl(pk, msg, &sig);
+}
+
+/* libbitcoin ECDSA COLLECT verify — SoA sibling of ecdsa_verify_lbtc_columns
+ * with the collect output convention: key_cells is a 1-byte-per-row verdict
+ * channel PRE-SEEDED non-zero by the host. The verdict is bit-for-bit identical
+ * to ecdsa_verify_lbtc_columns; only the encoding differs. VALID  -> write 0.
+ * INVALID (bad parse OR failed verify) -> leave the caller's seed untouched so
+ * the rejected id survives (fail-closed collect contract). Never write non-zero. */
+__kernel void ecdsa_verify_lbtc_collect(
+    __global const uchar* digests32,
+    __global const uchar* pubkeys33,
+    __global const uchar* sigs64,
+    __global uchar* key_cells,
+    const uint count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+
+    uchar msg[32];
+    for (int i = 0; i < 32; ++i) msg[i] = digests32[(ulong)gid * 32 + i];
+
+    JacobianPoint pub;
+    ECDSASignature sig;
+    // COMPACT (big-endian r||s) — the collect ABI uses the SAME sig format as
+    // ufsecp_gpu_ecdsa_verify_batch (kernel ecdsa_verify_compressed parses via
+    // lbtc_parse_compact_signature) and the CUDA collect (bytes_to_ecdsa_sig over
+    // compact[64]). NOT lbtc_parse_opaque_signature (little-endian libbitcoin-
+    // columns format) — that mis-parses every row so no valid sig ever collects.
+    int ok = lbtc_point_from_compressed(pubkeys33 + (ulong)gid * 33, &pub) &&
+             lbtc_parse_compact_signature(sigs64 + (ulong)gid * 64, &sig);
+    if (ok && ecdsa_verify_impl(msg, &pub, &sig)) key_cells[gid] = 0u; /* valid->0; invalid-> leave seeded */
+}
+
+/* libbitcoin Schnorr COLLECT verify — SoA sibling of schnorr_verify_lbtc_columns
+ * with the collect output convention (see ecdsa_verify_lbtc_collect). The BIP-340
+ * strict-s reject leaves the seed (bare return), NOT a 0 write. VALID -> write 0. */
+__kernel void schnorr_verify_lbtc_collect(
+    __global const uchar* digests32,
+    __global const uchar* xonly32,
+    __global const uchar* sigs64,
+    __global uchar* key_cells,
+    const uint count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+
+    uchar pk[32], msg[32];
+    for (int i = 0; i < 32; ++i) {
+        pk[i]  = xonly32[(ulong)gid * 32 + i];
+        msg[i] = digests32[(ulong)gid * 32 + i];
+    }
+
+    SchnorrSignature sig;
+    const ulong base = (ulong)gid * 64;
+    for (int i = 0; i < 32; ++i) sig.r[i] = sigs64[base + i];
+    for (int limb = 0; limb < 4; ++limb) {
+        ulong v = 0;
+        const int b = 32 + (3 - limb) * 8;
+        for (int j = 0; j < 8; ++j) v = (v << 8) | (ulong)sigs64[base + b + j];
+        sig.s.limbs[limb] = v;
+    }
+    // BIP-340 strict: reject s == 0 and s >= n. For collect this is an INVALID
+    // verdict -> leave the caller's seed (bare return), never write 0.
+    if (scalar_is_zero(&sig.s) || lbtc_scalar_ge_order(&sig.s)) return; /* leave seeded */
+    if (schnorr_verify_impl(pk, msg, &sig)) key_cells[gid] = 0u; /* valid->0; invalid-> leave seeded */
+}
+
+/* ============================================================================
+ * libbitcoin-bridge PUBLIC-DATA GpuBackend ops — native OpenCL siblings of the
+ * CUDA lbtc_* kernels (gpu_backend_cuda.cu @715-779). One item per work-item,
+ * variable-time (all inputs are public: x-only / compressed pubkeys, taproot
+ * commitment tuples, tagged-hash messages, hash256 preimages — no secret).
+ * THREE parity invariants mirrored bit-for-bit from CUDA:
+ *   (1) x<p is an EXTERNAL gate (lbtc_be32_lt_field_p, __global) applied BEFORE
+ *       lift_x_impl (which only reduces mod p);
+ *   (2) tweak is a RAW scalar via scalar_from_bytes_impl (single conditional -n),
+ *       never rejected;
+ *   (3) tagged hash feeds tag_hash32 TWICE then the message (SHA256(th||th||msg));
+ *       tagged_hash_impl is NOT used (it re-hashes the tag).
+ * CL1.2 has no generic address space: __global input bytes are copied into
+ * private buffers before lift_x_impl / sha256_update, and sha256_final writes a
+ * private digest that is then copied to the __global out. results/out are
+ * __global uchar to match the CUDA uint8_t contract. ========================= */
+
+/* result[i] = 1 iff keys32[i] is a valid BIP-340 x-only key (x<p, even-y lift). */
+__kernel void lbtc_xonly_validate(
+    __global const uchar* keys32,
+    __global uchar* results,
+    const uint count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+    uchar x[32];
+    for (int i = 0; i < 32; ++i) x[i] = keys32[(ulong)gid * 32 + i];
+    JacobianPoint p;
+    results[gid] = (lbtc_be32_lt_field_p(keys32 + (ulong)gid * 32) &&
+                    lift_x_impl(x, &p)) ? 1 : 0;
+}
+
+/* result[i] = 1 iff prefix in {2,3}, x<p, and x lifts (on curve). Byte-matches
+ * CUDA lbtc_pubkey_validate_kernel: prefix parity is NOT re-checked vs lift. */
+__kernel void lbtc_pubkey_validate(
+    __global const uchar* pubkeys33,
+    __global uchar* results,
+    const uint count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+    __global const uchar* p = pubkeys33 + (ulong)gid * 33;
+    uchar pfx = p[0];
+    int ok = (pfx == 0x02 || pfx == 0x03) && lbtc_be32_lt_field_p(p + 1);
+    if (ok) {
+        uchar x[32];
+        for (int i = 0; i < 32; ++i) x[i] = p[1 + i];
+        JacobianPoint j;
+        ok = lift_x_impl(x, &j);
+    }
+    results[gid] = ok ? 1 : 0;
+}
+
+/* result[i] = 1 iff x(lift_x_even(internal_i) + tweak_i*G) == tweaked_x_i AND its
+ * y-parity == parity[i]. RAW tweak. Mirrors CUDA lbtc_commitment_kernel. */
+__kernel void lbtc_commitment_verify(
+    __global const uchar* internal_x32,
+    __global const uchar* tweak32,
+    __global const uchar* tweaked_x32,
+    __global const uchar* parity,
+    __global uchar* results,
+    const uint count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+    __global const uchar* ixp = internal_x32 + (ulong)gid * 32;
+    uchar ix[32];
+    for (int i = 0; i < 32; ++i) ix[i] = ixp[i];
+    JacobianPoint P;
+    if (!lbtc_be32_lt_field_p(ixp) || !lift_x_impl(ix, &P)) {  // even-y internal, x<p
+        results[gid] = 0;
+        return;
+    }
+    // lift_x_impl sets z=1, so the Jacobian coords are already affine.
+    AffinePoint Pa; Pa.x = P.x; Pa.y = P.y;
+    uchar tw[32];
+    for (int i = 0; i < 32; ++i) tw[i] = tweak32[(ulong)gid * 32 + i];
+    // Q = tweak*G + 1*P via the PROVEN Shamir path (same helper ecdsa_verify_impl
+    // uses for u1*G + u2*Q). scalar_mul_generator_impl+point_add_mixed_unchecked
+    // was avoided: point_add_mixed_unchecked mis-handles a mixed-add edge case for
+    // certain Jacobian Z (e.g. 4*G, 7*G came out wrong) while scalar_mul_generator
+    // itself is correct. shamir_double_mul_glv_impl is exercised by ecdsa verify.
+    Scalar u1; scalar_from_bytes_impl(tw, &u1);        // RAW tweak (single -n)
+    Scalar u2; u2.limbs[0] = 1; u2.limbs[1] = 0; u2.limbs[2] = 0; u2.limbs[3] = 0;  // scalar 1
+    AffinePoint Gaff; get_generator(&Gaff);
+    JacobianPoint Q;
+    shamir_double_mul_glv_impl(&Gaff, &u1, &Pa, &u2, &Q);   // tweak*G + P
+    if (point_is_infinity(&Q)) { results[gid] = 0; return; }
+    // Inline Jacobian -> affine (jacobian_to_affine_impl lives in secp256k1_zk.cl,
+    // which is NOT part of this translation unit); mirror ecdsa_verify_impl.
+    FieldElement zinv, z2, z3, ax, ay;
+    field_inv_impl(&zinv, &Q.z);
+    field_sqr_impl(&z2, &zinv);
+    field_mul_impl(&z3, &z2, &zinv);
+    field_mul_impl(&ax, &Q.x, &z2);
+    field_mul_impl(&ay, &Q.y, &z3);
+    uchar xb[32], yb[32];
+    field_to_bytes_impl(&ax, xb);
+    field_to_bytes_impl(&ay, yb);
+    uchar want = (parity[gid] != 0) ? 0x03 : 0x02;
+    uchar got  = (yb[31] & 1) ? 0x03 : 0x02;              // y-parity of x(Q)
+    uchar ok = (got == want) ? 1 : 0;
+    for (int j = 0; j < 32; ++j)
+        if (xb[j] != tweaked_x32[(ulong)gid * 32 + j]) ok = 0;   // x(Q)==tweaked_x
+    results[gid] = ok;
+}
+
+/* out[i] = SHA256(tag_hash32 || tag_hash32 || msgs[i]) over fixed-length msgs. */
+__kernel void lbtc_tagged_hash(
+    __global const uchar* tag_hash32,
+    __global const uchar* msgs,
+    const uint msg_len,
+    __global uchar* out32,
+    const uint count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+    uchar th[32];
+    for (int i = 0; i < 32; ++i) th[i] = tag_hash32[i];
+    uchar mbuf[256];
+    for (uint i = 0; i < msg_len; ++i) mbuf[i] = msgs[(ulong)gid * msg_len + i];
+    SHA256Ctx ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, th, 32);          // tag hash TWICE
+    sha256_update(&ctx, th, 32);
+    sha256_update(&ctx, mbuf, msg_len);
+    uchar h[32];
+    sha256_final(&ctx, h);
+    for (int i = 0; i < 32; ++i) out32[(ulong)gid * 32 + i] = h[i];
+}
+
+/* out[i] = SHA256(tag_hash32 || tag_hash32 || msgs[i][0..L)), L=msg_lens[i]
+ * clamped to 256 (silent, matches CUDA). msgs row stride is `stride`. */
+__kernel void lbtc_tagged_hash_var(
+    __global const uchar* tag_hash32,
+    __global const uchar* msgs,
+    __global const uint* msg_lens,
+    const uint stride,
+    __global uchar* out32,
+    const uint count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+    uint L = msg_lens[gid];
+    if (L > 256) L = 256;
+    uchar th[32];
+    for (int i = 0; i < 32; ++i) th[i] = tag_hash32[i];
+    uchar mbuf[256];
+    for (uint i = 0; i < L; ++i) mbuf[i] = msgs[(ulong)gid * stride + i];
+    SHA256Ctx ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, th, 32);
+    sha256_update(&ctx, th, 32);
+    sha256_update(&ctx, mbuf, L);
+    uchar h[32];
+    sha256_final(&ctx, h);
+    for (int i = 0; i < 32; ++i) out32[(ulong)gid * 32 + i] = h[i];
+}
+
+/* out[i] = SHA256(SHA256(inputs[i])) over fixed-length inputs (no tag prefix). */
+__kernel void lbtc_hash256(
+    __global const uchar* inputs,
+    const uint input_len,
+    __global uchar* out32,
+    const uint count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+    uchar in[320];
+    for (uint i = 0; i < input_len; ++i) in[i] = inputs[(ulong)gid * input_len + i];
+    uchar h1[32];
+    SHA256Ctx ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, in, input_len);
+    sha256_final(&ctx, h1);               // SHA256(input)
+    uchar h2[32];
+    SHA256Ctx ctx2;
+    sha256_init(&ctx2);
+    sha256_update(&ctx2, h1, 32);
+    sha256_final(&ctx2, h2);              // SHA256(SHA256(input))
+    for (int i = 0; i < 32; ++i) out32[(ulong)gid * 32 + i] = h2[i];
+}
+
+/* out[i] = SHA256(SHA256(row_i)), where row_i = inputs[i*stride .. i*stride+input_lens[i]).
+ * Generic batch variable-length double-SHA256: row i is read directly from
+ * __global memory via sha256_update_global (O(1) private scratch), so rows
+ * can be multi-MB (e.g. real Bitcoin transactions) unlike lbtc_hash256's
+ * fixed 320-byte cap above. Bytes beyond input_lens[i] up to stride are
+ * ignored padding. Public-data hashing only — no tag prefix, no tx parsing. */
+__kernel void lbtc_hash256_var(
+    __global const uchar* inputs,
+    __global const uint* input_lens,
+    const uint stride,
+    __global uchar* out32,
+    const uint count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+    uint len = input_lens[gid];
+    SHA256Ctx ctx;
+    sha256_init(&ctx);
+    sha256_update_global(&ctx, inputs + (ulong)gid * stride, len);
+    uchar h1[32];
+    sha256_final(&ctx, h1);               // SHA256(row)
+    SHA256Ctx ctx2;
+    sha256_init(&ctx2);
+    sha256_update(&ctx2, h1, 32);          // h1 is a private array; existing sha256_update is fine here
+    uchar h2[32];
+    sha256_final(&ctx2, h2);              // SHA256(SHA256(row))
+    for (int i = 0; i < 32; ++i) out32[(ulong)gid * 32 + i] = h2[i];
+}
+
+/* ecdh_scalar_mul_compressed — GPU-side pubkey decompress + scalar multiplication.
+ * Takes 33-byte SEC1 compressed pubkeys + private scalars.
+ * Decompresses pubkeys in registers, then multiplies by scalar.
+ * Used by ECDH batch path to eliminate CPU sqrt+parity. */
+__kernel void ecdh_scalar_mul_compressed(
+    __global const Scalar* scalars,
+    __global const uchar* pubkeys33,
+    __global JacobianPoint* results,
+    const uint count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+
+    Scalar k = scalars[gid];
+
+    // Decompress pubkey on GPU (33-byte SEC1 → JacobianPoint with z=1)
+    JacobianPoint pub;
+    if (!lbtc_point_from_compressed(pubkeys33 + gid * 33, &pub)) {
+        point_set_infinity(&pub);
+        results[gid] = pub;
+        return;
+    }
+
+    // Convert Jacobian (z=1) → AffinePoint for scalar_mul_glv_impl
+    AffinePoint aff;
+    aff.x = pub.x;
+    aff.y = pub.y;
+
+    JacobianPoint r;
+    scalar_mul_glv_impl(&r, &k, &aff);
+    results[gid] = r;
+}
+
+__kernel void ecrecover_batch(
+    __global const uchar* msg_hashes,
+    __global const ECDSASignature* signatures,
+    __global const int* recids,
+    __global JacobianPoint* pubkeys,
+    __global int* results,
+    const uint count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+
+    uchar msg[32];
+    for (int i = 0; i < 32; ++i) msg[i] = msg_hashes[gid * 32 + i];
+
+    ECDSASignature sig = signatures[gid];
+    JacobianPoint recovered;
+    int ok = ecdsa_recover_impl(msg, &sig, recids[gid], &recovered);
+    results[gid] = ok;
+    if (ok) {
+        pubkeys[gid] = recovered;
+    } else {
+        pubkeys[gid].x.limbs[0] = 0; pubkeys[gid].x.limbs[1] = 0;
+        pubkeys[gid].x.limbs[2] = 0; pubkeys[gid].x.limbs[3] = 0;
+        pubkeys[gid].y.limbs[0] = 1; pubkeys[gid].y.limbs[1] = 0;
+        pubkeys[gid].y.limbs[2] = 0; pubkeys[gid].y.limbs[3] = 0;
+        pubkeys[gid].z.limbs[0] = 0; pubkeys[gid].z.limbs[1] = 0;
+        pubkeys[gid].z.limbs[2] = 0; pubkeys[gid].z.limbs[3] = 0;
+        pubkeys[gid].infinity = 1;
+        for (int i = 0; i < 7; ++i) pubkeys[gid].pad[i] = 0;
+    }
+}
+
+#ifndef SECP256K1_CT_SIGN_KERNELS
+// Variable-time signing kernel — superseded by secp256k1_ct_extended.cl when
+// SECP256K1_CT_SIGN_KERNELS is defined. Do NOT dispatch on secret inputs.
+__kernel void schnorr_sign(
+    __global const uchar* messages,
+    __global const Scalar* private_keys,
+    __global const uchar* aux_rands,
+    __global SchnorrSignature* signatures,
+    __global int* success_flags,
+    const uint count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+
+    uchar msg[32], aux[32];
+    for (int i = 0; i < 32; i++) { msg[i] = messages[gid*32+i]; aux[i] = aux_rands[gid*32+i]; }
+
+    Scalar priv = private_keys[gid];
+    SchnorrSignature sig;
+    success_flags[gid] = schnorr_sign_impl(&priv, msg, aux, &sig);
+    signatures[gid] = sig;
+}
+#endif /* SECP256K1_CT_SIGN_KERNELS */
+
+__kernel void schnorr_verify(
+    __global const uchar* pubkeys_x,
+    __global const uchar* messages,
+    __global const SchnorrSignature* signatures,
+    __global int* results,
+    const uint count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+
+    uchar pk[32], msg[32];
+    for (int i = 0; i < 32; i++) { pk[i] = pubkeys_x[gid*32+i]; msg[i] = messages[gid*32+i]; }
+
+    SchnorrSignature sig = signatures[gid];
+    results[gid] = schnorr_verify_impl(pk, msg, &sig);
+}
+
+__kernel void generator_mul_windowed(
+    __global const Scalar* scalars,
+    __global JacobianPoint* results,
+    const uint count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+
+    Scalar k = scalars[gid];
+    JacobianPoint r;
+    scalar_mul_generator_windowed_impl(&r, &k);
+    results[gid] = r;
+}
+
+// =============================================================================
+// LAYER 6: ECDSA SNARK witness (eprint 2025/695) — foreign-field PLONK/Halo2
+// =============================================================================
+
+/** Flat 760-byte witness record.  Identical layout to the CPU and CUDA structs.
+ *  uchar = uint8, ulong = uint64, int = int32.
+ *  Total: 11×32 + 10×5×8 + 2×4 = 352 + 400 + 8 = 760 bytes.
+ */
+typedef struct {
+    /* -- 11 input/witness byte fields (32 bytes each) ---- */
+    uchar  msg[32];
+    uchar  sig_r[32];
+    uchar  sig_s[32];
+    uchar  pub_x[32];
+    uchar  pub_y[32];
+    uchar  s_inv[32];
+    uchar  u1[32];
+    uchar  u2[32];
+    uchar  result_x[32];
+    uchar  result_y[32];
+    uchar  result_x_mod_n[32];
+    /* -- 10×5 foreign-field limbs (5×52-bit, stored as ulong) ------------- */
+    ulong  lmb_sig_r[5];
+    ulong  lmb_sig_s[5];
+    ulong  lmb_pub_x[5];
+    ulong  lmb_pub_y[5];
+    ulong  lmb_s_inv[5];
+    ulong  lmb_u1[5];
+    ulong  lmb_u2[5];
+    ulong  lmb_result_x[5];
+    ulong  lmb_result_y[5];
+    ulong  lmb_result_x_mod_n[5];
+    /* -- validity + alignment ---------------------------------------------- */
+    int    valid;
+    int    _pad;
+} EcdsaSnarkWitnessFlatOCL;
+
+// Helper: Scalar (4×ulong LE limbs) → 5×52-bit foreign-field limbs.
+inline void scalar_to_ff_limbs_cl(const Scalar* s, ulong out[5]) {
+    const ulong MASK52 = (1UL << 52) - 1UL;
+    out[0] =  s->limbs[0]                                        & MASK52;
+    out[1] = ((s->limbs[0] >> 52) | (s->limbs[1] << 12))        & MASK52;
+    out[2] = ((s->limbs[1] >> 40) | (s->limbs[2] << 24))        & MASK52;
+    out[3] = ((s->limbs[2] >> 28) | (s->limbs[3] << 36))        & MASK52;
+    out[4] =   s->limbs[3] >> 16;
+}
+
+// Helper: 32 big-endian bytes → 5×52-bit foreign-field limbs.
+// Interprets BE bytes as 4×ulong LE, then 52-bit windowing.
+inline void be_bytes_to_ff_limbs_cl(const uchar be[32], ulong out[5]) {
+    ulong w[4];
+    for (int i = 0; i < 4; i++) {
+        ulong v = 0;
+        int base = (3 - i) * 8;
+        for (int b = 0; b < 8; b++)
+            v = (v << 8) | (ulong)be[base + b];
+        w[i] = v;
+    }
+    const ulong MASK52 = (1UL << 52) - 1UL;
+    out[0] =  w[0]                           & MASK52;
+    out[1] = ((w[0] >> 52) | (w[1] << 12))  & MASK52;
+    out[2] = ((w[1] >> 40) | (w[2] << 24))  & MASK52;
+    out[3] = ((w[2] >> 28) | (w[3] << 36))  & MASK52;
+    out[4] =   w[3] >> 16;
+}
+
+// Compute one ECDSA SNARK witness record into *out.
+// On any early-out failure, out->valid is left 0.
+inline void ecdsa_snark_witness_impl(
+    const uchar              msg_hash[32],
+    const JacobianPoint*     pubkey,
+    const ECDSASignature*    sig,
+    EcdsaSnarkWitnessFlatOCL* out)
+{
+    out->valid = 0;
+    out->_pad  = 0;
+
+    if (scalar_is_zero(&sig->r) || scalar_is_zero(&sig->s)) return;
+    if (point_is_infinity(pubkey)) return;
+
+    /* ---- input bytes ---- */
+    for (int i = 0; i < 32; i++) out->msg[i] = msg_hash[i];
+    scalar_to_bytes_impl(&sig->r, out->sig_r);
+    scalar_to_bytes_impl(&sig->s, out->sig_s);
+
+    /* ---- public key: Jacobian → affine ---- */
+    AffinePoint pub_aff;
+    if (pubkey->z.limbs[0] == 1UL && pubkey->z.limbs[1] == 0UL &&
+        pubkey->z.limbs[2] == 0UL && pubkey->z.limbs[3] == 0UL) {
+        pub_aff.x = pubkey->x;
+        pub_aff.y = pubkey->y;
+    } else {
+        FieldElement pz_inv, pz_inv2, pz_inv3;
+        field_inv_impl(&pz_inv,  &pubkey->z);
+        field_sqr_impl(&pz_inv2, &pz_inv);
+        field_mul_impl(&pz_inv3, &pz_inv2, &pz_inv);
+        field_mul_impl(&pub_aff.x, &pubkey->x, &pz_inv2);
+        field_mul_impl(&pub_aff.y, &pubkey->y, &pz_inv3);
+    }
+    field_to_bytes_impl(&pub_aff.x, out->pub_x);
+    field_to_bytes_impl(&pub_aff.y, out->pub_y);
+
+    /* ---- witness scalars ---- */
+    Scalar z;
+    scalar_from_bytes_impl(msg_hash, &z);
+
+    Scalar s_inv;
+    scalar_inverse_impl(&sig->s, &s_inv);
+    scalar_to_bytes_impl(&s_inv, out->s_inv);
+
+    Scalar u1, u2;
+    scalar_mul_mod_n_impl(&z,      &s_inv, &u1);
+    scalar_to_bytes_impl(&u1, out->u1);
+    scalar_mul_mod_n_impl(&sig->r, &s_inv, &u2);
+    scalar_to_bytes_impl(&u2, out->u2);
+
+    /* ---- R = u1·G + u2·Q using Shamir's trick ---- */
+    AffinePoint G;
+    get_generator(&G);
+
+    JacobianPoint R;
+    shamir_double_mul_glv_impl(&G, &u1, &pub_aff, &u2, &R);
+    if (point_is_infinity(&R)) return;
+
+    /* ---- R affine x, y ---- */
+    FieldElement rz_inv, rz_inv2, rz_inv3, rx_aff, ry_aff;
+    field_inv_impl(&rz_inv,  &R.z);
+    field_sqr_impl(&rz_inv2, &rz_inv);
+    field_mul_impl(&rz_inv3, &rz_inv2, &rz_inv);
+    field_mul_impl(&rx_aff,  &R.x,     &rz_inv2);
+    field_mul_impl(&ry_aff,  &R.y,     &rz_inv3);
+    field_to_bytes_impl(&rx_aff, out->result_x);
+    field_to_bytes_impl(&ry_aff, out->result_y);
+
+    /* ---- result_x mod n ---- */
+    Scalar v;
+    scalar_from_bytes_impl(out->result_x, &v);
+    scalar_to_bytes_impl(&v, out->result_x_mod_n);
+
+    /* ---- validity ---- */
+    out->valid = scalar_eq_impl(&v, &sig->r) ? 1 : 0;
+
+    /* ---- foreign-field limbs ---- */
+    scalar_to_ff_limbs_cl(&sig->r, out->lmb_sig_r);
+    scalar_to_ff_limbs_cl(&sig->s, out->lmb_sig_s);
+    be_bytes_to_ff_limbs_cl(out->pub_x, out->lmb_pub_x);
+    be_bytes_to_ff_limbs_cl(out->pub_y, out->lmb_pub_y);
+    scalar_to_ff_limbs_cl(&s_inv,   out->lmb_s_inv);
+    scalar_to_ff_limbs_cl(&u1,      out->lmb_u1);
+    scalar_to_ff_limbs_cl(&u2,      out->lmb_u2);
+    be_bytes_to_ff_limbs_cl(out->result_x,       out->lmb_result_x);
+    be_bytes_to_ff_limbs_cl(out->result_y,       out->lmb_result_y);
+    be_bytes_to_ff_limbs_cl(out->result_x_mod_n, out->lmb_result_x_mod_n);
+}
+
+// Kernel: one thread per (message, pubkey, sig) tuple.
+__kernel void ecdsa_snark_witness_batch(
+    __global const uchar*              msg_hashes,   // count × 32 bytes (BE SHA-256)
+    __global const JacobianPoint*      pubkeys,      // count × JacobianPoint (decompressed)
+    __global const ECDSASignature*     sigs,         // count × ECDSASignature {r, s}
+    __global EcdsaSnarkWitnessFlatOCL* out,          // count × 760-byte witness records
+    const uint                         count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+
+    uchar msg[32];
+    for (int i = 0; i < 32; i++) msg[i] = msg_hashes[gid * 32 + i];
+
+    JacobianPoint pub = pubkeys[gid];
+    ECDSASignature sig = sigs[gid];
+
+    EcdsaSnarkWitnessFlatOCL w;
+    ecdsa_snark_witness_impl(msg, &pub, &sig, &w);
+    out[gid] = w;
+}
+
+/* ecdsa_snark_witness_batch_compressed — GPU-side pubkey decompression variant */
+__kernel void ecdsa_snark_witness_batch_compressed(
+    __global const uchar*              msg_hashes,   // count × 32 bytes
+    __global const uchar*              pubkeys33,    // count × 33 bytes (SEC1 compressed)
+    __global const ECDSASignature*     sigs,
+    __global EcdsaSnarkWitnessFlatOCL* out,
+    const uint                         count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+
+    uchar msg[32];
+    for (int i = 0; i < 32; i++) msg[i] = msg_hashes[gid * 32 + i];
+
+    JacobianPoint pub;
+    if (!lbtc_point_from_compressed(pubkeys33 + gid * 33, &pub)) {
+        // Zero-fill output on failure (fail-closed)
+        EcdsaSnarkWitnessFlatOCL zero = {0};
+        out[gid] = zero;
+        return;
+    }
+
+    ECDSASignature sig = sigs[gid];
+    EcdsaSnarkWitnessFlatOCL w;
+    ecdsa_snark_witness_impl(msg, &pub, &sig, &w);
+    out[gid] = w;
+}
+
+// =============================================================================
+// LAYER 7: BIP-340 Schnorr SNARK witness (eprint 2025/695)
+// =============================================================================
+
+/** Flat 472-byte Schnorr SNARK witness record.
+ *  Total: 7×32 + 6×5×8 + 2×4 = 224 + 240 + 8 = 472 bytes.
+ */
+typedef struct {
+    uchar  msg[32];
+    uchar  sig_r[32];
+    uchar  sig_s[32];
+    uchar  pub_x[32];
+    uchar  r_y[32];
+    uchar  pub_y[32];
+    uchar  e[32];
+    ulong  lmb_sig_r[5];
+    ulong  lmb_sig_s[5];
+    ulong  lmb_pub_x[5];
+    ulong  lmb_r_y[5];
+    ulong  lmb_pub_y[5];
+    ulong  lmb_e[5];
+    int    valid;
+    int    _pad;
+} SchnorrSnarkWitnessFlatOCL;
+
+// Validate: be32 bytes represent value < p (secp256k1 field prime).
+// p = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+inline int schnorr_be32_lt_p(const uchar x[32]) {
+    const uchar P[32] = {
+        0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF,
+        0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF,
+        0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF,
+        0xFF,0xFF,0xFF,0xFE, 0xFF,0xFF,0xFC,0x2F
+    };
+    for (int i = 0; i < 32; i++) {
+        if (x[i] < P[i]) return 1;
+        if (x[i] > P[i]) return 0;
+    }
+    return 0;
+}
+
+// Validate: be32 bytes represent scalar s in [1, n-1].
+// n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+inline int schnorr_be32_is_nonzero_lt_n(const uchar s[32]) {
+    int all_zero = 1;
+    for (int i = 0; i < 32; i++) if (s[i] != 0) { all_zero = 0; break; }
+    if (all_zero) return 0;
+    const uchar N[32] = {
+        0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF,
+        0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFE,
+        0xBA,0xAE,0xDC,0xE6, 0xAF,0x48,0xA0,0x3B,
+        0xBF,0xD2,0x5E,0x8C, 0xD0,0x36,0x41,0x41
+    };
+    for (int i = 0; i < 32; i++) {
+        if (s[i] < N[i]) return 1;
+        if (s[i] > N[i]) return 0;
+    }
+    return 0;
+}
+
+// Compute one BIP-340 Schnorr SNARK witness record.
+// out->valid = 0 on any failure (invalid sig, x not on curve, etc.).
+inline void schnorr_snark_witness_impl(
+    const uchar               msg[32],
+    const uchar               pub_x_bytes[32],
+    const uchar               sig64[64],
+    SchnorrSnarkWitnessFlatOCL* out)
+{
+    out->valid = 0;
+    out->_pad  = 0;
+
+    // r must be a valid field element (< p); s must be in [1, n-1]
+    if (!schnorr_be32_lt_p(sig64))           return;
+    if (!schnorr_be32_is_nonzero_lt_n(sig64 + 32)) return;
+
+    SchnorrSignature sig;
+    for (int i = 0; i < 32; i++) sig.r[i] = sig64[i];
+    scalar_from_bytes_impl(sig64 + 32, &sig.s);
+
+    // Copy byte fields
+    for (int i = 0; i < 32; i++) out->msg[i]   = msg[i];
+    for (int i = 0; i < 32; i++) out->sig_r[i] = sig.r[i];
+    for (int i = 0; i < 32; i++) out->pub_x[i] = pub_x_bytes[i];
+    scalar_to_bytes_impl(&sig.s, out->sig_s);
+
+    // lift_x sets z=1, so .x and .y are already affine
+    JacobianPoint P;
+    if (!lift_x_impl(pub_x_bytes, &P)) return;
+    field_to_bytes_impl(&P.y, out->pub_y);
+
+    JacobianPoint R;
+    if (!lift_x_impl(sig.r, &R)) return;
+    field_to_bytes_impl(&R.y, out->r_y);
+
+    // e = tagged_hash("BIP0340/challenge", sig_r || pub_x || msg)
+    uchar challenge_in[96];
+    for (int i = 0; i < 32; i++) challenge_in[i]      = sig.r[i];
+    for (int i = 0; i < 32; i++) challenge_in[32 + i] = pub_x_bytes[i];
+    for (int i = 0; i < 32; i++) challenge_in[64 + i] = msg[i];
+    tagged_hash_fast_impl(BIP340_TAG_CHALLENGE, challenge_in, 96, out->e);
+
+    // 5×52-bit foreign-field limbs for all 6 values
+    be_bytes_to_ff_limbs_cl(out->sig_r, out->lmb_sig_r);
+    be_bytes_to_ff_limbs_cl(out->sig_s, out->lmb_sig_s);
+    be_bytes_to_ff_limbs_cl(out->pub_x, out->lmb_pub_x);
+    be_bytes_to_ff_limbs_cl(out->r_y,   out->lmb_r_y);
+    be_bytes_to_ff_limbs_cl(out->pub_y,  out->lmb_pub_y);
+    be_bytes_to_ff_limbs_cl(out->e,     out->lmb_e);
+
+    out->valid = 1;
+}
+
+// Kernel: one thread per (msg, pub_x, sig) tuple.
+__kernel void schnorr_snark_witness_batch(
+    __global const uchar*                  msgs32,      // count × 32 bytes
+    __global const uchar*                  pubkeys_x32, // count × 32 bytes (x-only)
+    __global const uchar*                  sigs64,      // count × 64 bytes (r||s)
+    __global SchnorrSnarkWitnessFlatOCL*   out,         // count × 472-byte records
+    const uint                             count
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+
+    uchar msg[32], pub_x[32], sig64[64];
+    for (int i = 0; i < 32; i++) msg[i]       = msgs32[gid * 32 + i];
+    for (int i = 0; i < 32; i++) pub_x[i]     = pubkeys_x32[gid * 32 + i];
+    for (int i = 0; i < 64; i++) sig64[i]     = sigs64[gid * 64 + i];
+
+    SchnorrSnarkWitnessFlatOCL w;
+    schnorr_snark_witness_impl(msg, pub_x, sig64, &w);
+    out[gid] = w;
+}

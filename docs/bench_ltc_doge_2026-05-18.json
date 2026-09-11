@@ -1,0 +1,161 @@
+{
+  "meta": {
+    "date": "2026-05-18",
+    "machine": "x86_64-linux-gnu",
+    "compiler": "g++-14 (Ubuntu 14.2.0-4ubuntu2~24.04.1)",
+    "cpu_turbo": "enabled (could not disable — no sudo)",
+    "cpu_governor": "powersave",
+    "cpu_pinning": "taskset -c 0 (LTC benchmarks)",
+    "note_ltc": "LTC benchmarks use bench_bitcoin native harness (IQR-trimmed median). min-time=3000ms.",
+    "note_doge": "DOGE benchmarks use older CSV harness (min/max/average over many iterations). No sign-specific bench in Dogecoin suite.",
+    "ltc_backend_ultrafast": "UltrafastSecp256k1 v4.0.0 via cmake/secp256k1.cmake SECP256K1_BACKEND=ultrafast, SECP256K1_CORE_BACKEND_MODE=ON",
+    "ltc_backend_bundled": "bitcoin-core/secp256k1 subtree (bundled)",
+    "doge_backend_ultrafast": "UltrafastSecp256k1 shim (combined libsecp256k1_combined.a = libfastsecp256k1.a + libsecp256k1_shim.a)",
+    "doge_backend_bundled": "bundled secp256k1 subtree compiled via autotools",
+    "cmake_build_type": "Release",
+    "cmake_flags": "-O2 -std=c++20 (LTC) / -O2 -std=c++11 (DOGE)",
+    "build_options": "ENABLE_IPC=OFF ENABLE_WALLET=OFF BUILD_TESTS=OFF BUILD_BENCH=ON"
+  },
+  "litecoin": {
+    "unit": "ns/op (ns/script for Verify benchmarks)",
+    "source": "bench_bitcoin -filter=... -min-time=3000",
+    "benchmarks": {
+      "SignSchnorrWithMerkleRoot": {
+        "bundled_ns": 65612.97,
+        "ultra_ns":   55584.67,
+        "speedup":    1.180,
+        "note": "Schnorr sign with full tapscript merkle root. ~18% faster."
+      },
+      "SignSchnorrWithNullMerkleRoot": {
+        "bundled_ns": 63753.84,
+        "ultra_ns":   53700.72,
+        "speedup":    1.187,
+        "note": "Schnorr sign without merkle root (keypath spend). ~19% faster."
+      },
+      "SignTransactionECDSA": {
+        "bundled_ns": 111515.63,
+        "ultra_ns":   93644.96,
+        "speedup":    1.191,
+        "note": "Full ECDSA transaction signing. ~19% faster."
+      },
+      "SignTransactionSchnorr": {
+        "bundled_ns": 78270.36,
+        "ultra_ns":   80129.61,
+        "speedup":    0.977,
+        "note": "Full Schnorr tx sign with key tweaking. Within noise (overlapping ranges). C++11→C++20 shim overhead."
+      },
+      "VerifyScriptP2TR_KeyPath": {
+        "bundled_ns": 26127.93,
+        "ultra_ns":   27613.18,
+        "speedup":    0.946,
+        "note": "P2TR keypath verification. Slight regression (~5%). Verify uses variable-time wNAF in both — overhead from larger .text competing for I-cache."
+      },
+      "VerifyScriptP2TR_ScriptPath": {
+        "bundled_ns": 47831.88,
+        "ultra_ns":   45229.17,
+        "speedup":    1.058,
+        "note": "P2TR scriptpath verify. ~6% faster."
+      },
+      "VerifyScriptP2WPKH": {
+        "bundled_ns": 26194.53,
+        "ultra_ns":   30037.85,
+        "speedup":    0.872,
+        "note": "P2WPKH verify. Regression ~13%. Larger .text / I-cache pressure without LTO. LTO expected to close this gap."
+      },
+      "BIP324_ECDH": {
+        "bundled_ns": 28434.43,
+        "ultra_ns":   28613.49,
+        "speedup":    0.994,
+        "note": "BIP-324 X-only ECDH. Statistically identical (within noise)."
+      },
+      "AssembleBlock": {
+        "bundled_ns": 133180.55,
+        "ultra_ns":   131657.68,
+        "speedup":    1.012,
+        "note": "Block assembly (no secp hotpath). Statistically identical."
+      }
+    }
+  },
+  "dogecoin": {
+    "unit": "microseconds (average per operation from CSV harness)",
+    "source": "bench/bench_dogecoin (full run, no filter — no sign-specific bench in suite)",
+    "note": "Dogecoin benchmark suite does not include Sign or ECDSA benchmarks. Comparison covers hashing, bloom, mempool, script utils.",
+    "benchmarks": {
+      "Base58CheckEncode": {
+        "bundled_us": 1.953079391,
+        "ultra_us":   1.975500254,
+        "speedup":    0.989
+      },
+      "Base58Decode": {
+        "bundled_us": 0.561245542,
+        "ultra_us":   0.547917028,
+        "speedup":    1.024
+      },
+      "Base58Encode": {
+        "bundled_us": 1.233941685,
+        "ultra_us":   1.254789822,
+        "speedup":    0.983
+      },
+      "CCheckQueueSpeed": {
+        "bundled_us": 255.322025623,
+        "ultra_us":   267.622185250,
+        "speedup":    0.954
+      },
+      "CCheckQueueSpeedPrevectorJob": {
+        "bundled_us": 879.156299763,
+        "ultra_us":   904.300353593,
+        "speedup":    0.972
+      },
+      "CCoinsCaching": {
+        "bundled_us": 4.280367284,
+        "ultra_us":   4.253653848,
+        "speedup":    1.006
+      },
+      "MempoolEviction": {
+        "bundled_us": 14.250609739,
+        "ultra_us":   13.437424786,
+        "speedup":    1.061
+      },
+      "RIPEMD160": {
+        "bundled_us": 1579.914242029,
+        "ultra_us":   1598.084717989,
+        "speedup":    0.989
+      },
+      "RollingBloom": {
+        "bundled_us": 0.324824668,
+        "ultra_us":   0.324828837,
+        "speedup":    1.000
+      },
+      "SHA256": {
+        "bundled_us": 2406.444687110,
+        "ultra_us":   2552.651442014,
+        "speedup":    0.943
+      },
+      "SHA256_32b": {
+        "bundled_us": 163341.224193573,
+        "ultra_us":   168139.815330505,
+        "speedup":    0.971
+      },
+      "Scrypt": {
+        "bundled_us": 172.641749183,
+        "ultra_us":   168.076173092,
+        "speedup":    1.027
+      },
+      "SipHash_32b": {
+        "bundled_us": 18384.890896933,
+        "ultra_us":   18483.694110598,
+        "speedup":    0.995
+      }
+    }
+  },
+  "build_issues_notes": [
+    "LTC: cmake/secp256k1.cmake missing no-op add_secp256k1() stub for ultrafast branch — fixed inline.",
+    "LTC: Cap'n Proto missing — resolved with -DENABLE_IPC=OFF.",
+    "DOGE: boost_filesystem/.so not installed system-wide — resolved by downloading debs without root and extracting to /tmp/boost_pkgs/extracted.",
+    "DOGE: Makefile.am hardcoded LIBSECP256K1=secp256k1/libsecp256k1.la — patched with USE_ULTRAFAST_SECP256K1 conditional.",
+    "DOGE: configure.ac missing AC_SUBST([SECP256K1_LIBS]) — added.",
+    "DOGE: contrib/ultrafast-secp256k1/build.sh copies only thin shim .a (1 object) but fastsecp256k1.a contains all 61 objects — created libsecp256k1_combined.a merging both archives.",
+    "DOGE: boost 1.63 in depends/ fails to build with GCC 14 (implicit function declarations treated as errors) — skipped depends, used extracted system debs instead.",
+    "No sign-specific benchmark exists in Dogecoin's bench suite — secp256k1 is only exercised indirectly via key operations in CCheckQueueSpeed."
+  ]
+}

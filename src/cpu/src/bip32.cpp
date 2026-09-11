@@ -1,0 +1,575 @@
+// ============================================================================
+// BIP-32: Hierarchical Deterministic Key Derivation
+// ============================================================================
+
+#include "secp256k1/bip32.hpp"
+#include "secp256k1/sha256.hpp"
+#include "secp256k1/sha512.hpp"
+#include "secp256k1/ct/point.hpp"
+#include "secp256k1/ct/scalar.hpp"
+#include "secp256k1/detail/secure_erase.hpp"
+#include <cstring>
+#include <cctype>
+
+namespace secp256k1 {
+
+using fast::Scalar;
+using fast::Point;
+
+// -- HMAC-SHA512 --------------------------------------------------------------
+
+std::array<std::uint8_t, 64> hmac_sha512(const uint8_t* key, std::size_t key_len,
+                                          const uint8_t* data, std::size_t data_len) {
+    uint8_t k_buf[128]{};
+
+    if (key_len > 128) {
+        auto h = SHA512::hash(key, key_len);
+        std::memcpy(k_buf, h.data(), 64);
+    } else {
+        std::memcpy(k_buf, key, key_len);
+    }
+
+    uint8_t ipad[128], opad[128];
+    for (int i = 0; i < 128; ++i) {
+        ipad[i] = k_buf[i] ^ 0x36;
+        opad[i] = k_buf[i] ^ 0x5c;
+    }
+
+    // inner = SHA512(ipad || data)
+    SHA512 inner;
+    inner.update(ipad, 128);
+    inner.update(data, data_len);
+    auto inner_hash = inner.finalize();
+
+    // outer = SHA512(opad || inner_hash)
+    SHA512 outer;
+    outer.update(opad, 128);
+    outer.update(inner_hash.data(), 64);
+    auto result = outer.finalize();
+    detail::secure_erase(k_buf, sizeof(k_buf));
+    detail::secure_erase(ipad, sizeof(ipad));
+    detail::secure_erase(opad, sizeof(opad));
+    // RED-TEAM-010: erase inner_hash — derived from secret key material in BIP-32 hardened paths.
+    detail::secure_erase(inner_hash.data(), inner_hash.size());
+    return result;
+}
+
+// -- RIPEMD-160 (minimal) -----------------------------------------------------
+// Needed for HASH160 = RIPEMD160(SHA256(data))
+
+namespace {
+
+class RIPEMD160 {
+public:
+    static std::array<uint8_t, 20> hash(const void* data, std::size_t len) {
+        RIPEMD160 ctx;
+        ctx.update(static_cast<const uint8_t*>(data), len);
+        return ctx.finalize();
+    }
+
+private:
+    uint32_t h_[5];
+    uint64_t total_;
+    uint8_t buf_[64];
+    size_t buf_len_;
+
+    RIPEMD160() : buf_{} {
+        h_[0] = 0x67452301u; h_[1] = 0xEFCDAB89u;
+        h_[2] = 0x98BADCFEu; h_[3] = 0x10325476u;
+        h_[4] = 0xC3D2E1F0u;
+        total_ = 0;
+        buf_len_ = 0;
+    }
+
+    void update(const uint8_t* data, size_t len) {
+        total_ += len;
+        if (buf_len_ > 0) {
+            size_t const fill = 64 - buf_len_;
+            if (len < fill) {
+                std::memcpy(buf_ + buf_len_, data, len);
+                buf_len_ += len;
+                return;
+            }
+            std::memcpy(buf_ + buf_len_, data, fill);
+            compress(buf_);
+            data += fill;
+            len -= fill;
+            buf_len_ = 0;
+        }
+        while (len >= 64) {
+            compress(data);
+            data += 64;
+            len -= 64;
+        }
+        if (len > 0) {
+            std::memcpy(buf_, data, len);
+            buf_len_ = len;
+        }
+    }
+
+    std::array<uint8_t, 20> finalize() {
+        uint64_t const bit_len = total_ * 8;
+        uint8_t const pad = 0x80;
+        update(&pad, 1);
+        while (buf_len_ != 56) {
+            uint8_t const z = 0;
+            update(&z, 1);
+        }
+        uint8_t len_buf[8];
+        for (std::size_t i = 0; i < 8; ++i) {
+            len_buf[i] = static_cast<uint8_t>(bit_len >> (i * 8));
+}
+        update(len_buf, 8);
+
+        std::array<uint8_t, 20> d{};
+        for (std::size_t i = 0; i < 5; ++i) {
+            d[i * 4 + 0] = static_cast<uint8_t>(h_[i]);
+            d[i * 4 + 1] = static_cast<uint8_t>(h_[i] >> 8);
+            d[i * 4 + 2] = static_cast<uint8_t>(h_[i] >> 16);
+            d[i * 4 + 3] = static_cast<uint8_t>(h_[i] >> 24);
+        }
+        return d;
+    }
+
+    static uint32_t rotl(uint32_t x, unsigned n) { return (x << n) | (x >> (32 - n)); }
+
+    static uint32_t f(unsigned j, uint32_t x, uint32_t y, uint32_t z) {
+        if (j < 16) {      return x ^ y ^ z;
+        } else if (j < 32) { return (x & y) | (~x & z);
+        } else if (j < 48) { return (x | ~y) ^ z;
+        } else if (j < 64) { return (x & z) | (y & ~z);
+        } else {              return x ^ (y | ~z);
+}
+    }
+
+    static uint32_t K_left(unsigned j) {
+        if (j < 16) {      return 0x00000000u;
+        } else if (j < 32) { return 0x5A827999u;
+        } else if (j < 48) { return 0x6ED9EBA1u;
+        } else if (j < 64) { return 0x8F1BBCDCu;
+        } else {              return 0xA953FD4Eu;
+}
+    }
+
+    static uint32_t K_right(unsigned j) {
+        if (j < 16) {      return 0x50A28BE6u;
+        } else if (j < 32) { return 0x5C4DD124u;
+        } else if (j < 48) { return 0x6D703EF3u;
+        } else if (j < 64) { return 0x7A6D76E9u;
+        } else {              return 0x00000000u;
+}
+    }
+
+    void compress(const uint8_t* block) {
+        static constexpr uint8_t RL[80] = {
+            0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+            7,4,13,1,10,6,15,3,12,0,9,5,2,14,11,8,
+            3,10,14,4,9,15,8,1,2,7,0,6,13,11,5,12,
+            1,9,11,10,0,8,12,4,13,3,7,15,14,5,6,2,
+            4,0,5,9,7,12,2,10,14,1,3,8,11,6,15,13
+        };
+        static constexpr uint8_t RR[80] = {
+            5,14,7,0,9,2,11,4,13,6,15,8,1,10,3,12,
+            6,11,3,7,0,13,5,10,14,15,8,12,4,9,1,2,
+            15,5,1,3,7,14,6,9,11,8,12,2,10,0,4,13,
+            8,6,4,1,3,11,15,0,5,12,2,13,9,7,10,14,
+            12,15,10,4,1,5,8,7,6,2,13,14,0,3,9,11
+        };
+        static constexpr uint8_t SL[80] = {
+            11,14,15,12,5,8,7,9,11,13,14,15,6,7,9,8,
+            7,6,8,13,11,9,7,15,7,12,15,9,11,7,13,12,
+            11,13,6,7,14,9,13,15,14,8,13,6,5,12,7,5,
+            11,12,14,15,14,15,9,8,9,14,5,6,8,6,5,12,
+            9,15,5,11,6,8,13,12,5,12,13,14,11,8,5,6
+        };
+        static constexpr uint8_t SR[80] = {
+            8,9,9,11,13,15,15,5,7,7,8,11,14,14,12,6,
+            9,13,15,7,12,8,9,11,7,7,12,7,6,15,13,11,
+            9,7,15,11,8,6,6,14,12,13,5,14,13,13,7,5,
+            15,5,8,11,14,14,6,14,6,9,12,9,12,5,15,8,
+            8,5,12,9,12,5,14,6,8,13,6,5,15,13,11,11
+        };
+
+        uint32_t X[16];
+        for (int i = 0; i < 16; ++i) {
+            auto const idx = static_cast<std::size_t>(i) * 4;
+            X[i] = static_cast<uint32_t>(block[idx]) |
+                   (static_cast<uint32_t>(block[idx + 1]) << 8) |
+                   (static_cast<uint32_t>(block[idx + 2]) << 16) |
+                   (static_cast<uint32_t>(block[idx + 3]) << 24);
+        }
+
+        uint32_t al = h_[0], bl = h_[1], cl = h_[2], dl = h_[3], el = h_[4];
+        uint32_t ar = h_[0], br = h_[1], cr = h_[2], dr = h_[3], er = h_[4];
+
+        for (unsigned j = 0; j < 80; ++j) {
+            uint32_t const tl = rotl(al + f(j, bl, cl, dl) + X[RL[j]] + K_left(j), SL[j]) + el;
+            al = el; el = dl; dl = rotl(cl, 10); cl = bl; bl = tl;
+
+            uint32_t const tr = rotl(ar + f(79 - j, br, cr, dr) + X[RR[j]] + K_right(j), SR[j]) + er;
+            ar = er; er = dr; dr = rotl(cr, 10); cr = br; br = tr;
+        }
+
+        uint32_t const t = h_[1] + cl + dr;
+        h_[1] = h_[2] + dl + er;
+        h_[2] = h_[3] + el + ar;
+        h_[3] = h_[4] + al + br;
+        h_[4] = h_[0] + bl + cr;
+        h_[0] = t;
+    }
+};
+
+// HASH160 = RIPEMD160(SHA256(data))
+std::array<uint8_t, 20> hash160(const void* data, std::size_t len) {
+    auto sha = SHA256::hash(data, len);
+    return RIPEMD160::hash(sha.data(), 32);
+}
+
+} // anonymous namespace
+
+// -- ExtendedKey --------------------------------------------------------------
+
+fast::Point ExtendedKey::public_key() const {
+    if (is_private) {
+        // Strict: reject key >= n or == 0 (Rule 11). from_bytes would silently
+        // reduce mod n, masking a corrupted key as a valid (wrong) scalar.
+        Scalar sk{};
+        if (!Scalar::parse_bytes_strict_nonzero(key, sk)) {
+            detail::secure_erase(&sk, sizeof(sk));
+            return Point::infinity();
+        }
+        auto pub = ct::generator_mul(sk);
+        detail::secure_erase(&sk, sizeof(sk));
+        return pub;
+    }
+    // Public key: decompress from pub_prefix + key (x-coordinate)
+    // y^2 = x^3 + 7, then pick y matching parity
+    // Strict: reject x >= p
+    fast::FieldElement x;
+    if (!fast::FieldElement::parse_bytes_strict(key, x)) {
+        return Point::infinity();
+    }
+    auto x2 = x * x;
+    auto x3 = x2 * x;
+    auto seven = fast::FieldElement::from_uint64(7);
+    auto y2 = x3 + seven;
+    auto y = y2.sqrt();
+    // Verify sqrt: y^2 must equal y2 (reject if x not on curve)
+    if (y * y != y2) {
+        return Point::infinity();
+    }
+    // Check parity: prefix 0x02 = even y, 0x03 = odd y
+    bool const y_is_odd = (y.limbs()[0] & 1) != 0;
+    bool const need_odd = (pub_prefix == 0x03);
+    if (y_is_odd != need_odd) {
+        y = y.negate();
+    }
+    return Point::from_affine(x, y);
+}
+
+fast::Scalar ExtendedKey::private_key() const {
+    // Strict: reject keys >= n or == 0. A valid BIP-32 private key is always in [1, n).
+    // from_bytes() would silently reduce mod n, masking a corrupted key.
+    Scalar sk{};
+    if (!Scalar::parse_bytes_strict_nonzero(key, sk)) {
+        // Return a zero scalar on invalid key — callers must check is_private and
+        // validate the key before calling private_key(). A zero scalar here will
+        // produce the identity point if used for signing, which CT signing detects
+        // as a degenerate case and returns an error.
+        return Scalar{};
+    }
+    return sk;
+}
+
+ExtendedKey ExtendedKey::to_public() const {
+    if (!is_private) return *this;
+
+    ExtendedKey pub{};
+    auto pk = public_key();
+    auto compressed = pk.to_compressed();
+    // Store prefix (0x02 or 0x03) and x-coordinate separately
+    pub.pub_prefix = compressed[0];
+    auto x_bytes = pk.x().to_bytes();
+    pub.key = x_bytes;
+    pub.chain_code = chain_code;
+    pub.depth = depth;
+    pub.child_number = child_number;
+    pub.parent_fingerprint = parent_fingerprint;
+    pub.is_private = false;
+    return pub;
+}
+
+std::array<uint8_t, 4> ExtendedKey::fingerprint() const {
+    auto pk = public_key();
+    auto compressed = pk.to_compressed();
+    auto h = hash160(compressed.data(), 33);
+    std::array<uint8_t, 4> fp{};
+    std::memcpy(fp.data(), h.data(), 4);
+    return fp;
+}
+
+// file-local helper: compute fingerprint from a pre-computed compressed public key
+static std::array<uint8_t, 4> fingerprint_from_compressed(const std::array<uint8_t, 33>& comp) {
+    auto h = hash160(comp.data(), 33);
+    std::array<uint8_t, 4> fp{};
+    std::memcpy(fp.data(), h.data(), 4);
+    return fp;
+}
+
+std::array<uint8_t, 78> ExtendedKey::serialize() const {
+    std::array<uint8_t, 78> out{};
+    // Version bytes
+    uint32_t const version = is_private ? 0x0488ADE4u : 0x0488B21Eu;  // xprv / xpub
+    out[0] = static_cast<uint8_t>(version >> 24);
+    out[1] = static_cast<uint8_t>(version >> 16);
+    out[2] = static_cast<uint8_t>(version >> 8);
+    out[3] = static_cast<uint8_t>(version);
+    out[4] = depth;
+    std::memcpy(out.data() + 5, parent_fingerprint.data(), 4);
+    out[9] = static_cast<uint8_t>(child_number >> 24);
+    out[10] = static_cast<uint8_t>(child_number >> 16);
+    out[11] = static_cast<uint8_t>(child_number >> 8);
+    out[12] = static_cast<uint8_t>(child_number);
+    std::memcpy(out.data() + 13, chain_code.data(), 32);
+
+    if (is_private) {
+        out[45] = 0x00;
+        std::memcpy(out.data() + 46, key.data(), 32);
+    } else {
+        // Reconstruct compressed pubkey from prefix + x-coordinate
+        out[45] = pub_prefix;
+        std::memcpy(out.data() + 46, key.data(), 32);
+    }
+    return out;
+}
+
+std::pair<ExtendedKey, bool> ExtendedKey::derive_child(uint32_t index) const {
+    bool const hardened = (index & 0x80000000u) != 0;
+
+    // Hardened derivation requires private key
+    if (hardened && !is_private) {
+        return {ExtendedKey{}, false};
+    }
+
+    // Data = [compressed_pubkey(33) || index(4)] for normal
+    // Data = [0x00 || private_key(32) || index(4)] for hardened
+    //
+    // Compute parent public key once: reused for HMAC data (non-hardened),
+    // fingerprint (all cases), and parent point in public-key child derivation.
+    auto parent_pk   = public_key();
+    auto parent_comp = parent_pk.to_compressed();
+    uint8_t data[37];
+    if (hardened) {
+        data[0] = 0x00;
+        std::memcpy(data + 1, key.data(), 32);
+    } else {
+        std::memcpy(data, parent_comp.data(), 33);
+    }
+    // Append index (big-endian)
+    data[33] = static_cast<uint8_t>(index >> 24);
+    data[34] = static_cast<uint8_t>(index >> 16);
+    data[35] = static_cast<uint8_t>(index >> 8);
+    data[36] = static_cast<uint8_t>(index);
+
+    // Both hardened (0x00||key||index) and normal (pubkey||index) are 37 bytes
+    auto I = hmac_sha512(chain_code.data(), 32, data, 37);
+
+    detail::secure_erase(data, sizeof(data));
+
+    std::array<uint8_t, 32> IL{}, IR{};
+    std::memcpy(IL.data(), I.data(), 32);
+    std::memcpy(IR.data(), I.data() + 32, 32);
+
+    auto il_scalar = Scalar{};
+    // BIP-32: IL must be < curve order n; reject (skip to next index) if >= n
+    if (!Scalar::parse_bytes_strict(IL, il_scalar)) {
+        // CT-02: IL/I and il_scalar are HMAC images of the parent private key on
+        // hardened paths (data = 0x00 || private_key || index) — erase on this
+        // early return too (was previously skipped).
+        detail::secure_erase(I.data(), I.size());
+        detail::secure_erase(IL.data(), IL.size());
+        detail::secure_erase(&il_scalar, sizeof(il_scalar));
+        return {ExtendedKey{}, false};
+    }
+    // Also reject zero — use is_zero_ct() because il_scalar is HMAC-derived from
+    // the private key on hardened paths (data = 0x00 || private_key || index).
+    // is_zero() has a data-dependent branch; is_zero_ct() is branchless.
+    // Probability of IL==0 is ~2^-256 but the CT discipline must be maintained.
+    if (il_scalar.is_zero_ct()) {
+        detail::secure_erase(I.data(), I.size());        // CT-02
+        detail::secure_erase(IL.data(), IL.size());
+        detail::secure_erase(&il_scalar, sizeof(il_scalar));
+        return {ExtendedKey{}, false};
+    }
+
+    ExtendedKey child{};
+    child.chain_code = IR;
+    // Guard: BIP-32 depth is uint8_t (max 255).  depth + 1 would silently wrap
+    // to 0, producing a child at depth 0 with a wrong parent fingerprint.
+    if (depth == 0xFFu) {
+        detail::secure_erase(I.data(), I.size());
+        detail::secure_erase(IL.data(), IL.size());
+        detail::secure_erase(&il_scalar, sizeof(il_scalar));   // CT-02
+        return {ExtendedKey{}, false};
+    }
+    child.depth = static_cast<uint8_t>(depth + 1);
+    child.child_number = index;
+    child.parent_fingerprint = fingerprint_from_compressed(parent_comp);
+
+    if (is_private) {
+        // child_key = (IL + parent_key) mod n — CT: both scalars are secret
+        // Strict parse rejects key >= n or key == 0 (guards against corrupted ExtendedKey).
+        Scalar parent_scalar{};
+        if (!Scalar::parse_bytes_strict_nonzero(key, parent_scalar)) {
+            detail::secure_erase(I.data(), I.size());
+            detail::secure_erase(IL.data(), IL.size());
+            detail::secure_erase(&il_scalar, sizeof(il_scalar));   // CT-02
+            detail::secure_erase(&parent_scalar, sizeof(parent_scalar));
+            return {ExtendedKey{}, false};
+        }
+        auto child_scalar = ct::scalar_add(il_scalar, parent_scalar);
+        detail::secure_erase(&parent_scalar, sizeof(parent_scalar));
+        // v9 RT-007 / TASK-022: use the constant-time zero predicate on the
+        // secret-derived child scalar. is_zero() would have a data-dependent
+        // branch leaking whether the (extremely unlikely, ~2^-256) wraparound
+        // (IL + parent_key) mod n == 0 case occurred — a probabilistic signal
+        // an attacker could correlate across many sessions.
+        if (child_scalar.is_zero_ct()) {
+            detail::secure_erase(&child_scalar, sizeof(child_scalar));
+            detail::secure_erase(I.data(), I.size());
+            detail::secure_erase(IL.data(), IL.size());
+            detail::secure_erase(&il_scalar, sizeof(il_scalar));   // CT-02
+            return {ExtendedKey{}, false};
+        }
+        child.key = child_scalar.to_bytes();
+        // Erase child_scalar from stack: child private key must not linger
+        // in memory after serialization into child.key (stack-scrubbing defence).
+        detail::secure_erase(&child_scalar, sizeof(child_scalar));
+        child.is_private = true;
+    } else {
+        // child_key = point(IL) + parent_pubkey  (comb-based: 3-5x faster)
+        auto IL_point = ct::generator_mul(il_scalar);
+        const auto& parent_point = parent_pk;
+        auto child_point = IL_point.add(parent_point);
+        if (child_point.is_infinity()) {
+            detail::secure_erase(I.data(), I.size());
+            detail::secure_erase(IL.data(), IL.size());
+            detail::secure_erase(&il_scalar, sizeof(il_scalar));   // CT-02
+            return {ExtendedKey{}, false};
+        }
+        auto compressed = child_point.to_compressed();
+        child.pub_prefix = compressed[0];
+        child.key = child_point.x().to_bytes();
+        child.is_private = false;
+    }
+
+    detail::secure_erase(I.data(), I.size());
+    detail::secure_erase(IL.data(), IL.size());
+    detail::secure_erase(&il_scalar, sizeof(il_scalar));   // CT-02
+
+    return {child, true};
+}
+
+// -- Master Key ---------------------------------------------------------------
+
+std::pair<ExtendedKey, bool> bip32_master_key(const uint8_t* seed, std::size_t seed_len) {
+    if (seed_len < 16 || seed_len > 64) return {ExtendedKey{}, false};
+
+    // I = HMAC-SHA512(Key="Bitcoin seed", Data=Seed)
+    const char* hmac_key = "Bitcoin seed";
+    auto I = hmac_sha512(reinterpret_cast<const uint8_t*>(hmac_key), 12,
+                          seed, seed_len);
+
+    std::array<uint8_t, 32> IL{}, IR{};
+    std::memcpy(IL.data(), I.data(), 32);
+    std::memcpy(IR.data(), I.data() + 32, 32);
+
+    auto master_key = Scalar{};
+    // BIP-32: IL must be < curve order n AND non-zero; parse_bytes_strict_nonzero
+    // combines both checks in one call (SEC-010: was two separate calls, second
+    // used variable-time is_zero() which could leak via timing on marginal hardware).
+    if (!Scalar::parse_bytes_strict_nonzero(IL, master_key)) {
+        detail::secure_erase(I.data(), I.size());
+        detail::secure_erase(IL.data(), IL.size());
+        detail::secure_erase(IR.data(), IR.size());
+        detail::secure_erase(&master_key, sizeof(master_key));
+        return {ExtendedKey{}, false};
+    }
+
+    ExtendedKey ext{};
+    auto master_bytes = master_key.to_bytes();
+    ext.key = master_bytes;
+    ext.chain_code = IR;
+    ext.depth = 0;
+    ext.child_number = 0;
+    ext.parent_fingerprint = {0, 0, 0, 0};
+    ext.is_private = true;
+
+    detail::secure_erase(I.data(), I.size());
+    detail::secure_erase(IL.data(), IL.size());
+    detail::secure_erase(IR.data(), IR.size());
+    detail::secure_erase(master_bytes.data(), master_bytes.size());
+    detail::secure_erase(&master_key, sizeof(master_key));
+
+    return {ext, true};
+}
+
+// -- Path Derivation ----------------------------------------------------------
+
+std::pair<ExtendedKey, bool> bip32_derive_path(const ExtendedKey& master,
+                                                const std::string& path) {
+    // Format: "m/44'/0'/0'/0/0"
+    if (path.empty() || path[0] != 'm') return {ExtendedKey{}, false};
+    if (path.size() == 1) return {master, true};
+
+    ExtendedKey current = master;
+    std::size_t pos = 1; // skip 'm'
+
+    while (pos < path.size()) {
+        if (path[pos] != '/') return {ExtendedKey{}, false};
+        ++pos;
+        if (pos >= path.size()) return {ExtendedKey{}, false};
+
+        // Parse number with overflow detection
+        uint64_t index64 = 0;
+        bool has_digit = false;
+        while (pos < path.size() && std::isdigit(static_cast<unsigned char>(path[pos]))) {
+            index64 = index64 * 10 + static_cast<uint64_t>(path[pos] - '0');
+            if (index64 > 0x7FFFFFFFu) return {ExtendedKey{}, false}; // exceeds max BIP-32 index
+            ++pos;
+            has_digit = true;
+        }
+        if (!has_digit) return {ExtendedKey{}, false};
+        const auto index = static_cast<uint32_t>(index64);
+
+        // Check for hardened marker
+        bool hardened = false;
+        if (pos < path.size() && (path[pos] == '\'' || path[pos] == 'h' || path[pos] == 'H')) {
+            hardened = true;
+            ++pos;
+        }
+        if (pos < path.size() && path[pos] != '/') return {ExtendedKey{}, false};
+
+        uint32_t const child_index = hardened ? (index | 0x80000000u) : index;
+        auto [child, ok] = current.derive_child(child_index);
+        if (!ok) {
+            // P2-CT-001: scrub the working intermediate's material on failure (secret
+            // for a private master; a harmless erase of the public x-coord otherwise).
+            // Unconditional so the on-failure erase is exercised by the xpub-hardened test.
+            detail::secure_erase(current.key.data(), current.key.size());
+            detail::secure_erase(current.chain_code.data(), current.chain_code.size());
+            return {ExtendedKey{}, false};
+        }
+        current = child;
+        // P2-CT-001: scrub the redundant `child` copy of the intermediate key + chain
+        // code so no intermediate secret lingers on the stack across iterations.
+        // `current` is a LOCAL copy of the caller's master (never the caller's object);
+        // the FINAL returned key is `current`, never scrubbed here.
+        detail::secure_erase(child.key.data(), child.key.size());
+        detail::secure_erase(child.chain_code.data(), child.chain_code.size());
+    }
+
+    return {current, true};
+}
+
+} // namespace secp256k1

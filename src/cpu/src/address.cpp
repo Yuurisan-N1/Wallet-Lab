@@ -1,0 +1,1139 @@
+// ============================================================================
+// Address Generation + Silent Payments -- Implementation
+// ============================================================================
+
+#include "secp256k1/address.hpp"
+#include "secp256k1/sha256.hpp"
+#include "secp256k1/schnorr.hpp"
+#include "secp256k1/field.hpp"
+#include "secp256k1/ct/point.hpp"
+#include "secp256k1/ct/sign.hpp"   // ct::generator_mul for t_k*G in silent payments
+#include "secp256k1/detail/secure_erase.hpp"
+#include "secp256k1/precompute.hpp"
+#include "secp256k1/multiscalar.hpp"
+#include <algorithm>
+#include <array>
+#include <cstring>
+
+namespace secp256k1 {
+
+using fast::Point;
+using fast::Scalar;
+using fast::FieldElement;
+
+// ===============================================================================
+// RIPEMD-160 (self-contained, needed for HASH160)
+// ===============================================================================
+
+namespace {
+
+class RIPEMD160 {
+public:
+    static std::array<std::uint8_t, 20> hash(const std::uint8_t* data, std::size_t len) {
+        RIPEMD160 ctx;
+        ctx.update(data, len);
+        return ctx.finalize();
+    }
+
+    RIPEMD160() : buf_{} {
+        h_[0] = 0x67452301u; h_[1] = 0xEFCDAB89u;
+        h_[2] = 0x98BADCFEu; h_[3] = 0x10325476u;
+        h_[4] = 0xC3D2E1F0u;
+        total_ = 0; buf_len_ = 0;
+    }
+
+    void update(const std::uint8_t* data, std::size_t len) {
+        total_ += len;
+        if (buf_len_ > 0) {
+            std::size_t const fill = 64 - buf_len_;
+            if (len < fill) { std::memcpy(buf_ + buf_len_, data, len); buf_len_ += len; return; }
+            std::memcpy(buf_ + buf_len_, data, fill);
+            compress(buf_); data += fill; len -= fill; buf_len_ = 0;
+        }
+        while (len >= 64) { compress(data); data += 64; len -= 64; }
+        if (len > 0) { std::memcpy(buf_, data, len); buf_len_ = len; }
+    }
+
+    std::array<std::uint8_t, 20> finalize() {
+        std::uint64_t const bits = total_ * 8;
+        std::uint8_t pad = 0x80;
+        update(&pad, 1);
+        pad = 0;
+        while (buf_len_ != 56) update(&pad, 1);
+        std::uint8_t len_le[8];
+        for (std::size_t i = 0; i < 8; ++i) len_le[i] = std::uint8_t(bits >> (i * 8));
+        update(len_le, 8);
+        std::array<std::uint8_t, 20> out;
+        for (std::size_t i = 0; i < 5; ++i) {
+            out[i*4+0] = std::uint8_t(h_[i]); out[i*4+1] = std::uint8_t(h_[i]>>8);
+            out[i*4+2] = std::uint8_t(h_[i]>>16); out[i*4+3] = std::uint8_t(h_[i]>>24);
+        }
+        return out;
+    }
+
+private:
+    static std::uint32_t rotl(std::uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
+    static std::uint32_t f(int j, std::uint32_t x, std::uint32_t y, std::uint32_t z) {
+        if (j < 16) return x ^ y ^ z;
+        if (j < 32) return (x & y) | (~x & z);
+        if (j < 48) return (x | ~y) ^ z;
+        if (j < 64) return (x & z) | (y & ~z);
+        return x ^ (y | ~z);
+    }
+
+    void compress(const std::uint8_t* block) {
+        std::uint32_t X[16];
+        for (int i = 0; i < 16; ++i) {
+            auto const idx = static_cast<std::size_t>(i) * 4;
+            X[i] = std::uint32_t(block[idx]) | (std::uint32_t(block[idx+1])<<8) |
+                   (std::uint32_t(block[idx+2])<<16) | (std::uint32_t(block[idx+3])<<24);
+}
+
+        static constexpr int rl[80] = {
+            0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+            7,4,13,1,10,6,15,3,12,0,9,5,2,14,11,8,
+            3,10,14,4,9,15,8,1,2,7,0,6,13,11,5,12,
+            1,9,11,10,0,8,12,4,13,3,7,15,14,5,6,2,
+            4,0,5,9,7,12,2,10,14,1,3,8,11,6,15,13
+        };
+        static constexpr int rr[80] = {
+            5,14,7,0,9,2,11,4,13,6,15,8,1,10,3,12,
+            6,11,3,7,0,13,5,10,14,15,8,12,4,9,1,2,
+            15,5,1,3,7,14,6,9,11,8,12,2,10,0,4,13,
+            8,6,4,1,3,11,15,0,5,12,2,13,9,7,10,14,
+            12,15,10,4,1,5,8,7,6,2,13,14,0,3,9,11
+        };
+        static constexpr int sl[80] = {
+            11,14,15,12,5,8,7,9,11,13,14,15,6,7,9,8,
+            7,6,8,13,11,9,7,15,7,12,15,9,11,7,13,12,
+            11,13,6,7,14,9,13,15,14,8,13,6,5,12,7,5,
+            11,12,14,15,14,15,9,8,9,14,5,6,8,6,5,12,
+            9,15,5,11,6,8,13,12,5,12,13,14,11,8,5,6
+        };
+        static constexpr int sr[80] = {
+            8,9,9,11,13,15,15,5,7,7,8,11,14,14,12,6,
+            9,13,15,7,12,8,9,11,7,7,12,7,6,15,13,11,
+            9,7,15,11,8,6,6,14,12,13,5,14,13,13,7,5,
+            15,5,8,11,14,14,6,14,6,9,12,9,12,5,15,8,
+            8,5,12,9,12,5,14,6,8,13,6,5,15,13,11,11
+        };
+        static constexpr std::uint32_t KL[5] = {0, 0x5A827999u, 0x6ED9EBA1u, 0x8F1BBCDCu, 0xA953FD4Eu};
+        static constexpr std::uint32_t KR[5] = {0x50A28BE6u, 0x5C4DD124u, 0x6D703EF3u, 0x7A6D76E9u, 0};
+
+        std::uint32_t al=h_[0],bl=h_[1],cl=h_[2],dl=h_[3],el=h_[4];
+        std::uint32_t ar=h_[0],br=h_[1],cr=h_[2],dr=h_[3],er=h_[4];
+
+        for (int j = 0; j < 80; ++j) {
+            std::uint32_t tl = al + f(j,bl,cl,dl) + X[rl[j]] + KL[j/16];
+            tl = rotl(tl, sl[j]) + el;
+            al = el; el = dl; dl = rotl(cl, 10); cl = bl; bl = tl;
+
+            std::uint32_t tr = ar + f(79-j,br,cr,dr) + X[rr[j]] + KR[j/16];
+            tr = rotl(tr, sr[j]) + er;
+            ar = er; er = dr; dr = rotl(cr, 10); cr = br; br = tr;
+        }
+
+        std::uint32_t const t = h_[1] + cl + dr;
+        h_[1] = h_[2] + dl + er;
+        h_[2] = h_[3] + el + ar;
+        h_[3] = h_[4] + al + br;
+        h_[4] = h_[0] + bl + cr;
+        h_[0] = t;
+    }
+
+    std::uint32_t h_[5];
+    std::uint8_t buf_[64];
+    std::size_t buf_len_;
+    std::uint64_t total_;
+};
+
+} // anonymous namespace
+
+// ===============================================================================
+// HASH160
+// ===============================================================================
+
+std::array<std::uint8_t, 20> hash160(const std::uint8_t* data, std::size_t len) {
+    auto sha = SHA256::hash(data, len);
+    return RIPEMD160::hash(sha.data(), 32);
+}
+
+// ===============================================================================
+// Base58Check
+// ===============================================================================
+
+static const char BASE58_ALPHABET[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+static int base58_char_value(char c) {
+    if (c >= '1' && c <= '9') return c - '1';
+    if (c >= 'A' && c <= 'H') return c - 'A' + 9;
+    if (c >= 'J' && c <= 'N') return c - 'J' + 17;
+    if (c >= 'P' && c <= 'Z') return c - 'P' + 22;
+    if (c >= 'a' && c <= 'k') return c - 'a' + 33;
+    if (c >= 'm' && c <= 'z') return c - 'm' + 44;
+    return -1;
+}
+
+std::string base58check_encode(const std::uint8_t* data, std::size_t len) {
+    // Guard against size_t overflow in (len + 4) -- silences GCC -Wstringop-overflow
+    if (len == 0 || len > 0x7FFFFFFFUL) return {};
+
+    // Append 4-byte checksum
+    auto checksum_hash1 = SHA256::hash(data, len);
+    auto checksum_hash2 = SHA256::hash(checksum_hash1.data(), 32);
+
+    std::vector<std::uint8_t> payload(len + 4);
+    std::memcpy(payload.data(), data, len);
+    std::memcpy(payload.data() + len, checksum_hash2.data(), 4);
+
+    // Count leading zeros
+    std::size_t leading_zeros = 0;
+    while (leading_zeros < payload.size() && payload[leading_zeros] == 0) ++leading_zeros;
+
+    // Base58 encode (big number division)
+    std::string result;
+    result.reserve(payload.size() * 138 / 100 + 1);
+
+    // Use a copy for division
+    std::vector<std::uint8_t> num(payload.begin(), payload.end());
+    std::vector<std::uint8_t> quotient;
+    quotient.reserve(num.size());
+    while (!num.empty()) {
+        int remainder = 0;
+        quotient.clear();
+        for (std::size_t i = 0; i < num.size(); ++i) {
+            int const acc = remainder * 256 + num[i];
+            int digit = acc / 58;
+            remainder = acc % 58;
+            if (!quotient.empty() || digit > 0) {
+                quotient.push_back(static_cast<std::uint8_t>(digit));
+            }
+        }
+        result.push_back(BASE58_ALPHABET[remainder]);
+        num.swap(quotient);
+    }
+
+    // Add '1' for each leading zero byte
+    for (std::size_t i = 0; i < leading_zeros; ++i) {
+        result.push_back('1');
+    }
+
+    std::reverse(result.begin(), result.end());
+    return result;
+}
+
+std::pair<std::vector<std::uint8_t>, bool>
+base58check_decode(const std::string& encoded) {
+    // Decode from base58
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(encoded.size());
+
+    // Count leading '1's
+    std::size_t leading_ones = 0;
+    while (leading_ones < encoded.size() && encoded[leading_ones] == '1') ++leading_ones;
+
+    // Convert from base58 to base256
+    std::vector<int> digits;
+    for (char const c : encoded) {
+        int const val = base58_char_value(c);
+        if (val < 0) return {{}, false};
+
+        int carry = val;
+        for (auto it = digits.rbegin(); it != digits.rend(); ++it) {
+            int const acc = *it * 58 + carry;
+            *it = acc % 256;
+            carry = acc / 256;
+        }
+        while (carry > 0) {
+            digits.insert(digits.begin(), carry % 256);
+            carry /= 256;
+        }
+    }
+
+    // Prepend leading zeros
+    for (std::size_t i = 0; i < leading_ones; ++i) {
+        digits.insert(digits.begin(), 0);
+    }
+
+    if (digits.size() < 4) return {{}, false};
+
+    // Verify checksum
+    std::size_t const payload_len = digits.size() - 4;
+    std::vector<std::uint8_t> payload(digits.begin(), digits.begin() + static_cast<std::ptrdiff_t>(payload_len));
+    auto h1 = SHA256::hash(payload.data(), payload_len);
+    auto h2 = SHA256::hash(h1.data(), 32);
+
+    for (std::size_t i = 0; i < 4; ++i) {
+        if (digits[payload_len + i] != static_cast<int>(h2[i])) return {{}, false};
+    }
+
+    return {payload, true};
+}
+
+// ===============================================================================
+// Bech32 / Bech32m (BIP-173 / BIP-350)
+// ===============================================================================
+
+static const char BECH32_CHARSET[] = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+
+static int bech32_charset_value(char c) {
+    const char* p = std::strchr(BECH32_CHARSET, c);
+    if (!p) return -1;
+    return static_cast<int>(p - BECH32_CHARSET);
+}
+
+static std::uint32_t bech32_polymod(const std::vector<std::uint8_t>& values) {
+    static constexpr std::uint32_t GEN[5] = {
+        0x3b6a57b2u, 0x26508e6du, 0x1ea119fau, 0x3d4233ddu, 0x2a1462b3u
+    };
+    std::uint32_t chk = 1;
+    for (auto v : values) {
+        std::uint32_t const top = chk >> 25;
+        chk = ((chk & 0x1ffffffu) << 5) ^ v;
+        for (int i = 0; i < 5; ++i) {
+            if ((top >> i) & 1) chk ^= GEN[i];
+        }
+    }
+    return chk;
+}
+
+static std::uint32_t bech32_polymod_step(std::uint32_t chk, std::uint8_t v) {
+    static constexpr std::uint32_t GEN[5] = {
+        0x3b6a57b2u, 0x26508e6du, 0x1ea119fau, 0x3d4233ddu, 0x2a1462b3u
+    };
+    std::uint32_t const top = chk >> 25;
+    chk = ((chk & 0x1ffffffu) << 5) ^ v;
+    for (int i = 0; i < 5; ++i) {
+        if ((top >> i) & 1u) chk ^= GEN[i];
+    }
+    return chk;
+}
+
+static std::uint32_t bech32_checksum_polymod(const std::string& hrp,
+                                             const std::uint8_t* data,
+                                             std::size_t data_len,
+                                             std::uint32_t encoding_const) {
+    std::uint32_t chk = 1;
+    for (char const c : hrp) {
+        chk = bech32_polymod_step(chk, static_cast<std::uint8_t>(
+            static_cast<unsigned char>(c) >> 5));
+    }
+    chk = bech32_polymod_step(chk, 0);
+    for (char const c : hrp) {
+        chk = bech32_polymod_step(chk, static_cast<std::uint8_t>(
+            static_cast<unsigned char>(c) & 31u));
+    }
+    for (std::size_t i = 0; i < data_len; ++i) {
+        chk = bech32_polymod_step(chk, data[i]);
+    }
+    for (int i = 0; i < 6; ++i) {
+        chk = bech32_polymod_step(chk, 0);
+    }
+    return chk ^ encoding_const;
+}
+
+static std::vector<std::uint8_t> bech32_hrp_expand(const std::string& hrp) {
+    std::vector<std::uint8_t> ret;
+    ret.reserve(hrp.size() * 2 + 1);
+    for (char const c : hrp) ret.push_back(static_cast<std::uint8_t>(c >> 5));
+    ret.push_back(0);
+    for (char const c : hrp) ret.push_back(static_cast<std::uint8_t>(c & 31));
+    return ret;
+}
+
+static bool convert_bits(std::vector<std::uint8_t>& out,
+                          const std::uint8_t* data, std::size_t len,
+                          int frombits, int tobits, bool pad) {
+    int acc = 0;
+    int bits = 0;
+    int const maxv = (1 << tobits) - 1;
+    for (std::size_t i = 0; i < len; ++i) {
+        int const value = data[i];
+        if (value >> frombits) return false;
+        acc = (acc << frombits) | value;
+        bits += frombits;
+        while (bits >= tobits) {
+            bits -= tobits;
+            out.push_back(static_cast<std::uint8_t>((acc >> bits) & maxv));
+        }
+    }
+    if (pad) {
+        if (bits > 0) {
+            out.push_back(static_cast<std::uint8_t>((acc << (tobits - bits)) & maxv));
+        }
+    } else if (bits >= frombits || ((acc << (tobits - bits)) & maxv)) {
+        return false;
+    }
+    return true;
+}
+
+static bool convert_bits_fixed(std::uint8_t* out, std::size_t& out_len,
+                               std::size_t out_capacity,
+                               const std::uint8_t* data, std::size_t len,
+                               int frombits, int tobits, bool pad) {
+    int acc = 0;
+    int bits = 0;
+    int const maxv = (1 << tobits) - 1;
+    out_len = 0;
+    for (std::size_t i = 0; i < len; ++i) {
+        int const value = data[i];
+        if (value >> frombits) return false;
+        acc = (acc << frombits) | value;
+        bits += frombits;
+        while (bits >= tobits) {
+            bits -= tobits;
+            if (out_len >= out_capacity) return false;
+            out[out_len++] = static_cast<std::uint8_t>((acc >> bits) & maxv);
+        }
+    }
+    if (pad) {
+        if (bits > 0) {
+            if (out_len >= out_capacity) return false;
+            out[out_len++] = static_cast<std::uint8_t>((acc << (tobits - bits)) & maxv);
+        }
+    } else if (bits >= frombits || ((acc << (tobits - bits)) & maxv)) {
+        return false;
+    }
+    return true;
+}
+
+std::string bech32_encode(const std::string& hrp,
+                          std::uint8_t witness_version,
+                          const std::uint8_t* witness_program,
+                          std::size_t prog_len) {
+    // Determine encoding: v0 = BECH32, v1+ = BECH32M
+    std::uint32_t const encoding_const = (witness_version == 0) ? 1u : 0x2bc830a3u;
+
+    // Convert 8-bit data to 5-bit groups
+    constexpr std::size_t STACK_DATA5_LIMIT = 128;
+    std::size_t const data5_capacity = 1 + ((prog_len * 8 + 4) / 5);
+    std::array<std::uint8_t, STACK_DATA5_LIMIT> stack_data5;
+    std::vector<std::uint8_t> data5_heap;
+    std::uint8_t* data5 = nullptr;
+    if (data5_capacity <= STACK_DATA5_LIMIT) {
+        data5 = stack_data5.data();
+    } else {
+        data5_heap.resize(data5_capacity);
+        data5 = data5_heap.data();
+    }
+    data5[0] = witness_version;
+    std::size_t converted_len = 0;
+    if (!convert_bits_fixed(data5 + 1, converted_len, data5_capacity - 1,
+                            witness_program, prog_len, 8, 5, true)) {
+        return {};
+    }
+    std::size_t const data5_len = converted_len + 1;
+
+    // Compute checksum
+    std::uint32_t const polymod = bech32_checksum_polymod(
+        hrp, data5, data5_len, encoding_const);
+
+    // Build result
+    std::string result;
+    result.reserve(hrp.size() + 1 + data5_len + 6);
+    result.append(hrp);
+    result.push_back('1');
+    for (std::size_t i = 0; i < data5_len; ++i) result.push_back(BECH32_CHARSET[data5[i]]);
+    for (int i = 0; i < 6; ++i) {
+        result.push_back(BECH32_CHARSET[(polymod >> (5 * (5 - i))) & 31]);
+    }
+
+    return result;
+}
+
+Bech32DecodeResult bech32_decode(const std::string& addr) {
+    Bech32DecodeResult result;
+    result.valid = false;
+    result.witness_version = -1;
+
+    // Find separator '1'
+    auto sep = addr.rfind('1');
+    if (sep == std::string::npos || sep < 1 || sep + 8 > addr.size()) return result;
+
+    std::string hrp_str;
+    for (std::size_t i = 0; i < sep; ++i) {
+        char const c = addr[i];
+        if (c < 33 || c > 126) return result;
+        hrp_str.push_back(static_cast<char>(c >= 'A' && c <= 'Z' ? c + 32 : c));
+    }
+
+    // Decode data part
+    std::vector<std::uint8_t> data5;
+    for (std::size_t i = sep + 1; i < addr.size(); ++i) {
+        char c = addr[i];
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+        int val = bech32_charset_value(c);
+        if (val < 0) return result;
+        data5.push_back(static_cast<std::uint8_t>(val));
+    }
+
+    if (data5.size() < 7) return result;
+
+    // Verify checksum
+    auto hrp_exp = bech32_hrp_expand(hrp_str);
+    std::vector<std::uint8_t> values(hrp_exp);
+    values.insert(values.end(), data5.begin(), data5.end());
+    std::uint32_t const polymod = bech32_polymod(values);
+
+    Bech32Encoding enc = Bech32Encoding::BECH32;  // initialized to satisfy cppcoreguidelines
+    if (polymod == 1) { enc = Bech32Encoding::BECH32;
+    } else if (polymod == 0x2bc830a3u) { enc = Bech32Encoding::BECH32M;
+    } else { return result;
+}
+
+    // Extract witness version and program
+    std::uint8_t const wit_ver = data5[0];
+    if (wit_ver > 16) return result;
+    if (wit_ver == 0 && enc != Bech32Encoding::BECH32) return result;
+    if (wit_ver != 0 && enc != Bech32Encoding::BECH32M) return result;
+
+    std::vector<std::uint8_t> prog;
+    if (!convert_bits(prog, data5.data() + 1, data5.size() - 7, 5, 8, false)) return result;
+
+    if (prog.size() < 2 || prog.size() > 40) return result;
+    if (wit_ver == 0 && prog.size() != 20 && prog.size() != 32) return result;
+
+    result.hrp = hrp_str;
+    result.witness_version = wit_ver;
+    result.witness_program = std::move(prog);
+    result.valid = true;
+    return result;
+}
+
+// bech32m_paycode_decode: like bech32_decode but accepts programs > 40 bytes.
+// For paycodes (BIP-352 sp1..., LTC-SP ltcsp1...) carrying 64-66 bytes of pubkeys.
+Bech32DecodeResult bech32m_paycode_decode(const std::string& encoded) {
+    Bech32DecodeResult result;
+    result.valid = false;
+    result.witness_version = -1;
+
+    auto sep = encoded.rfind('1');
+    if (sep == std::string::npos || sep < 1 || sep + 8 > encoded.size()) return result;
+
+    std::string hrp_str;
+    for (std::size_t i = 0; i < sep; ++i) {
+        char const c = encoded[i];
+        if (c < 33 || c > 126) return result;
+        hrp_str.push_back(static_cast<char>(c >= 'A' && c <= 'Z' ? c + 32 : c));
+    }
+
+    std::vector<std::uint8_t> data5;
+    for (std::size_t i = sep + 1; i < encoded.size(); ++i) {
+        char c = encoded[i];
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+        int val = bech32_charset_value(c);
+        if (val < 0) return result;
+        data5.push_back(static_cast<std::uint8_t>(val));
+    }
+    if (data5.size() < 7) return result;
+
+    auto hrp_exp = bech32_hrp_expand(hrp_str);
+    std::vector<std::uint8_t> values(hrp_exp);
+    values.insert(values.end(), data5.begin(), data5.end());
+    std::uint32_t const polymod = bech32_polymod(values);
+    if (polymod != 0x2bc830a3u) return result;  // must be bech32m
+
+    std::uint8_t const wit_ver = data5[0];
+    if (wit_ver == 0 || wit_ver > 16) return result;  // paycodes use version ≥ 1
+
+    std::vector<std::uint8_t> prog;
+    if (!convert_bits(prog, data5.data() + 1, data5.size() - 7, 5, 8, false)) return result;
+    if (prog.empty()) return result;
+    // No upper size limit — paycode programs can be 64-66+ bytes
+
+    result.hrp = hrp_str;
+    result.witness_version = wit_ver;
+    result.witness_program = std::move(prog);
+    result.valid = true;
+    return result;
+}
+
+// ===============================================================================
+// Address Derivation
+// ===============================================================================
+
+std::string address_p2pkh(const Point& pubkey, Network net) {
+    auto compressed = pubkey.to_compressed();
+    auto h160 = hash160(compressed.data(), 33);
+
+    // Version byte + hash160
+    std::uint8_t payload[21];
+    payload[0] = (net == Network::Mainnet) ? 0x00 : 0x6F;
+    std::memcpy(payload + 1, h160.data(), 20);
+
+    return base58check_encode(payload, 21);
+}
+
+std::string address_p2wpkh(const Point& pubkey, Network net) {
+    auto compressed = pubkey.to_compressed();
+    auto h160 = hash160(compressed.data(), 33);
+
+    std::string const hrp = (net == Network::Mainnet) ? "bc" : "tb";
+    return bech32_encode(hrp, 0, h160.data(), 20);
+}
+
+std::string address_p2tr(const Point& internal_key, Network net) {
+    // For keypath-only spend: output_key = internal_key (no tweak)
+    // A proper Taproot output key uses taproot_output_key() from taproot.hpp
+    // Here we just encode the x-only key
+    auto x_bytes = internal_key.x().to_bytes();
+    return address_p2tr_raw(x_bytes, net);
+}
+
+std::string address_p2tr_raw(const std::array<std::uint8_t, 32>& output_key_x,
+                             Network net) {
+    std::string const hrp = (net == Network::Mainnet) ? "bc" : "tb";
+    return bech32_encode(hrp, 1, output_key_x.data(), 32);
+}
+
+std::string address_p2sh_p2wpkh(const Point& pubkey, Network net) {
+    // 1. hash160 of compressed pubkey
+    auto compressed = pubkey.to_compressed();
+    auto keyhash = hash160(compressed.data(), 33);
+
+    // 2. Build witness script: OP_0 PUSH20 <keyhash>
+    std::uint8_t witness_script[22];
+    witness_script[0] = 0x00;  // OP_0
+    witness_script[1] = 0x14;  // PUSH 20 bytes
+    std::memcpy(witness_script + 2, keyhash.data(), 20);
+
+    // 3. hash160 of witness script -> script hash
+    auto script_hash = hash160(witness_script, 22);
+
+    // 4. Base58Check with P2SH version byte
+    std::uint8_t payload[21];
+    payload[0] = (net == Network::Mainnet) ? 0x05 : 0xC4;
+    std::memcpy(payload + 1, script_hash.data(), 20);
+
+    return base58check_encode(payload, 21);
+}
+
+std::string address_p2sh(const std::array<std::uint8_t, 20>& script_hash,
+                         Network net) {
+    std::uint8_t payload[21];
+    payload[0] = (net == Network::Mainnet) ? 0x05 : 0xC4;
+    std::memcpy(payload + 1, script_hash.data(), 20);
+    return base58check_encode(payload, 21);
+}
+
+std::string address_p2wsh(const std::array<std::uint8_t, 32>& witness_script_hash,
+                          Network net) {
+    std::string const hrp = (net == Network::Mainnet) ? "bc" : "tb";
+    return bech32_encode(hrp, 0, witness_script_hash.data(), 32);
+}
+
+// ===============================================================================
+// CashAddr (Bitcoin Cash, BIP-0185)
+// ===============================================================================
+
+namespace {
+
+static std::uint64_t cashaddr_polymod(const std::vector<std::uint8_t>& v) {
+    static constexpr std::uint64_t GEN[5] = {
+        0x98f2bc8e61ULL, 0x79b76d99e2ULL,
+        0xf33e5fb3c4ULL, 0xae2eabe2a8ULL,
+        0x1e4f43e470ULL
+    };
+    std::uint64_t c = 1;
+    for (auto d : v) {
+        std::uint64_t const c0 = c >> 35;
+        c = ((c & 0x07ffffffffULL) << 5) ^ d;
+        for (int i = 0; i < 5; ++i) {
+            if ((c0 >> i) & 1) c ^= GEN[i];
+        }
+    }
+    return c ^ 1;
+}
+
+static std::vector<std::uint8_t> cashaddr_prefix_expand(const std::string& prefix) {
+    std::vector<std::uint8_t> ret;
+    ret.reserve(prefix.size() + 1);
+    for (const char c : prefix) {
+        ret.push_back(static_cast<std::uint8_t>(c & 0x1f));
+    }
+    ret.push_back(0);
+    return ret;
+}
+
+} // anonymous namespace
+
+std::string cashaddr_encode(const std::array<std::uint8_t, 20>& hash,
+                            const std::string& prefix,
+                            std::uint8_t type) {
+    // Version byte: type (0=P2PKH, 1=P2SH) in upper 4 bits, size=0 (=20 bytes) in lower 4
+    const auto version_byte = static_cast<std::uint8_t>(type << 3);
+
+    // Payload: version_byte + 20-byte hash = 21 bytes
+    std::uint8_t payload[21];
+    payload[0] = version_byte;
+    std::memcpy(payload + 1, hash.data(), 20);
+
+    // Convert 8-bit payload to 5-bit groups
+    std::vector<std::uint8_t> data5;
+    convert_bits(data5, payload, 21, 8, 5, true);
+
+    // Compute checksum
+    auto prefix_exp = cashaddr_prefix_expand(prefix);
+    std::vector<std::uint8_t> values(prefix_exp);
+    values.insert(values.end(), data5.begin(), data5.end());
+    values.resize(values.size() + 8, 0);
+    std::uint64_t const poly = cashaddr_polymod(values);
+
+    static const char CASHADDR_CHARSET[] = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+
+    // Build result
+    std::string result = prefix + ":";
+    for (auto v : data5) result.push_back(CASHADDR_CHARSET[v]);
+    for (int i = 0; i < 8; ++i) {
+        result.push_back(CASHADDR_CHARSET[(poly >> (5 * (7 - i))) & 31]);
+    }
+
+    return result;
+}
+
+std::string address_cashaddr(const Point& pubkey,
+                             const std::string& prefix) {
+    auto compressed = pubkey.to_compressed();
+    auto h160 = hash160(compressed.data(), 33);
+    return cashaddr_encode(h160, prefix, 0);
+}
+
+// ===============================================================================
+// WIF (Wallet Import Format)
+// ===============================================================================
+
+std::string wif_encode(const Scalar& private_key, bool compressed, Network net) {
+    auto key_bytes = private_key.to_bytes();
+    std::size_t const payload_len = compressed ? 34 : 33;
+    std::vector<std::uint8_t> payload(payload_len);
+
+    payload[0] = (net == Network::Mainnet) ? 0x80 : 0xEF;
+    std::memcpy(payload.data() + 1, key_bytes.data(), 32);
+    if (compressed) payload[33] = 0x01;
+
+    auto result = base58check_encode(payload.data(), payload_len);
+    detail::secure_erase(key_bytes.data(), key_bytes.size());
+    detail::secure_erase(payload.data(), payload.size());
+    return result;
+}
+
+WIFDecodeResult wif_decode(const std::string& wif) {
+    auto [data, valid] = base58check_decode(wif);
+    WIFDecodeResult result{};
+    result.valid = false;
+
+    if (!valid || data.empty()) return result;
+
+    std::uint8_t const version = data[0];
+    if (version != 0x80 && version != 0xEF) return result;
+
+    result.network = (version == 0x80) ? Network::Mainnet : Network::Testnet;
+
+    if (data.size() == 34 && data[33] == 0x01) {
+        result.compressed = true;
+    } else if (data.size() == 33) {
+        result.compressed = false;
+    } else {
+        return result;
+    }
+
+    std::array<std::uint8_t, 32> key_bytes;
+    std::memcpy(key_bytes.data(), data.data() + 1, 32);
+    result.key = Scalar::from_bytes(key_bytes);
+    detail::secure_erase(key_bytes.data(), key_bytes.size());
+    detail::secure_erase(data.data(), data.size());
+    result.valid = true;
+    return result;
+}
+
+// ===============================================================================
+// BIP-352 Silent Payments
+// ===============================================================================
+
+// Helper: lift_x with even y (try-and-increment)
+[[maybe_unused]] static Point lift_x_even(const FieldElement& x_in) {
+    FieldElement x = x_in;
+    for (int attempt = 0; attempt < 256; ++attempt) {
+        FieldElement const x2 = x * x;
+        FieldElement const x3 = x2 * x;
+        FieldElement const rhs = x3 + FieldElement::from_uint64(7);
+        // Optimized sqrt via addition chain
+        auto y = rhs.sqrt();
+        if (y.square() == rhs) {
+            auto y_bytes = y.to_bytes();
+            if (y_bytes[31] & 1) y = FieldElement::zero() - y;
+            return Point::from_affine(x, y);
+        }
+        x = x + FieldElement::one();
+    }
+    return Point::infinity();
+}
+
+SilentPaymentAddress
+silent_payment_address(const Scalar& scan_privkey,
+                       const Scalar& spend_privkey) {
+    SilentPaymentAddress addr;
+    addr.scan_pubkey = ct::generator_mul(scan_privkey);
+    addr.spend_pubkey = ct::generator_mul(spend_privkey);
+    return addr;
+}
+
+std::string SilentPaymentAddress::encode(Network net) const {
+    // BIP-352 silent payment address format:
+    // sp1q + scan_pubkey_x(32) + spend_pubkey_x(32) -> bech32m
+    auto scan_x = scan_pubkey.x().to_bytes();
+    auto spend_x = spend_pubkey.x().to_bytes();
+
+    // Concatenate scan_x || spend_x
+    std::uint8_t data[64];
+    std::memcpy(data, scan_x.data(), 32);
+    std::memcpy(data + 32, spend_x.data(), 32);
+
+    std::string const hrp = (net == Network::Mainnet) ? "sp" : "tsp";
+    // Use witness version 1 (Bech32m) for silent payments 
+    // Note: BIP-352 uses a custom HRP, not standard witness program
+    // For simplicity, we encode as bech32m with witness version 0
+    // Real BIP-352 uses a dedicated encoding
+    return bech32_encode(hrp, 1, data, 64);
+}
+
+std::pair<Point, Scalar>
+silent_payment_create_output(const std::vector<Scalar>& input_privkeys,
+                             const SilentPaymentAddress& recipient,
+                             std::uint32_t k) {
+    // Sum of input private keys: a = Sum a_i
+    Scalar a_sum = Scalar::zero();
+    for (const auto& a : input_privkeys) {
+        a_sum = a_sum + a;
+    }
+
+    // Shared secret: S = a_sum * B_scan
+    Point const S = ct::scalar_mul(recipient.scan_pubkey, a_sum);
+
+    // t_k = SHA256(tagged_hash("BIP0352/SharedSecret", ser(S)) || ser32(k))
+    auto S_comp = S.to_compressed();
+    
+    // Tagged hash — "BIP0352/SharedSecret" is constant; use a static to avoid
+    // recomputing it on every call to silent_payment_create_output.
+    static const auto s_create_tag_hash =
+        SHA256::hash(reinterpret_cast<const std::uint8_t*>("BIP0352/SharedSecret"), 20);
+    SHA256 h;
+    h.update(s_create_tag_hash.data(), 32);
+    h.update(s_create_tag_hash.data(), 32);
+    h.update(S_comp.data(), 33);
+    std::uint8_t k_be[4] = {
+        std::uint8_t(k >> 24), std::uint8_t(k >> 16),
+        std::uint8_t(k >> 8), std::uint8_t(k)
+    };
+    h.update(k_be, 4);
+    auto t_hash = h.finalize();
+    Scalar const t_k = Scalar::from_bytes(t_hash);
+
+    // Output key: P_output = B_spend + t_k * G
+    // PERF + CT: ct::generator_mul uses precomputed table (~33µs vs ~826µs cold
+    // FAST path) AND keeps the operation constant-time. t_k is derived from the
+    // SHA-256 of the shared secret S = b_scan · A_sum, so it is secret-adjacent
+    // (anything keyed off scan_privkey). Use the CT generator-mul path so timing
+    // does not leak the scan key. Replaces the prior fast::generator().scalar_mul(t_k).
+    Point const P_output = recipient.spend_pubkey.add(ct::generator_mul(t_k));
+
+    // Erase secret-derived material: aggregate private key, shared secret, tagged hash
+    detail::secure_erase(&a_sum, sizeof(a_sum));
+    detail::secure_erase(S_comp.data(), S_comp.size());
+    detail::secure_erase(t_hash.data(), t_hash.size());
+
+    return {P_output, t_k};
+}
+
+std::vector<std::pair<std::uint32_t, Scalar>>
+silent_payment_scan(const Scalar& scan_privkey,
+                    const Scalar& spend_privkey,
+                    const std::vector<Point>& input_pubkeys,
+                    const std::vector<std::array<std::uint8_t, 32>>& output_pubkeys) {
+    std::vector<std::pair<std::uint32_t, Scalar>> results;
+
+    // Sum of input public keys: A = Sum A_i
+    Point A_sum = Point::infinity();
+    for (const auto& A : input_pubkeys) {
+        A_sum = A_sum.add(A);
+    }
+
+    // Shared secret: S = b_scan * A_sum
+    Point const S = ct::scalar_mul(A_sum, scan_privkey);
+    auto S_comp = S.to_compressed();
+    Point const B_spend = ct::generator_mul(spend_privkey);
+
+    // Precompute SHA midstate for t_k computation: avoids recomputing the
+    // static "BIP0352/SharedSecret" tag and S_comp update inside the loop.
+    // tag_hash is constant; S_comp is fixed per scan call.
+    static const auto s_bip352_tag_hash =
+        SHA256::hash(reinterpret_cast<const std::uint8_t*>("BIP0352/SharedSecret"), 20);
+    SHA256 h_base;
+    h_base.update(s_bip352_tag_hash.data(), 32);
+    h_base.update(s_bip352_tag_hash.data(), 32);
+    h_base.update(S_comp.data(), 33);
+
+    // Check each output
+    for (std::uint32_t k = 0; k < static_cast<std::uint32_t>(output_pubkeys.size()); ++k) {
+        // t_k = tagged_hash("BIP0352/SharedSecret", ser(S) || ser32(k))
+        // Clone precomputed midstate; only append ser32(k) per iteration
+        SHA256 h = h_base;
+        std::uint8_t k_be[4] = {
+            std::uint8_t(k >> 24), std::uint8_t(k >> 16),
+            std::uint8_t(k >> 8), std::uint8_t(k)
+        };
+        h.update(k_be, 4);
+        auto t_hash = h.finalize();
+        Scalar const t_k = Scalar::from_bytes(t_hash);
+
+        // Expected output: P = B_spend + t_k * G
+        // Expected output: P = B_spend + t_k · G
+        // PERF + CT: precomputed-table generator-mul (~33µs vs ~826µs cold FAST
+        // path) and constant-time. Same rationale as the create() path above:
+        // t_k is secret-adjacent through S = b_scan · A_sum, so the scan loop
+        // must not leak timing on each output check.
+        Point const expected = B_spend.add(ct::generator_mul(t_k));
+        auto expected_x = expected.x().to_bytes();
+
+        // Compare x-coordinate
+        if (expected_x == output_pubkeys[k]) {
+            // Compute spending private key: d = b_spend + t_k
+            Scalar const d = spend_privkey + t_k;
+            results.push_back({k, d});
+        }
+
+        // Erase secret-derived per-iteration temporaries
+        detail::secure_erase(t_hash.data(), t_hash.size());
+    }
+
+    // Erase shared secret material
+    detail::secure_erase(S_comp.data(), S_comp.size());
+
+    return results;
+}
+
+ScanTx compute_a_eff(const ScanTxRaw& raw)
+{
+    ScanTx result;
+    result.outputs = raw.outputs;
+
+    if (raw.input_pubkeys.empty()) {
+        result.a_eff = Point::infinity();
+        return result;
+    }
+
+    // Step 1: A_sum = Σ input_pubkeys
+    // Pippenger/Strauss via multi_scalar_mul with unit scalars — shares batch inversion
+    // across all inputs.  Crossover to Pippenger bucket-method at n_inputs > ~128
+    // is handled internally by multi_scalar_mul.  For n=1 skip to avoid overhead.
+    Point a_sum = Point::infinity();
+    {
+        std::size_t const m = raw.input_pubkeys.size();
+        if (m == 1) {
+            a_sum = raw.input_pubkeys[0];
+        } else {
+            // Build unit-scalar vector: each scalar = 1 (A_sum = Σ 1×P_i)
+            static const std::uint8_t one_bytes[32] = {
+                0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+                0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1
+            };
+            Scalar unit;
+            if (!Scalar::parse_bytes_strict_nonzero(one_bytes, unit)) return {};
+            std::vector<Scalar> scalars(m, unit);
+            a_sum = multi_scalar_mul(scalars.data(), raw.input_pubkeys.data(), m);
+        }
+    }
+
+    // Step 2: input_hash = H_BIP0352/Inputs(smallest_outpoint || A_sum_compressed)
+    static const auto s_inputs_tag = SHA256::hash(
+        reinterpret_cast<const std::uint8_t*>("BIP0352/Inputs"), 14);
+
+    auto a_sum_comp = a_sum.to_compressed();
+    SHA256 h;
+    h.update(s_inputs_tag.data(), 32);
+    h.update(s_inputs_tag.data(), 32);
+    h.update(raw.smallest_outpoint.data(), 36);
+    h.update(a_sum_comp.data(), 33);
+    auto hash_bytes = h.finalize();
+
+    Scalar input_hash;
+    if (!Scalar::parse_bytes_strict_nonzero(hash_bytes.data(), input_hash)) {
+        result.a_eff = Point::infinity();
+        return result;
+    }
+
+    // Step 3: a_eff = input_hash × A_sum
+    result.a_eff = a_sum.scalar_mul(input_hash);
+    return result;
+}
+
+// ── fast_scan_batch: allocation-free hot path ────────────────────────────────
+//
+// All scratch buffers are thread_local and resized in-place; no heap allocation
+// occurs after the first call per thread.
+//
+// SHA256 midstate trick: BIP0352/SharedSecret tagged hash decomposes as:
+//   block0 = tag32 || tag32          (64 bytes → one SHA256 compression)
+//   block1 = S_comp33 || k_be4 || pad + len  (64 bytes → one SHA256 compression)
+// block0 is identical for every tx and every k; we compress it once into
+// s_base_state[8] (process-wide static).  Per-tx we store the 64-byte block1
+// template with S_comp pre-embedded; only 4 bytes (k) change per output.
+// The inner loop therefore does: memcpy(h, s_base_state, 32) + write k_be +
+// sha256_compress(blk, h) — no SHA256 object copy, no heap touch.
+
+namespace {
+
+// Compute SHA256 state after compressing tag||tag (one 64-byte block).
+static std::array<std::uint32_t, 8> compute_bip352_base_state() noexcept {
+    const auto tag = SHA256::hash(
+        reinterpret_cast<const std::uint8_t*>("BIP0352/SharedSecret"), 20);
+    std::uint8_t blk[64];
+    std::memcpy(blk,      tag.data(), 32);
+    std::memcpy(blk + 32, tag.data(), 32);
+    std::array<std::uint32_t, 8> st = {
+        0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+        0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u
+    };
+    detail::sha256_compress_dispatch(blk, st.data());
+    return st;
+}
+
+// Process-wide constant: SHA256 midstate after compressing tag||tag.
+// Initialized at program startup (before main) to avoid LTO lazy-init
+// misoptimization of static-local const under function-level inlining.
+static const std::array<std::uint32_t, 8> g_bip352_base_state =
+    compute_bip352_base_state();
+
+// block1 template for tx i:
+//   [0 ..32] = S_comp (33 bytes)
+//   [33..36] = k_be4  (placeholder — written per output)
+//   [37]     = 0x80
+//   [38..61] = 0x00 × 24
+//   [62..63] = 0x03 0x28  (big-endian 64-bit bit-length = (64+37)*8 = 808 = 0x0328)
+static void build_block1(const std::uint8_t s_comp[33],
+                          std::uint8_t       blk[64]) noexcept {
+    std::memcpy(blk, s_comp, 33);
+    blk[33] = blk[34] = blk[35] = blk[36] = 0; // k placeholder
+    blk[37] = 0x80;
+    std::memset(blk + 38, 0, 24); // zero-pad [38..61]; bit-length follows
+    blk[62] = 0x03; blk[63] = 0x28; // bit-length = (64+37)*8 = 808 = 0x0328
+}
+
+} // anonymous namespace
+
+std::vector<ScanMatch>
+fast_scan_batch(const fast::Scalar& scan_privkey,
+                const fast::Scalar& spend_privkey,
+                const std::vector<ScanTx>& txs)
+{
+    if (txs.empty()) return {};
+
+    // Process-wide constant SHA256 midstate.
+    const std::array<std::uint32_t, 8>& s_base_state = g_bip352_base_state;
+
+    // ── Thread-local scratch buffers (no heap after first call per thread) ───
+    static thread_local std::vector<fast::Point>              tl_a_eff;
+    static thread_local std::vector<fast::Point>              tl_s1;
+    static thread_local std::vector<std::array<std::uint8_t, 33>> tl_s1c;
+    static thread_local std::vector<std::array<std::uint8_t, 64>> tl_blk;
+    static thread_local std::vector<std::uint64_t>            tl_out_map; // ti<<32|k
+    static thread_local std::vector<fast::Point>              tl_out_jac;
+    static thread_local std::vector<std::array<std::uint8_t, 32>> tl_out_x;
+
+    std::size_t const n = txs.size();
+
+    // Resize-in-place (realloc only if growing beyond previous high-water mark).
+    tl_a_eff.resize(n);
+    tl_s1.resize(n);
+    tl_s1c.resize(n);
+    tl_blk.resize(n);
+
+    // Count outputs upfront for Stage-2 buffer sizing.
+    std::size_t total_outputs = 0;
+    for (auto const& tx : txs) total_outputs += tx.outputs.size();
+    tl_out_map.resize(total_outputs);
+    tl_out_jac.resize(total_outputs);
+    tl_out_x.resize(total_outputs);
+
+    // ── Stage 1 ──────────────────────────────────────────────────────────────
+    for (std::size_t i = 0; i < n; ++i)
+        tl_a_eff[i] = txs[i].a_eff;
+
+    fast::KPlan const plan = fast::KPlan::from_scalar(scan_privkey);
+    fast::Point::batch_scalar_mul_fixed_k(plan, tl_a_eff.data(), n, tl_s1.data());
+    fast::Point::batch_to_compressed(tl_s1.data(), n, tl_s1c.data());
+
+    // ── Build per-tx SHA256 block1 templates ─────────────────────────────────
+    for (std::size_t i = 0; i < n; ++i)
+        build_block1(tl_s1c[i].data(), tl_blk[i].data());
+
+    // ── Stage 2: hash all → batch ×G → batch x-only ─────────────────────────
+    if (total_outputs == 0) return {};
+
+    static thread_local std::vector<fast::Scalar> tl_out_scalars;
+    tl_out_scalars.resize(total_outputs);
+
+    // Helper: compress a pre-built 64-byte SHA256 block (starting from s_base_state)
+    // and parse the resulting big-endian digest as a non-zero scalar.
+    auto compress_to_scalar = [&](std::uint8_t* blk, Scalar& out) -> bool {
+        std::uint32_t h[8];
+        std::memcpy(h, s_base_state.data(), 32);
+        detail::sha256_compress_dispatch(blk, h);
+        std::array<std::uint8_t, 32> t_bytes;
+        for (int b = 0; b < 8; ++b) {
+            t_bytes[b*4+0] = std::uint8_t(h[b] >> 24);
+            t_bytes[b*4+1] = std::uint8_t(h[b] >> 16);
+            t_bytes[b*4+2] = std::uint8_t(h[b] >>  8);
+            t_bytes[b*4+3] = std::uint8_t(h[b]);
+        }
+        return Scalar::parse_bytes_strict_nonzero(t_bytes.data(), out);
+    };
+
+    // Pass 2a: compute all t_k + spend_privkey scalars (SHA256 only, no EC).
+    std::size_t slot = 0;
+    for (std::uint32_t ti = 0; ti < static_cast<std::uint32_t>(n); ++ti) {
+        auto const& tx = txs[ti];
+        std::uint8_t* blk = tl_blk[ti].data();
+        for (std::uint32_t k = 0; k < static_cast<std::uint32_t>(tx.outputs.size()); ++k) {
+            blk[33] = std::uint8_t(k >> 24);
+            blk[34] = std::uint8_t(k >> 16);
+            blk[35] = std::uint8_t(k >>  8);
+            blk[36] = std::uint8_t(k);
+            Scalar t_k;
+            if (!compress_to_scalar(blk, t_k)) continue;
+            tl_out_scalars[slot] = t_k + spend_privkey;
+            tl_out_map[slot] = (static_cast<std::uint64_t>(ti) << 32) | k;
+            ++slot;
+        }
+    }
+
+    // Pass 2b: one mutex lock for all N×M fixed-base multiplications.
+    std::size_t const actual_outputs = slot;
+    if (actual_outputs == 0) return {};
+    fast::batch_scalar_mul_generator(tl_out_scalars.data(), tl_out_jac.data(), actual_outputs);
+
+    // ── Compare and collect matches ──────────────────────────────────────────
+    std::vector<ScanMatch> results;
+
+    auto recompute_t_k = [&](std::uint32_t ti, std::uint32_t k, Scalar& t_k_out) -> bool {
+        std::uint8_t* mblk = tl_blk[ti].data();
+        mblk[33] = std::uint8_t(k >> 24); mblk[34] = std::uint8_t(k >> 16);
+        mblk[35] = std::uint8_t(k >>  8); mblk[36] = std::uint8_t(k);
+        return compress_to_scalar(mblk, t_k_out);
+    };
+
+    fast::Point::batch_x_only_bytes(tl_out_jac.data(), actual_outputs, tl_out_x.data());
+    for (std::size_t j = 0; j < actual_outputs; ++j) {
+        std::uint32_t const ti = static_cast<std::uint32_t>(tl_out_map[j] >> 32);
+        std::uint32_t const k  = static_cast<std::uint32_t>(tl_out_map[j]);
+        if (tl_out_x[j] != txs[ti].outputs[k]) continue;
+        Scalar t_k;
+        if (!recompute_t_k(ti, k, t_k)) continue;
+        results.push_back({ti, k, spend_privkey + t_k});
+    }
+
+    return results;
+}
+
+
+} // namespace secp256k1
