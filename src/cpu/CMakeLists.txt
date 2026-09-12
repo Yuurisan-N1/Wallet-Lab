@@ -41,6 +41,7 @@ set(SECP256K1_SOURCES
     src/bip144.cpp         # BIP-144 witness transaction serialization
     src/segwit.cpp         # BIP-141 segregated witness program ops
     src/hash_accel.cpp     # SHA-256 (SHA-NI) + RIPEMD-160 + Hash160
+    src/vanity.cpp         # Deterministic vanity-address search orchestration
 )
 
 # =============================================================================
@@ -1155,10 +1156,20 @@ if(SECP256K1_BUILD_BENCH)
     endif()
 endif()
 
+# Vanity-address command-line tool (CPU fallback; GPU orchestration can use the
+# same public result contract when a device backend is available).
+add_executable(cwl_vanity vanity_main.cpp)
+target_link_libraries(cwl_vanity PRIVATE ${SECP256K1_LIB_NAME})
+
 # Tests -- unified test runner
 # Single binary runs library selftest + all test modules.
 # Usage: run_selftest [smoke|ci|stress] [seed_hex]
 if(BUILD_TESTING)
+    # CUDA/CPU vanity-address search API tests
+    add_executable(test_vanity_standalone tests/test_vanity.cpp)
+    target_link_libraries(test_vanity_standalone PRIVATE ${SECP256K1_LIB_NAME})
+    add_test(NAME vanity COMMAND test_vanity_standalone)
+
     add_executable(run_selftest
         tests/run_selftest.cpp
         tests/test_large_scalar_multiplication.cpp
